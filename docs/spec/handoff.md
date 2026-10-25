@@ -1,6 +1,6 @@
 # Worker HANDOFF.md format (v1)
 
-Status: Phase 0 spike spec, round 7 (T-006). Parser: `spike/handoff/parse.sh`. Tests: `spike/tests/test_handoff.sh`.
+Status: Phase 0 spike spec, round 8 (T-006). Parser: `spike/handoff/parse.sh`. Tests: `spike/tests/test_handoff.sh`.
 
 Every harness worker writes a `HANDOFF.md` in its worktree when it finishes (ARCHITECTURE.md, "Dispatch" and
 "Collect"). The format mirrors the HANDOFF format in `AGENTS.md`, so the same parser reads this repo's own handoffs.
@@ -18,8 +18,8 @@ hard-wrapped.
 input path argument: a second positional argument is a usage error (exit 2). No other file name and no subdirectory is
 ever read (`<root>/sub/HANDOFF.md`, `<root>/HANDOFF.md.bak`, `<root>/../HANDOFF.md` are all ignored).
 
-The wrapper script only checks its arguments and then `exec`s **one perl process** (`/usr/bin/perl`, with
-`/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C`). That one process walks the root, opens and reads the file into memory,
+The wrapper script only checks its arguments, finds `compliance/denylist.txt` and then `exec`s **one perl process**
+(`/usr/bin/perl -f`, with `/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C`). That one process walks the root, opens and reads the file into memory,
 checks every rule, and prints the JSON once at the end, only if every check passed. There is no temp file, no copy, no
 here-string, no second process, and nothing is reopened by path. `jq` and `awk` are not used. (This differs from the
 T-006 brief's wording "`jq --arg`/`--rawfile`": the intent, that content is never interpolated into a shell command, is
@@ -56,15 +56,22 @@ When no other process is changing the files and directories involved while the p
 2. **No hard link, special file or mount crossing is read.** `HANDOFF.md` must be a regular file with exactly one link
    (checked before the open and again on the open handle), on the same device as the root directory (`crosses a
    mount`). A FIFO, directory or device is refused without blocking (the open uses `O_NONBLOCK`).
-3. **No provider CLI home is entered or read** (hard rule 4). The CLI homes are found by **identity**: the parser
-   computes the account home from the account database (`getpwuid`) and also takes `HOME` (if it is an absolute path),
-   `stat`s each candidate CLI home under both (the Claude directory and its JSON file, and the Codex, Grok, Kimi
-   (`kimi-code` and `kimi`) and Gemini directories; names are built from parts in the program so no credential path is
-   written out), and compares the (device, inode) of **every directory of the walk** and of the file against them. A root
-   that is, or is inside, a CLI home is refused with `refused: provider CLI directory` before anything is opened. Because
-   this is by identity, case changes on a case-insensitive filesystem, bind mounts, symlinked `HOME` and a wrong `HOME`
-   do not help: `HOME` is only an extra source of candidate homes and is never trusted as the only one. If no home at
-   all is known the check cannot be made and the parser stops with an internal error (exit 3).
+3. **No provider CLI home is entered or read** (hard rule 4). The CLI home names come from one file,
+   **`compliance/denylist.txt`** (one entry per line, relative to the account home; `#` comments and blank lines are
+   ignored; every entry must match `^\.[A-Za-z0-9._-]+$` and not be only dots). The wrapper finds it from the script's own
+   physical directory (two levels up; a symbolic link to `parse.sh` is refused) and passes the absolute path to perl, which
+   opens it with `O_NOFOLLOW`, requires a regular file of 1 to 65536 bytes and reads it **at run time**. A file that is
+   missing, empty, without an entry or malformed is an internal error (exit 3, one fixed message, nothing is read): the
+   parser fails closed. The homes are found by **identity**: the parser computes the account home from the account database
+   (`getpwuid`) and also takes `HOME` (if it is an absolute path), `stat`s every denylist entry under both, and compares the
+   (device, inode) of **every directory of the walk** and of the file against them. A directory whose `lstat` identity is a CLI
+   home is refused with `refused: provider CLI directory` **before the `chdir` into it** (the check is made again after the
+   `chdir`), so a CLI home is never entered. Because this is by identity, case changes on a case-insensitive filesystem,
+   symlinked `HOME`, a wrong `HOME`, and a **bind mount of the home itself** at another path do not help (that last case
+   needs mount privilege to set up and is tested where the privilege exists). A CLI JSON file that is bind-mounted onto
+   `HANDOFF.md` of an ordinary root on the same device is refused by the same identity check on the leaf (tested where mount
+   is permitted). `HOME` is only an extra source of candidate homes and is never trusted as the only one. If no home at all
+   is known the check cannot be made and the parser stops with an internal error (exit 3).
 4. **The bytes validated are the bytes of the inode that was checked.** The file is `lstat`ed, opened once with
    `O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_NOCTTY`, `fstat`ed (the handle must be the regular, single-link inode that the
    `lstat` saw), and read from that handle into memory. All checks run on that memory.
@@ -73,21 +80,30 @@ When no other process is changing the files and directories involved while the p
    never the text.
 6. **The caller's perl environment cannot change the parser.** `env -i` removes `PERL5LIB`, `PERL5OPT`, `PERLLIB`,
    `PERL5DB`, `PERL_UNICODE`, `PERL_USE_UNSAFE_INC` and every other variable; `perl` and `env` are called by absolute
-   path; the program drops relative and hook entries from `@INC` before it loads any module. `HOME` is passed only as
-   data.
+   path; `perl -f` skips `sitecustomize.pl` (a no-op on a perl built without it); the program drops relative and hook
+   entries from `@INC` before it loads any module. `HOME` and the denylist path are passed only as data. The wrapper's own
+   bash starts in privileged mode (`#!/bin/bash -p`) when executed directly, so `BASH_ENV`, `ENV` and exported functions
+   do not reach it; a caller that runs `bash parse.sh` bypasses the shebang (see the precondition).
 7. **Nothing is written anywhere.** No temp file, no output file, no directory is created, and nothing is left behind
    on success, refusal or signal.
 
 The walk is also hardened against a path that changes under it (each directory is entered only after its `lstat`, the
 `stat` of the directory entered must give the same (device, inode), and `getcwd` must return the expected physical path
 after every step and after the open), and the handle is `fstat`ed again after the read. These are **defence in depth for
-accidents and for a lost race, not a guarantee against an attacker who can race the parser** (see below).
+accidents and for a lost race, not a guarantee against an attacker who can race the parser** (see below). In the same
+class: the `fstat` checks on the open handle (type, link count, identity against the `lstat`, size), the consistency check
+after the read, the CLI check after the `chdir` and the `getcwd` check after the leaf checks. The test suite shows that
+they are reachable, but removing any one of them does not fail a test, because an earlier check already refuses the same
+input when nothing races.
 
 ### Precondition for the caller (the scheduler)
 
-The parser assumes that nothing is changing the worktree. The caller must enforce this **before** it parses: the
-worker's process group has exited, been killed if needed, and **been reaped**. Only then call
-`parse.sh --root <worktree>`. The advice to run the parser under a wall-clock timeout (for example 10 s) and to treat a
+The parser assumes that nothing is changing the worktree. The caller must enforce this **before** it parses:
+**all of the worker's processes have exited**, been killed if needed, and **been reaped**. That means every process, not
+only the process group: a descendant that called `setsid` (or `setpgid`) left the group and is still a process of the same user
+that can race the parser. Only then call `parse.sh --root <worktree>`. Execute `parse.sh` directly (not as `bash parse.sh`),
+so that its `#!/bin/bash -p` shebang applies (privileged mode: `BASH_ENV`, `ENV` and exported functions are not imported;
+accepted by bash 3.2 on macOS). The advice to run the parser under a wall-clock timeout (for example 10 s) and to treat a
 timeout as a failed handoff still applies, but it is not a security control.
 
 ### Out of scope, stated plainly
@@ -97,6 +113,14 @@ timeout as a failed handoff still applies, but it is not a security control.
   cannot defend against another process of the same user; no check in a parser can. The control for this is **Phase 4
   worker sandboxing** (the worker cannot touch the parser or the files it parses), plus the precondition above. Earlier
   rounds claimed to close races by path checks; that claim is withdrawn.
+- **Anything that needs mount privilege** (root, or a setup done before the parse) is out of scope, in the same class as
+  the same-user process. Two cases the identity check cannot see, named so nobody assumes otherwise:
+  (a) a **bind mount of an outside file onto `HANDOFF.md`** on the same filesystem as the root (a single-link regular file
+  on the root's device that is not a CLI file looks like any other `HANDOFF.md`; a file on another device is refused as
+  `crosses a mount`, and a CLI JSON file in the denylist is refused by identity);
+  (b) a **bind mount of a subdirectory of a CLI home** (or of a file inside one) at another path: only the CLI home
+  directory itself and the denylisted files are known by identity, so a subdirectory or an inner file at a new path is not
+  recognised. Reaching them by their normal path is refused, because the walk passes through the CLI home.
 - Content that a still-running worker places inside the root: a file inside the root is a file inside the root.
 - Case-insensitive filesystems: the root is compared with the physical path that `getcwd` reports, so a root typed with
   different letter case than the one on disk is refused (fails closed). Give the exact physical path.
@@ -225,7 +249,8 @@ Exit codes: `0` valid; `1` invalid handoff or refused input (message on stderr, 
 (wrong arguments, including a second positional argument, a second `--root`, an unknown option or a missing value; a
 `--root` that is empty, blank, relative, at or above `PATH_MAX`, has a `.` or `..` component, does not exist or is not
 a directory; `/usr/bin/perl` missing); `3` internal error (no home directory is known so the CLI home check cannot be
-made, a read or write failure, or any unexpected perl failure; the message starts with `handoff: internal error:`; the
+made; `compliance/denylist.txt` is missing, empty or malformed, or `parse.sh` was started through a symbolic link; a read or
+write failure, or any unexpected perl failure; the message starts with `handoff: internal error:`; the
 file was not judged, so do not treat it as an invalid handoff). A signal ends the process with the usual signal status
 and, because stdout is written once at the end, normally prints nothing; **a signal during that final write can still
 cut the output short**, so a caller must treat a non-zero status as a failed handoff.

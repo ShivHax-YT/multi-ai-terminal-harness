@@ -3,6 +3,9 @@
 #   /bin/bash spike/tests/test_handoff.sh
 # Exit 0 = all checks passed. Uses only temp dirs; never touches the network.
 #
+# Round 8: the provider CLI home names come from compliance/denylist.txt (read by the parser at run time; the tests
+# iterate the same file, so no credential path is written in this file). The sandbox copy of the parser lives in a copy of
+# the repo layout (spike/handoff/parse.sh next to compliance/denylist.txt).
 # Round 7: the interface is `parse.sh --root <dir>` and the parser reads exactly <dir>/HANDOFF.md (one perl process, no
 # temp files). Fixtures are copied into per-test sandbox roots as HANDOFF.md (run_parse). The guarantees tested here hold
 # for a filesystem that is not changing during the parse; the race tests only check that a lost race never prints the
@@ -41,9 +44,14 @@ trap cleanup EXIT
 # PERL5LIB reach perl, and (2) the account-database home lookup is replaced by an environment variable, so a test can
 # put the "real account home" somewhere else than HOME (a passwd-independent seam). The copy is checked against the
 # real file below: it differs in exactly those two lines.
-SEAM_DIR="$TMP/seam"
-mkdir -p "$SEAM_DIR"
+REPO_ROOT="$(cd "$SPIKE/.." && pwd -P)"
+DENY_FILE="$REPO_ROOT/compliance/denylist.txt"
+SEAM_REPO="$TMP/seam"
+SEAM_DIR="$SEAM_REPO/spike/handoff"
+mkdir -p "$SEAM_DIR" "$SEAM_REPO/compliance"
+cp "$DENY_FILE" "$SEAM_REPO/compliance/denylist.txt"
 sed -e 's|^exec "\$ENV_BIN" -i |exec "$ENV_BIN" |' -e 's|(getpwuid(\$<))\[7\]|$ENV{HANDOFF_TEST_PWDIR}|' "$PARSE" >"$SEAM_DIR/parse.sh"
+chmod +x "$SEAM_DIR/parse.sh"
 SEAM="$SEAM_DIR/parse.sh"
 sed -e 's|^PERL_BIN=.*|PERL_BIN=/nonexistent/perl|' "$PARSE" >"$SEAM_DIR/noperl.sh"
 
@@ -410,11 +418,20 @@ for pat in '\bsystem\b' '\bqx\b' '`' '\beval\b' '\bexec\b' '\bfork\b' '\bopen\('
 done
 eq "the program has no single quote inside (it is one single-quoted constant)" "$(sed -n "/^PERL_PROG='/,/^exec /p" "$PARSE" | grep -c "'")" "2"
 eq "exactly one exec in the wrapper" "$(printf '%s\n' "$code" | grep -c '^exec ')" "1"
-check "perl is called by an absolute path, with env -i" grep -q '^exec "\$ENV_BIN" -i PATH=/usr/bin:/bin LC_ALL=C "\$PERL_BIN" -e "\$PERL_PROG" -- "\$ROOT_ARG" "\${HOME-}"$' "$PARSE"
+check "perl is called by an absolute path, with env -i, with -f (no sitecustomize), root/HOME/denylist as data" grep -q '^exec "\$ENV_BIN" -i PATH=/usr/bin:/bin LC_ALL=C "\$PERL_BIN" -f -e "\$PERL_PROG" -- "\$ROOT_ARG" "\${HOME-}" "\$DENYLIST"$' "$PARSE"
+eq "the wrapper's first line is the privileged-mode shebang" "$(head -n 1 "$PARSE")" "#!/bin/bash -p"
+check "the wrapper is executable" test -x "$PARSE"
+check "the wrapper unsets BASH_ENV and ENV" grep -q '^unset CDPATH BASH_ENV ENV$' "$PARSE"
+check "the __DIE__ handler re-throws inside an eval (die @_ if \$^S)" grep -q 'SIG{__DIE__} = sub { die @_ if \$^S; ' "$PARSE"
+eq "no list of CLI home names is built in the program (round 8: denylist file only)" "$(grep -c -e 'cli_names' -e 'built from parts' "$PARSE")" "0"
+check "the denylist file is opened with O_NOFOLLOW" grep -q 'sysopen(\$fh, \$path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)' "$PARSE"
+eq "the denylist entry pattern is the one in the brief" "$(grep -c 'unless \$line =~ /\\A\\.\[A-Za-z0-9._-\]+\\z/' "$PARSE")" "1"
 check "ENV_BIN and PERL_BIN are fixed absolute paths" test "$(grep -c -e '^ENV_BIN=/usr/bin/env$' -e '^PERL_BIN=/usr/bin/perl$' "$PARSE")" = "2"
 check "the leaf name HANDOFF.md is one constant" test "$(grep -c 'my \$NAME = "HANDOFF.md";' "$PARSE")" = "1"
 check "the open is sysopen with O_NOFOLLOW and O_NONBLOCK" grep -q 'sysopen(\$in, \$NAME, O_RDONLY | O_NOFOLLOW | O_NONBLOCK' "$PARSE"
-eq "the leaf is opened exactly once" "$(printf '%s\n' "$prog" | grep -c 'sysopen(')" "1"
+eq "the leaf is opened exactly once" "$(printf '%s\n' "$prog" | grep -c 'sysopen(\$in')" "1"
+eq "two sysopen calls in all: the denylist and the leaf" "$(printf '%s\n' "$prog" | grep -c 'sysopen(')" "2"
+eq "no chdir happens before the CLI home check in the walk (source order)" "$(printf '%s\n' "$prog" | grep -n -e 'refuse(\$cli_msg) if denied(@l);' -e 'chdir(\$c)' | cut -d: -f2- | sed -e 's/^ *//' -e 's/ *#.*//' | tr '\n' '|')" 'refuse($cli_msg) if denied(@l);|refuse("cannot read --root: a directory of the root path cannot be entered") unless chdir($c);|' 
 check "the CLI home lookup uses the account database" test "$(grep -c 'getpwuid' "$PARSE")" = "1"
 check "no compound local array assignment (bash 3.2 safe)" test "$(printf '%s\n' "$code" | grep -c 'local [A-Za-z_]*=(')" = "0"
 check "the CLI homes are compared by identity (device and inode)" grep -q '\$deny{"\$s\[0\]:\$s\[1\]"}' "$PARSE"
@@ -425,6 +442,7 @@ eq "no chdir to the root by string" "$(grep -c 'chdir(\$root)' "$PARSE")" "0"
 
 # the sandbox copy differs from the real parser in exactly the two seam lines
 eq "the sandbox copy changes exactly the two seam lines" "$(diff "$PARSE" "$SEAM" | grep -c '^<')" "2"
+check "the sandbox copy sits in a copy of the repo layout with the real denylist" cmp -s "$DENY_FILE" "$SEAM_REPO/compliance/denylist.txt"
 eq "the sandbox copy has no env -i left" "$(grep -c 'ENV_BIN" -i' "$SEAM")" "0"
 eq "the sandbox copy has no getpwuid left" "$(grep -c 'getpwuid' "$SEAM")" "0"
 
@@ -825,6 +843,9 @@ eq "strace: no open for writing, create or truncate (bash's failing tty probe as
   eq "strace: no fork or clone (a single process after the exec chain)" "$(grep -Ec '(clone|clone3|fork|vfork)\(' "$TMP/strace.out")" "0"
   eq "strace: four execs only (the strace helper env, bash, env, perl)" "$(grep -c 'execve(' "$TMP/strace.out")" "4"
   eq "strace: the last exec is /usr/bin/perl" "$(grep 'execve(' "$TMP/strace.out" | tail -1 | grep -c 'execve("/usr/bin/perl"')" "1"
+  eq "strace: perl is started with -f (no sitecustomize)" "$(grep 'execve(' "$TMP/strace.out" | tail -1 | grep -c 'execve("/usr/bin/perl", \["/usr/bin/perl", "-f", "-e"')" "1"
+  eq "strace: exactly two opens of files under compliance/ or HANDOFF.md: the denylist once, the leaf once" "$(grep -E '(openat|open)\(' "$TMP/strace.out" | grep -c -e 'compliance/denylist.txt' -e '"HANDOFF.md"')" "2"
+  eq "strace: the denylist is opened with O_NOFOLLOW" "$(grep -E '(openat|open)\(' "$TMP/strace.out" | grep 'compliance/denylist.txt' | grep -c O_NOFOLLOW)" "1"
 else
   printf 'NOTE: strace is not usable here; the syscall-level checks are skipped\n'
 fi
@@ -948,22 +969,27 @@ eq "control: the sandbox copy still parses (rc 0)" "$RC" "0"
 # the parser itself drops a relative @INC entry (older perls put . there)
 check "the program removes relative and hook entries from @INC before any use" grep -q '@INC = grep { !ref(\$_) && m{\\A/} } @INC;' "$PARSE"
 # the environment is HOME-independent for data: HOME is only passed in @ARGV
-check "HOME is passed as data in @ARGV only" grep -q '"\${HOME-}"$' "$PARSE"
+check "HOME is passed as data in @ARGV only" grep -q '"\${HOME-}" "\$DENYLIST"$' "$PARSE"
 
 # ---- provider CLI homes, by identity (hard rule 4) -----------------------------------------------------------------------
-# The names are built from parts, as in the parser, so no literal credential path appears in this file. FAKE is a fake
-# account home with canaries in it. The sandbox copy takes the "account database" home from HANDOFF_TEST_PWDIR.
+# The names come from compliance/denylist.txt (the parser reads the same file at run time), so no literal credential path
+# appears in this file. FAKE is a fake account home with canaries in it. The sandbox copy takes the "account database"
+# home from HANDOFF_TEST_PWDIR.
+DENY_ENTRIES=$(sed -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$DENY_FILE" | grep -v '^$')
+DENY_N=$(printf '%s\n' "$DENY_ENTRIES" | wc -l | tr -d ' ')
+check "the denylist file has entries (and every entry has the shape ^\\.[A-Za-z0-9._-]+\$)" test "$DENY_N" -ge 1 -a "$(printf '%s\n' "$DENY_ENTRIES" | grep -Ec '^\.[A-Za-z0-9._-]+$')" = "$DENY_N"
+E_A=$(printf '%s\n' "$DENY_ENTRIES" | sed -n 1p)
+E_B=$(printf '%s\n' "$DENY_ENTRIES" | tail -n 1)
+E_JSON=$(printf '%s\n' "$DENY_ENTRIES" | grep -m1 '\.json$')
 FAKE="$TMP/r7/home"
 NOHOME="$TMP/r7/elsewhere"
 mkdir -p "$FAKE" "$NOHOME"
-cli_name() { printf '.%s' "$1"; }
-cli_home() { printf '%s/%s' "$FAKE" "$(cli_name "$1")"; }
-for n in claude codex grok kimi-code kimi gemini; do
+cli_home() { printf '%s/%s' "$FAKE" "$1"; }
+for n in $DENY_ENTRIES; do
   mkdir -p "$(cli_home "$n")/sub"
   mk "CLI-CANARY-$n" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$(cli_home "$n")/HANDOFF.md"
   mk "CLI-CANARY-$n" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$(cli_home "$n")/sub/HANDOFF.md"
 done
-mk "CLI-CANARY-JSON" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$FAKE/$(cli_name claude.json)"
 # the account-database home is unrelated to the fake home in the real parser; HOME carries the fake home as data
 home_refused() { # <desc> <root> [HOME value] [PWDIR value]: via the sandbox copy; pwdir defaults to NOHOME, HOME to FAKE
   HOME="${3-$FAKE}" HANDOFF_TEST_PWDIR="${4-$NOHOME}" seam_run "$2"
@@ -974,7 +1000,7 @@ home_refused() { # <desc> <root> [HOME value] [PWDIR value]: via the sandbox cop
   elif [ "$(count_tmp)" -ne 0 ]; then fail "$1: something was left in TMPDIR"
   else pass; fi
 }
-for n in claude codex grok kimi-code kimi gemini; do
+for n in $DENY_ENTRIES; do
   home_refused "CLI home $n as the root (HOME is the fake home)" "$(cli_home "$n")"
   home_refused "a directory inside CLI home $n as the root (HOME is the fake home)" "$(cli_home "$n")/sub"
   # HOME pointing away does not lift the refusal: the account database home is the fake home
@@ -984,49 +1010,49 @@ for n in claude codex grok kimi-code kimi gemini; do
   home_refused "CLI home $n as the root, HOME empty, account home is the fake home" "$(cli_home "$n")" "" "$FAKE"
 done
 # real parser (no seam): HOME carries the fake home
-HOME="$FAKE" TMPDIR="$TDIR" "$SH" "$PARSE" --root "$(cli_home codex)" >"$TMP/out" 2>"$TMP/err" </dev/null
-eq "real parser, HOME is the fake home: the codex home as the root is refused (rc 1)" "$?" "1"
+HOME="$FAKE" TMPDIR="$TDIR" "$SH" "$PARSE" --root "$(cli_home "$E_A")" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "real parser, HOME is the fake home: the first denylist entry as the root is refused (rc 1)" "$?" "1"
 has "real parser: the CLI refusal" "$(cat "$TMP/err")" "refused: provider CLI directory"
 if grep -q 'CLI-CANARY' "$TMP/out" "$TMP/err"; then fail "real parser: canary leaked"; else pass; fi
-HOME="$FAKE" TMPDIR="$TDIR" "$SH" "$PARSE" --root "$(cli_home claude)/sub" >"$TMP/out" 2>"$TMP/err" </dev/null
-eq "real parser, HOME is the fake home: a directory inside the Claude home is refused (rc 1)" "$?" "1"
-# the claude JSON file is a CLI home name too: a hard link to it is refused (by the link count first), and a root cannot be a file
+HOME="$FAKE" TMPDIR="$TDIR" "$SH" "$PARSE" --root "$(cli_home "$E_B")/sub" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "real parser, HOME is the fake home: a directory inside the last denylist entry is refused (rc 1)" "$?" "1"
 # a symlink into a CLI home is refused by the walk
 sl=$(mkroot clilink)
-ln -s "$(cli_home codex)" "$sl/link-codex"
-HOME="$FAKE" HANDOFF_TEST_PWDIR="$NOHOME" seam_run "$sl/link-codex"
-eq "a symlink into the codex home is refused (rc 1)" "$RC" "1"
-has "a symlink into the codex home: symlink not allowed" "$ERR" "symlink not allowed"
-if grep -q 'CLI-CANARY' "$TMP/out" "$TMP/err"; then fail "a symlink into the codex home: canary read"; else pass; fi
+ln -s "$(cli_home "$E_A")" "$sl/link-cli"
+HOME="$FAKE" HANDOFF_TEST_PWDIR="$NOHOME" seam_run "$sl/link-cli"
+eq "a symlink into a CLI home is refused (rc 1)" "$RC" "1"
+has "a symlink into a CLI home: symlink not allowed" "$ERR" "symlink not allowed"
+if grep -q 'CLI-CANARY' "$TMP/out" "$TMP/err"; then fail "a symlink into a CLI home: canary read"; else pass; fi
 # HOME given as a symlink: the identity of the resolved CLI home is what counts
-mkdir -p "$TMP/r7/realhome/$(cli_name codex)"
-mk "CLI-CANARY-REALHOME" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$TMP/r7/realhome/$(cli_name codex)/HANDOFF.md"
+mkdir -p "$TMP/r7/realhome/$E_A"
+mk "CLI-CANARY-REALHOME" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$TMP/r7/realhome/$E_A/HANDOFF.md"
 ln -s "$TMP/r7/realhome" "$TMP/r7/homelink"
-home_refused "HOME as a symlink: the resolved CLI home is refused (identity)" "$TMP/r7/realhome/$(cli_name codex)" "$TMP/r7/homelink" "$NOHOME"
+home_refused "HOME as a symlink: the resolved CLI home is refused (identity)" "$TMP/r7/realhome/$E_A" "$TMP/r7/homelink" "$NOHOME"
 # a CLI home that is itself a symlink to a directory elsewhere: the target directory is refused (stat follows)
 mkdir -p "$TMP/r7/target-of-link" "$TMP/r7/linkhome"
 mk "CLI-CANARY-TARGET" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$TMP/r7/target-of-link/HANDOFF.md"
-ln -s "$TMP/r7/target-of-link" "$TMP/r7/linkhome/$(cli_name grok)"
+ln -s "$TMP/r7/target-of-link" "$TMP/r7/linkhome/$E_B"
 home_refused "a CLI home that is a symlink: its target directory is refused" "$TMP/r7/target-of-link" "$TMP/r7/linkhome" "$NOHOME"
 # near misses are not CLI homes, and a parent of a CLI home (HOME itself) is not one
-mkdir -p "$FAKE/$(cli_name codex)-notes" "$FAKE/codex"
-mk "NEAR-OK" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$FAKE/$(cli_name codex)-notes/HANDOFF.md"
-mk "NEAR-OK" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$FAKE/codex/HANDOFF.md"
+NOTDOT="${E_A#.}"
+mkdir -p "$FAKE/${E_A}-notes" "$FAKE/$NOTDOT"
+mk "NEAR-OK" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$FAKE/${E_A}-notes/HANDOFF.md"
+mk "NEAR-OK" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$FAKE/$NOTDOT/HANDOFF.md"
 mk "HOME-OK" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$FAKE/HANDOFF.md"
-HOME="$FAKE" HANDOFF_TEST_PWDIR="$NOHOME" seam_run "$FAKE/$(cli_name codex)-notes"
+HOME="$FAKE" HANDOFF_TEST_PWDIR="$NOHOME" seam_run "$FAKE/${E_A}-notes"
 eq "a near miss of a CLI home name (dot name with a suffix) is not refused (rc 0)" "$RC" "0"
-HOME="$FAKE" HANDOFF_TEST_PWDIR="$NOHOME" seam_run "$FAKE/codex"
+HOME="$FAKE" HANDOFF_TEST_PWDIR="$NOHOME" seam_run "$FAKE/$NOTDOT"
 eq "a directory named like a CLI home without the dot is not refused (rc 0)" "$RC" "0"
 HOME="$FAKE" HANDOFF_TEST_PWDIR="$NOHOME" seam_run "$FAKE"
 eq "HOME itself (the parent of the CLI homes) is not refused (rc 0)" "$RC" "0"
 # HOME unset or relative is fine while the account database gives a home (the old round 6 "internal error" is gone)
-HOME="" HANDOFF_TEST_PWDIR="$NOHOME" seam_run "$FAKE/codex"
+HOME="" HANDOFF_TEST_PWDIR="$NOHOME" seam_run "$FAKE/$NOTDOT"
 eq "HOME empty with a known account home: parses (rc 0)" "$RC" "0"
 # no home known at all: the check cannot be made, so it fails closed as an internal error
-(unset HOME; unset HANDOFF_TEST_PWDIR; seam_run "$FAKE/codex"; printf '%s\n%s\n' "$RC" "$ERR" >"$TMP/nohome.txt")
+(unset HOME; unset HANDOFF_TEST_PWDIR; seam_run "$FAKE/$NOTDOT"; printf '%s\n%s\n' "$RC" "$ERR" >"$TMP/nohome.txt")
 eq "no account home and no HOME: internal error (rc 3)" "$(sed -n 1p "$TMP/nohome.txt")" "3"
 has "no home known: the message says internal error" "$(sed -n 2p "$TMP/nohome.txt")" "internal error"
-(HOME=relative/dir; unset HANDOFF_TEST_PWDIR; seam_run "$FAKE/codex"; printf '%s\n' "$RC" >"$TMP/nohome.txt")
+(HOME=relative/dir; unset HANDOFF_TEST_PWDIR; seam_run "$FAKE/$NOTDOT"; printf '%s\n' "$RC" >"$TMP/nohome.txt")
 eq "no account home and a relative HOME: internal error (rc 3)" "$(cat "$TMP/nohome.txt")" "3"
 # the real parser on this machine: the account database gives a home, so an unset HOME still parses
 (unset HOME; TMPDIR="$TDIR" "$SH" "$PARSE" --root "$lf" >"$TMP/out" 2>"$TMP/err" </dev/null; printf '%s\n' "$?" >"$TMP/nohome.txt")
@@ -1035,14 +1061,208 @@ eq "real parser, HOME unset: parses through the account database home (rc 0)" "$
 # identity, not strings: a bind mount of a CLI home under another path is refused (needs mount privilege)
 BINDROOT="$TMP/r7/bind"
 mkdir -p "$BINDROOT"
-if mount --bind "$(cli_home codex)" "$BINDROOT" 2>/dev/null; then
+if mount --bind "$(cli_home "$E_A")" "$BINDROOT" 2>/dev/null; then
   MOUNTED="$BINDROOT"
-  home_refused "a bind mount of the codex home under another path is refused (same device and inode)" "$BINDROOT"
+  home_refused "a bind mount of a CLI home itself under another path is refused (same device and inode)" "$BINDROOT"
   umount "$BINDROOT"
   MOUNTED=''
 else
   printf 'NOTE: mount --bind is not allowed here; the bind-mount identity test is skipped\n'
 fi
+
+# a CLI home is refused BEFORE it is entered (round 8): a chdir logger (CORE::GLOBAL::chdir, loaded through PERL5OPT in the
+# sandbox copy only) records every directory the walk enters. The root is a CLI home (or inside one): the refusal message
+# is the CLI refusal, and the entry's name never appears in the chdir log. Control: HOME itself is entered, so the log works.
+CHD="$TMP/chd"
+mkdir -p "$CHD/lib"
+cat >"$CHD/lib/ChdirLog.pm" <<'PM'
+package ChdirLog;
+no strict 'refs';
+# Test-only: log every chdir argument to HANDOFF_TEST_CHDIR_LOG, then do the chdir.
+*{"CORE::GLOBAL::chdir"} = sub {
+  if (defined $ENV{HANDOFF_TEST_CHDIR_LOG}) {
+    open(my $fh, '>>', $ENV{HANDOFF_TEST_CHDIR_LOG}) or die "log";
+    print $fh "$_[0]\n";
+    close($fh);
+  }
+  return CORE::chdir($_[0]);
+};
+1;
+PM
+chd_run() { # <root> <log>: sandbox copy, HOME is the fake home, the account home is elsewhere
+  rm -f "$2"
+  HOME="$FAKE" HANDOFF_TEST_PWDIR="$NOHOME" PERL5OPT="-I$CHD/lib -MChdirLog" HANDOFF_TEST_CHDIR_LOG="$2" seam_run "$1"
+}
+chd_run "$FAKE" "$TMP/chd.log"
+eq "control: the chdir logger sees the walk into the fake home (rc 0)" "$RC" "0"
+check "control: the log has the name of the fake home directory" grep -qx "$(basename "$FAKE")" "$TMP/chd.log"
+for n in $DENY_ENTRIES; do
+  chd_run "$(cli_home "$n")" "$TMP/chd.log"
+  eq "CLI home $n as the root: refused (rc 1)" "$RC" "1"
+  has "CLI home $n as the root: the CLI refusal message" "$ERR" "refused: provider CLI directory"
+  check "CLI home $n as the root: the walk reached its parent (log has the fake home)" grep -qx "$(basename "$FAKE")" "$TMP/chd.log"
+  check "CLI home $n as the root: NEVER entered (no chdir to $n)" test "$(grep -cxF -e "$n" "$TMP/chd.log")" = "0"
+  chd_run "$(cli_home "$n")/sub" "$TMP/chd.log"
+  eq "inside CLI home $n: refused (rc 1)" "$RC" "1"
+  check "inside CLI home $n: no chdir to $n and none to sub" test "$(grep -cxF -e "$n" -e sub "$TMP/chd.log")" = "0"
+done
+if command -v strace >/dev/null 2>&1 && strace -f -o /dev/null true 2>/dev/null; then
+  HOME="$FAKE" HANDOFF_TEST_PWDIR="$NOHOME" strace -f -qq -o "$TMP/strace-chdir.out" -e trace=chdir,fchdir "$SH" "$SEAM" --root "$(cli_home "$E_A")" >"$TMP/out" 2>"$TMP/err" </dev/null
+  eq "strace: the CLI home as the root is refused (rc 1)" "$?" "1"
+  check "strace: the walk did chdir into the parent (control)" grep -q "chdir(\"$(basename "$FAKE")\")" "$TMP/strace-chdir.out"
+  check "strace: there is no chdir syscall into the CLI home" test "$(grep -cF "chdir(\"$E_A\")" "$TMP/strace-chdir.out")" = "0"
+else
+  printf 'NOTE: strace is not usable here; the syscall-level check of "never entered" is skipped (the chdir logger above covers it)\n'
+fi
+
+# leaf identity (round 8): a file of the CLI set (the JSON file in the denylist) bind-mounted onto HANDOFF.md of an
+# ordinary root is refused by identity, even though it is a regular single-link file on the root's device. Needs mount
+# privilege; skipped with a NOTE otherwise. Control: an ordinary file bind-mounted the same way parses.
+FAKE2="$TMP/r8/home2"
+LEAFR="$TMP/r8/leafroot"
+mkdir -p "$FAKE2" "$LEAFR"
+if [ -n "$E_JSON" ]; then
+  mk "CLI-CANARY-JSON" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$FAKE2/$E_JSON"
+  mk "LEAF-CONTROL-OK" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$FAKE2/ordinary.md"
+  : >"$LEAFR/HANDOFF.md"
+  if mount --bind "$FAKE2/$E_JSON" "$LEAFR/HANDOFF.md" 2>/dev/null; then
+    MOUNTED="$LEAFR/HANDOFF.md"
+    home_refused "a CLI JSON file bind-mounted onto HANDOFF.md is refused by identity (same device, one link, regular)" "$LEAFR" "$FAKE2"
+    umount "$LEAFR/HANDOFF.md"
+    MOUNTED=''
+    if mount --bind "$FAKE2/ordinary.md" "$LEAFR/HANDOFF.md" 2>/dev/null; then
+      MOUNTED="$LEAFR/HANDOFF.md"
+      HOME="$FAKE2" HANDOFF_TEST_PWDIR="$NOHOME" seam_run "$LEAFR"
+      eq "control: an ordinary file bind-mounted onto HANDOFF.md parses (rc 0)" "$RC" "0"
+      umount "$LEAFR/HANDOFF.md"
+      MOUNTED=''
+    fi
+  else
+    printf 'NOTE: mount --bind of a file is not allowed here; the leaf identity test is skipped\n'
+  fi
+else
+  printf 'NOTE: the denylist has no .json entry; the leaf identity test is skipped\n'
+fi
+
+# ---- the denylist file (round 8): read at run time, fail closed ---------------------------------------------------------------
+# lay_out <name>: a copy of the repo layout holding the REAL parser (no seam) and a copy of the denylist; prints the
+# directory. Tests then replace the denylist and run <dir>/spike/handoff/parse.sh on the sandbox root.
+lay_out() {
+  local d="${TMP:?}/lay/${1:?}"
+  rm -rf "${d:?}"
+  mkdir -p "$d/spike/handoff" "$d/compliance"
+  cp "$PARSE" "$d/spike/handoff/parse.sh"
+  chmod +x "$d/spike/handoff/parse.sh"
+  cp "$DENY_FILE" "$d/compliance/denylist.txt"
+  printf '%s' "$d"
+}
+lay_run() { # <layout dir> <root>: runs the layout's parser (HOME is the fake home). Sets RC, OUT, ERR.
+  HOME="$FAKE" TMPDIR="$TDIR" "$SH" "$1/spike/handoff/parse.sh" --root "$2" >"$TMP/out" 2>"$TMP/err" </dev/null
+  RC=$?
+  OUT=$(cat "$TMP/out")
+  ERR=$(cat "$TMP/err")
+}
+expect_deny_bad() { # <desc> <layout dir>: the layout's denylist is unusable: exit 3, fixed message, nothing else
+  lay_run "$2" "$BOX"
+  if [ "$RC" -ne 3 ]; then fail "$1: expected exit 3, got $RC ($ERR)"
+  elif [ -n "$OUT" ]; then fail "$1: stdout must be empty"
+  elif [[ $ERR != "handoff: internal error: the compliance denylist"* ]]; then fail "$1: expected the fixed denylist message, got: $ERR"
+  elif [ "$(printf '%s\n' "$ERR" | wc -l | tr -d ' ')" -ne 1 ]; then fail "$1: the message must be one line"
+  else pass; fi
+}
+cat "$FIX/good.md" >"$BOX/HANDOFF.md"
+ly=$(lay_out ok)
+lay_run "$ly" "$BOX"
+eq "control: a copy of the repo layout with the real denylist parses (rc 0)" "$RC" "0"
+(cd "$ly/spike/handoff" && HOME="$FAKE" "$SH" ./parse.sh --root "$BOX" >"$TMP/out" 2>"$TMP/err" </dev/null)
+eq "run from its own directory by a relative path: the denylist is found (rc 0)" "$?" "0"
+ln -s "$ly" "$TMP/lay/ok-dirlink"
+HOME="$FAKE" "$SH" "$TMP/lay/ok-dirlink/spike/handoff/parse.sh" --root "$BOX" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "run through a symlinked directory: located by the physical directory (rc 0)" "$?" "0"
+ln -s "$ly/spike/handoff/parse.sh" "$TMP/lay/parse-link.sh"
+HOME="$FAKE" "$SH" "$TMP/lay/parse-link.sh" --root "$BOX" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "a symbolic link to parse.sh is refused (rc 3)" "$?" "3"
+has "a symbolic link to parse.sh: the message says why" "$(cat "$TMP/err")" "physical path"
+eq "a symbolic link to parse.sh: stdout empty" "$(cat "$TMP/out")" ""
+
+ly=$(lay_out missing)
+rm -f "$ly/compliance/denylist.txt"
+expect_deny_bad "denylist missing" "$ly"
+ly=$(lay_out nodir)
+rmdir "$ly/compliance" 2>/dev/null || { rm -f "$ly/compliance/denylist.txt"; rmdir "$ly/compliance"; }
+expect_deny_bad "denylist directory missing" "$ly"
+ly=$(lay_out empty)
+: >"$ly/compliance/denylist.txt"
+expect_deny_bad "denylist empty (0 bytes)" "$ly"
+ly=$(lay_out onlycomments)
+printf '# only a comment\n\n   \n\t# another\n' >"$ly/compliance/denylist.txt"
+expect_deny_bad "denylist with comments and blank lines only (no entry)" "$ly"
+ly=$(lay_out isdir)
+rm -f "$ly/compliance/denylist.txt"
+mkdir "$ly/compliance/denylist.txt"
+expect_deny_bad "denylist is a directory" "$ly"
+ly=$(lay_out issymlink)
+rm -f "$ly/compliance/denylist.txt"
+ln -s "$DENY_FILE" "$ly/compliance/denylist.txt"
+expect_deny_bad "denylist is a symbolic link (O_NOFOLLOW)" "$ly"
+ly=$(lay_out fifo)
+rm -f "$ly/compliance/denylist.txt"
+mkfifo "$ly/compliance/denylist.txt"
+expect_deny_bad "denylist is a FIFO (refused without blocking)" "$ly"
+ly=$(lay_out big)
+"$REAL_PERL" -e 'print ".a\n" x 40000' >"$ly/compliance/denylist.txt"
+expect_deny_bad "denylist larger than 64 KB" "$ly"
+bad_n=0
+while IFS= read -r badline; do
+  bad_n=$((bad_n + 1))
+  ly=$(lay_out "bad$bad_n")
+  { cat "$DENY_FILE"; printf '%s\n' "$badline"; } >"$ly/compliance/denylist.txt"
+  expect_deny_bad "denylist with one malformed entry [$badline]" "$ly"
+done <<'LINES'
+noleadingdot
+/abs/path
+.a/b
+..
+.
+...
+.has space
+.semi;colon
+.dollar$x
+.back`tick`
+.star*
+-.dash
+.é
+ .ok then more
+.ok;
+LINES
+# a NUL byte or invalid UTF-8 inside an entry
+ly=$(lay_out nul)
+{ cat "$DENY_FILE"; printf '.a\000b\n'; } >"$ly/compliance/denylist.txt"
+expect_deny_bad "denylist with a NUL byte in an entry" "$ly"
+ly=$(lay_out hibyte)
+{ cat "$DENY_FILE"; printf '.a\377\n'; } >"$ly/compliance/denylist.txt"
+expect_deny_bad "denylist with a high byte in an entry" "$ly"
+# a good denylist with comments, blank lines, CRLF, inline comments and tabs is accepted, and its entries are what counts
+ly=$(lay_out extra)
+mkdir -p "$FAKE/.zzz-extra-entry/sub" "$FAKE/.zzz-extra-entry2"
+mk "CLI-CANARY-EXTRA" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$FAKE/.zzz-extra-entry/sub/HANDOFF.md"
+mk "CLI-CANARY-EXTRA" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$FAKE/.zzz-extra-entry2/HANDOFF.md"
+printf '# comment\r\n\r\n\t.zzz-extra-entry   # inline comment\r\n   \n.zzz-extra-entry2\r\n' >"$ly/compliance/denylist.txt"
+lay_run "$ly" "$FAKE/.zzz-extra-entry/sub"
+eq "a custom denylist entry (comments, CRLF, tabs) is read at run time and refused (rc 1)" "$RC" "1"
+has "custom entry: the CLI refusal" "$ERR" "refused: provider CLI directory"
+lay_run "$ly" "$FAKE/.zzz-extra-entry2"
+eq "the second custom entry (after a CRLF line) is refused (rc 1)" "$RC" "1"
+# an entry that is NOT in this layout's denylist is not refused: the names are not built in
+lay_run "$ly" "$(cli_home "$E_A")"
+eq "a real entry that is absent from the layout's denylist is not refused: nothing is built in (rc 0)" "$RC" "0"
+rm -r "${FAKE:?}/.zzz-extra-entry" "${FAKE:?}/.zzz-extra-entry2"
+# the real parser on the real layout, once per entry of the real file, with HOME the fake home
+for n in $DENY_ENTRIES; do
+  HOME="$FAKE" TMPDIR="$TDIR" "$SH" "$PARSE" --root "$(cli_home "$n")" >"$TMP/out" 2>"$TMP/err" </dev/null
+  rc=$?
+  if [ "$rc" -eq 1 ] && grep -q 'refused: provider CLI directory' "$TMP/err" && ! grep -q CLI-CANARY "$TMP/out" "$TMP/err"; then pass; else fail "the real parser must refuse the denylist entry $n as the root (rc=$rc)"; fi
+done
 
 # ---- mounts: the leaf must be on the device of the root directory ----------------------------------------------------------
 # a tmpfs mount holding the root is allowed (the walk crosses mounts to reach the root); a HANDOFF.md on another device
@@ -1053,10 +1273,12 @@ cat >"$LIE/lib/LieStat.pm" <<'PM'
 package LieStat;
 no strict 'refs';
 # Test-only lstat override (loaded through PERL5OPT in the sandbox copy only). HANDOFF_TEST_LIE_NAME names the path the
-# parser looks up; HANDOFF_TEST_LIE_AS makes lstat answer for another path; HANDOFF_TEST_LIE_DEVPLUS adds 1 to st_dev.
+# parser looks up; HANDOFF_TEST_LIE_AS makes lstat answer for another path; HANDOFF_TEST_LIE_DEVPLUS adds 1 to st_dev;
+# HANDOFF_TEST_LIE_DIE makes the lstat of that path die (the unexpected-failure test).
 *{"CORE::GLOBAL::lstat"} = sub {
   my $name = @_ ? $_[0] : $_;
   my $match = defined $ENV{HANDOFF_TEST_LIE_NAME} && $name eq $ENV{HANDOFF_TEST_LIE_NAME};
+  die "boom DIE-CANARY\n" if $match && defined $ENV{HANDOFF_TEST_LIE_DIE};
   $name = $ENV{HANDOFF_TEST_LIE_AS} if $match && defined $ENV{HANDOFF_TEST_LIE_AS};
   my @r = CORE::lstat($name);
   $r[0] += 1 if @r && $match && defined $ENV{HANDOFF_TEST_LIE_DEVPLUS};
@@ -1079,6 +1301,62 @@ HANDOFF_TEST_LIE_NAME=HANDOFF.md HANDOFF_TEST_LIE_AS=other.md lie_run "$lf"
 eq "an lstat that saw another inode than the open file is refused (rc 1)" "$RC" "1"
 has "identity change between lstat and open" "$ERR" "input changed between the lstat and the open"
 rm -f "$lf/other.md"
+
+# O_NOFOLLOW, behaviourally (round 8): HANDOFF.md is a symlink to a valid regular file, and the lstat is made to lie (it
+# answers for the regular file), so every check before the open passes. Only the O_NOFOLLOW open stands between the parser and
+# the symlink target: it must refuse "at open" and never print the target's content. Control: the honest lstat refuses
+# "before open". (The source grep above stays as an extra.)
+nf=$(mkroot nofollow)
+mk "NOFOLLOW-CANARY" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$nf/other.md"
+ln -s other.md "$nf/HANDOFF.md"
+HANDOFF_TEST_LIE_NAME=HANDOFF.md HANDOFF_TEST_LIE_AS=other.md lie_run "$nf"
+eq "symlink HANDOFF.md with a lying lstat: refused (rc 1)" "$RC" "1"
+has "symlink HANDOFF.md with a lying lstat: refused AT OPEN (O_NOFOLLOW, ELOOP)" "$ERR" "refused at open"
+eq "symlink HANDOFF.md with a lying lstat: stdout empty" "$OUT" ""
+if grep -q NOFOLLOW-CANARY "$TMP/out" "$TMP/err"; then fail "O_NOFOLLOW: the symlink target was read"; else pass; fi
+lie_run "$nf"
+eq "control: the honest lstat refuses the same symlink (rc 1)" "$RC" "1"
+has "control: the honest lstat refuses before the open" "$ERR" "refused before open"
+check "the source still opens the leaf with O_NOFOLLOW (extra, not the proof)" grep -q 'sysopen(\$in, \$NAME, O_RDONLY | O_NOFOLLOW' "$PARSE"
+
+# the unexpected-failure path (round 8): a die inside the parser (seam: the lstat override dies on the leaf) is exit 3 with
+# one fixed message; the die text is not echoed and nothing is printed on stdout
+HANDOFF_TEST_LIE_NAME=HANDOFF.md HANDOFF_TEST_LIE_DIE=1 lie_run "$lf"
+eq "an unexpected die inside the parser is exit 3" "$RC" "3"
+eq "the unexpected failure prints one fixed message" "$ERR" "handoff: internal error: unexpected failure in the parser"
+eq "the unexpected failure prints nothing on stdout" "$OUT" ""
+check "the die text is not echoed" test "${ERR#*DIE-CANARY}" = "$ERR"
+
+# the wrapper in privileged mode (round 8): executed directly (the shebang applies), neither BASH_ENV nor an exported
+# function reaches the wrapper. Controls: a plain bash does run both, so the markers can appear.
+cat "$FIX/good.md" >"$BOX/HANDOFF.md"
+printf ': >"%s/bash-env-ran"\n' "$TMP" >"$TMP/bash-env.sh"
+rm -f "$TMP/bash-env-ran" "$TMP/func-ran"
+BASH_ENV="$TMP/bash-env.sh" /bin/bash -c ':' >/dev/null 2>&1
+check "control: a plain bash runs BASH_ENV (marker file)" test -e "$TMP/bash-env-ran"
+rm -f "$TMP/bash-env-ran"
+BASH_ENV="$TMP/bash-env.sh" "$PARSE" --root "$BOX" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "run directly with BASH_ENV set: rc 0" "$?" "0"
+check "run directly: BASH_ENV was not run (bash -p)" test ! -e "$TMP/bash-env-ran"
+fnrun() { # runs "$@" with an exported function that shadows the shopt builtin and leaves a marker
+  (
+    export FUNC_MARK="$TMP/func-ran"
+    shopt() { : >"$FUNC_MARK"; builtin shopt "$@"; }
+    export -f shopt
+    "$@"
+  )
+}
+fnrun /bin/bash -c 'shopt -s nullglob' >/dev/null 2>&1
+check "control: a plain bash imports the exported function (marker file)" test -e "$TMP/func-ran"
+rm -f "$TMP/func-ran"
+fnrun "$PARSE" --root "$BOX" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "run directly with an exported function: rc 0" "$?" "0"
+check "run directly: the exported function was not imported (bash -p)" test ! -e "$TMP/func-ran"
+env SHELLOPTS=xtrace "$PARSE" --root "$BOX" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "run directly with SHELLOPTS=xtrace: no trace on stderr" "$(cat "$TMP/err")" ""
+
+# perl -f: accepted by this perl; the program is started with it (strace sees the argument where available)
+check "this perl accepts -f" /usr/bin/perl -f -e '1'
 
 TMPMNT="$TMP/r7/mnt"
 mkdir -p "$TMPMNT"
@@ -1220,6 +1498,14 @@ check "the spec makes no 'closes the race' claim" test "$(grep -ci 'closes the r
 check "the spec no longer says the root is resolved once or trusted" test "$(grep -c -e 'resolved once' -e 'root and its parents are trusted' "$SPEC")" = "0"
 check "the spec no longer claims jq or a temp dir" test "$(grep -c -e 'private temp dir' -e 'PERL_WALK' -e 'through .jq' "$SPEC")" = "0"
 check "the spec records the CLI home identity rule" grep -q 'inode' "$SPEC"
+check "the spec names the denylist file as the source of the CLI home names" grep -q 'compliance/denylist.txt' "$SPEC"
+check "the spec no longer says the names are built from parts" test "$(grep -c 'built from parts' "$SPEC")" = "0"
+check "the spec requires ALL of the worker's processes to have exited, setsid descendants included" grep -q 'setsid' "$SPEC"
+check "the spec says all processes, not only the process group" grep -qi 'all of the worker.s processes' "$SPEC"
+check "the spec lists a bind mount of an outside file onto HANDOFF.md as out of scope (needs mount privilege)" grep -q 'bind mount of an outside file' "$SPEC"
+check "the spec lists a bind mount of a subdirectory of a CLI home as out of scope" grep -q 'subdirectory of a CLI home' "$SPEC"
+check "the spec says the CLI home check runs before the chdir" grep -qi 'before the .chdir' "$SPEC"
+check "the spec names the shebang and the perl -f flag" test "$(grep -c -e 'bash -p' -e 'perl -f' "$SPEC")" -ge 2
 
 printf 'test_handoff: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # parse.sh --root <worktree>  ->  JSON on stdout (format: docs/spec/handoff.md). Reads exactly <root>/HANDOFF.md.
 #
 #   {task_id, summary, files_changed:[{path,note}], tests_run, hard_rules:[..], risks, confidence:{level,why}}
@@ -6,10 +6,16 @@
 # Exit codes: 0 valid; 1 invalid handoff or refused input (message on stderr, nothing on stdout);
 #             2 usage error (arguments, or --root empty, relative, too long, with a '.' or '..' component, not a
 #               directory; /usr/bin/perl missing);
-#             3 internal error (the input was not judged: do not treat it as an invalid handoff).
+#             3 internal error (the input was not judged: do not treat it as an invalid handoff). This includes a
+#               missing, empty or malformed compliance/denylist.txt, and a wrapper started through a symbolic link.
 #
-# STRUCTURE (round 7): this script only checks its arguments and then execs ONE perl process (/usr/bin/perl) with a
-# scrubbed environment. That process does everything: it walks the root from "/", opens <root>/HANDOFF.md once, reads it
+# SHEBANG: "#!/bin/bash -p" (privileged mode: bash does not read BASH_ENV or ENV and does not import exported functions;
+# -p is accepted by bash 3.2 on macOS and by bash 4/5). It only applies when the script is executed directly. If a caller
+# runs "bash parse.sh" the shebang is not used and bash has already read BASH_ENV by then; the scheduler must execute the
+# script directly. The env -i exec below gives perl a clean environment in any case.
+#
+# STRUCTURE (round 7, round 8): this script only checks its arguments, finds the denylist file and then execs ONE perl
+# process (/usr/bin/perl -f) with a scrubbed environment. That process does everything: it walks the root from "/", opens <root>/HANDOFF.md once, reads it
 # into memory, checks it, and prints the JSON once at the end. No temp file, no second process, no here-string, nothing
 # reopened by path. jq and awk are not used (the old design copied the file and re-read the copy).
 #
@@ -19,12 +25,13 @@
 #
 # THREAT MODEL (honest, see docs/spec/handoff.md): the guarantees hold for filesystem state that does not change while
 # the parse runs. A concurrent process running as the same user can race (or ptrace) the parser; that is out of scope
-# here, and the caller must make sure the worker's process group has exited and been reaped before it parses.
+# here, and the caller must make sure ALL of the worker's processes have exited (descendants that called setsid
+# included) and been reaped before it parses.
 #
 # Targets bash 3.2 (macOS /bin/bash): no associative arrays, no mapfile.
 
 set -f
-unset CDPATH
+unset CDPATH BASH_ENV ENV
 shopt -s execfail
 
 ENV_BIN=/usr/bin/env
@@ -51,11 +58,29 @@ if [ ! -x "$PERL_BIN" ]; then
   exit 2
 fi
 
-# The one perl program. No single quote inside (double quotes, q~~ and \x27 only). The root and HOME reach it only as
-# @ARGV data. HOME is data for the CLI home identity check and is never used as a path to read.
+# The denylist: compliance/denylist.txt, two directories above this script's PHYSICAL directory. cd -P (no subshell, so
+# the wrapper still forks nothing) gives the physical directory. A symbolic link to this script is refused: the layout is
+# found from the real location only. The path is passed to perl as @ARGV data; perl opens it with O_NOFOLLOW and fails
+# closed (exit 3) if it is missing, empty or malformed.
+if [ -L "$0" ]; then
+  printf 'handoff: internal error: parse.sh must be run by its physical path, not through a symbolic link\n' >&2
+  exit 3
+fi
+case $0 in
+  */*) SELF_DIR=${0%/*} ;;
+  *) SELF_DIR=. ;;
+esac
+if ! cd -P "$SELF_DIR"; then
+  printf 'handoff: internal error: cannot locate the compliance denylist\n' >&2
+  exit 3
+fi
+DENYLIST=${PWD%/*/*}/compliance/denylist.txt
+
+# The one perl program. No single quote inside (double quotes, q~~ and \x27 only). The root, HOME and the denylist path
+# reach it only as @ARGV data. HOME is data for the CLI home identity check and is never used as a path to read.
 PERL_PROG='
 BEGIN {
-  $SIG{__DIE__} = sub { print STDERR "handoff: internal error: unexpected failure in the parser\n"; exit 3; };
+  $SIG{__DIE__} = sub { die @_ if $^S; print STDERR "handoff: internal error: unexpected failure in the parser\n"; exit 3; };
   $SIG{__WARN__} = sub { };
   @INC = grep { !ref($_) && m{\A/} } @INC;
 }
@@ -78,8 +103,8 @@ sub refuse { print STDERR "handoff: $_[0]\n"; exit 1; }
 sub usage_err { print STDERR "handoff: $_[0]\n"; exit 2; }
 sub internal { print STDERR "handoff: internal error: $_[0]\n"; exit 3; }
 
-internal("wrong number of arguments") unless @ARGV == 2;
-my ($root, $home_arg) = @ARGV;
+internal("wrong number of arguments") unless @ARGV == 3;
+my ($root, $home_arg, $deny_file) = @ARGV;
 
 # ---- the root string: usage errors, before the filesystem is touched ------------------------------------------------
 usage_err("--root must not be empty") if $root =~ /\A[ \t\n\r\f\x0B]*\z/;
@@ -91,11 +116,54 @@ for my $c (@rc) {
   usage_err("--root must not contain a \x27.\x27 or \x27..\x27 component") if $c eq "." || $c eq "..";
 }
 
+# ---- the denylist file (hard rule 4) ---------------------------------------------------------------------------------
+# compliance/denylist.txt is the single source of truth for the provider CLI home names: one entry per line, relative to
+# the account home, "#" starts a comment, blank lines are ignored. Every entry must match ^\.[A-Za-z0-9._-]+$ and must not
+# be only dots. The file is opened with O_NOFOLLOW and must be a regular file of 1 to 65536 bytes. Anything else (missing,
+# a symbolic link, empty, no entry, a malformed entry) is an internal error: without the list the CLI home check cannot be
+# made, so nothing is read. Nothing of the file is echoed.
+sub load_denylist {
+  my ($path) = @_;
+  my $bad = "the compliance denylist (compliance/denylist.txt) is missing, empty or malformed: the provider CLI home check cannot be made (nothing is read)";
+  internal($bad) unless defined $path && substr($path, 0, 1) eq "/";
+  my $fh;
+  internal($bad) unless sysopen($fh, $path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
+  my @st = stat($fh);
+  internal($bad) unless @st && S_ISREG($st[2]) && $st[7] > 0 && $st[7] <= 65536;
+  binmode($fh);
+  my $data = "";
+  my $left = 65537;
+  while ($left > 0) {
+    my $buf = "";
+    my $n = sysread($fh, $buf, $left);
+    if (!defined $n) {
+      next if $! == EINTR;
+      internal($bad);
+    }
+    last if $n == 0;
+    $data .= $buf;
+    $left -= $n;
+  }
+  close($fh);
+  internal($bad) if length($data) > 65536;
+  my @entries;
+  for my $line (split /\n/, $data, -1) {
+    $line =~ s/#.*\z//s;
+    $line =~ s/\A[ \t\r]+//;
+    $line =~ s/[ \t\r]+\z//;
+    next if $line eq "";
+    internal($bad) unless $line =~ /\A\.[A-Za-z0-9._-]+\z/ && $line !~ /\A\.+\z/;
+    push @entries, $line;
+  }
+  internal($bad) unless @entries;
+  return @entries;
+}
+my @deny_names = load_denylist($deny_file);
+
 # ---- provider CLI homes, by identity (hard rule 4) -------------------------------------------------------------------
-# The homes are computed from the account database and from HOME (as data), and each candidate CLI home is stat-ed.
-# Every directory of the walk is then compared by (device, inode), so a case change, a bind mount or a HOME trick does not
-# help. The names are built from parts (the dot is added here), so no literal credential path is in this program.
-my @cli_names = ("claude", "claude.json", "codex", "grok", "kimi-code", "kimi", "gemini");
+# The homes are computed from the account database and from HOME (as data), and every denylist entry under each home is
+# stat-ed. Every directory of the walk, and the leaf, is then compared by (device, inode), so a case change, a bind mount
+# of the home itself or a HOME trick does not help.
 my @homes;
 my $pw_home = (getpwuid($<))[7];
 push @homes, $pw_home if defined $pw_home && $pw_home =~ m{\A/};
@@ -104,8 +172,8 @@ internal("no home directory is known, so the provider CLI home check cannot be m
 my %deny;
 for my $h (@homes) {
   (my $b = $h) =~ s{/+\z}{};
-  for my $n (@cli_names) {
-    my @s = stat("$b/.$n");
+  for my $n (@deny_names) {
+    my @s = stat("$b/$n");
     $deny{"$s[0]:$s[1]"} = 1 if @s;
   }
 }
@@ -133,6 +201,7 @@ for my $c (@rc) {
   usage_err("--root is not a directory, or a directory of the root path does not exist") unless @l;
   refuse("symlink not allowed: a directory of --root is a symbolic link (refused; nothing is read)") if S_ISLNK($l[2]);
   usage_err("--root is not a directory") unless S_ISDIR($l[2]);
+  refuse($cli_msg) if denied(@l);    # BEFORE the chdir: a CLI home is never entered (the check after the chdir stays)
   refuse("cannot read --root: a directory of the root path cannot be entered") unless chdir($c);
   my @s = stat(".");
   internal("cannot stat the working directory") unless @s;
@@ -379,7 +448,8 @@ exit 0;
 '
 
 # scrubbed environment: PERL5LIB, PERL5OPT, PERLLIB, PERL5DB, PERL_UNICODE, PERL_USE_UNSAFE_INC and every other variable
-# are gone (env -i), PATH is fixed, and LC_ALL=C. HOME is passed only as data in @ARGV.
-exec "$ENV_BIN" -i PATH=/usr/bin:/bin LC_ALL=C "$PERL_BIN" -e "$PERL_PROG" -- "$ROOT_ARG" "${HOME-}"
+# are gone (env -i), PATH is fixed, and LC_ALL=C. HOME and the denylist path are passed only as data in @ARGV. perl -f
+# skips sitecustomize.pl (a no-op on a perl built without it; accepted by perl 5.8 and later, so by the macOS perl).
+exec "$ENV_BIN" -i PATH=/usr/bin:/bin LC_ALL=C "$PERL_BIN" -f -e "$PERL_PROG" -- "$ROOT_ARG" "${HOME-}" "$DENYLIST"
 printf 'handoff: internal error: cannot run %s\n' "$PERL_BIN" >&2
 exit 3
