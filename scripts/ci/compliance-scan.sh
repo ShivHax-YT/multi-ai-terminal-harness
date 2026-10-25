@@ -50,7 +50,7 @@ list_files() {
 }
 
 ALLOW_RE='^(docs/|\.claude/|scripts/ci/|tests/compliance/|compliance/|\.github/|AGENTS\.md$|CLAUDE\.md$|README\.md$)'
-TEXT_EXT_RE='\.(rs|ts|tsx|js|jsx|mjs|cjs|swift|m|mm|h|c|cc|cpp|py|sh|bash|zsh|toml|json|yaml|yml|plist|xml|html|css|md|txt|env|conf|ini)$'
+TEXT_EXT_RE='\.(rs|ts|tsx|js|jsx|mjs|cjs|swift|m|mm|h|c|cc|cpp|py|pl|pm|sh|bash|zsh|toml|json|yaml|yml|plist|xml|html|css|md|txt|env|conf|ini)$'
 IMG_EXT_RE='\.(png|jpe?g|gif|svg|webp|icns|ico|pdf|ai|eps|heic|tiff?)$'
 BRAND_RE='(anthropic|claude|openai|chatgpt|codex|gpt|xai|grok|gemini|google|moonshot|kimi|zhipu|z-ai|zai|glm)'
 
