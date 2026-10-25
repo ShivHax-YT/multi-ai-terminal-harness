@@ -16,10 +16,10 @@ status run, and runs commands as a process-group leader whose in-group watchdog 
 Built for macOS `/bin/bash` 3.2 and the macOS system perl; only GNU bash 5.2 / perl 5.38 on Linux was run here.
 
 ## Files changed
-- spike/lib/runner.pl - NEW. The helper: `resolve`, `magic`, `clihome`, `tool-path`, `gate`, `run`, `register`, `vdir-create`,
+- spike/lib/runner.pl - NEW. The helper: `resolve`, `clihome`, `tool-path`, `gate`, `run`, `register`, `vdir-create`,
   `vdir-sweep`, `vdir-remove`. Core modules only (POSIX, Fcntl, Errno, Cwd, Digest::SHA). The codesign path and the pinned team ids
   now live here. Loaded with `require` (by a test) it only defines its functions.
-- spike/lib/common.sh - rewritten tail: thin wrappers (`spike_resolve_path`, `spike_magic_ok`, `spike_under_cli_home`,
+- spike/lib/common.sh - rewritten tail: thin wrappers (`spike_resolve_path`, `spike_under_cli_home`,
   `spike_run_timeout`, `spike_run_live`, `spike_run_status`, `spike_run_timed`, `spike_mark_verified`) plus new
   `spike_register_cli`, `spike_tool_path`, `spike_verify_init`, `spike_verify_dir`, `spike_verify_cleanup`. `spike_cleanup`
   refuses control characters and resolves through the helper. Removed: `spike_set_verify_dir`, `spike_verify_signer`,
@@ -95,6 +95,19 @@ test_preflight: sandbox runner diff 2 -> 4 changed lines (account_home rewritten
 **Decisions I made.** (a) `/dev/null` is accepted as an outfile despite "non-regular refused" (preflight discards sign-in output there; only the exact null device). (b) Tool prefixes include `/usr/local/` and `/opt/homebrew/` because Homebrew links resolve into `Cellar`. (c) A tool script (`#!`) is refused as well as living outside a prefix. (d) Unusable denylist refuses even `resolve`, so `spike_cleanup` also stops (fail closed). (e) Pinned-name test is `^(claude|codex)(?![a-z0-9])` on the lower-cased basename. (f) Tests that need a fake account home use a second sandbox copy of runner.pl whose one-line `account_home` is rewritten (the shipped file is checked to keep `getpwuid`). (g) The leaf OID was added to `-R` (documented Apple OID) but could not be run against a real codesign here.
 
 **Not done / risks.** The OID requirement is unverified on a Mac: if it fails, a genuine vendor binary shows UNTRUSTED (fail closed); confirm with a real run. A renamed copy of claude cannot be recognised by name (item 9 is name-based by the lead's decision). A SIGKILL to the whole caller chain (not just the direct parent) can still orphan a registration codesign.
+
+### Round 9 (dead code removed)
+Finding (Opus final gate): the `magic` subcommand of `runner.pl` (reached through `spike_magic_ok` in `common.sh`) opened and read 4 bytes of any
+caller-supplied file with no CLI-home check, which made the README's "a path inside a CLI home is never read" false. Nothing in `spike/` called it.
+Fix (lead decision): `cmd_magic`, its dispatch line and `spike_magic_ok` are deleted, and removed from the README function index. README wording
+only: launchers (`env claude`, `sh -c`, version-number basenames) are not recognized by name, the Phase 1 runner (T-115/T-119) decides by identity;
+codesign is watched on TERM to the helper and death of its direct parent, but a SIGKILL to the caller's whole process group can still orphan it;
+`handoff/parse.sh` is listed as done (T-006, merged).
+Test (`magic:` assertions in test_common.sh): `runner.pl magic <file>` is an unknown subcommand and exits non-zero for a canary in a fake CLI home
+and for an ordinary file; the canary content is not printed; runner.pl has no `cmd_magic` and common.sh no `spike_magic_ok`; `spike_magic_ok` is
+not defined after sourcing common.sh; strace (ran here) shows no open/openat/creat on the canary.
+Audit of the other opens in runner.pl: every `open_ro` caller is either after `under_cli_home`/`path_refused` (register, outfile, clihome), on the
+helper's own private verify directory (`.owner`, `.registry`, the copy), or `tool_file_ok` (see Open risks, Phase 1 follow-ups).
 
 ## Round 7 (structural): decision -> implementation -> tests
 A. One perl helper, by absolute path.
@@ -196,6 +209,12 @@ Added: roughly 100 names in test_common and 28 in test_preflight (see D).
 - The explicit CLI-home list still lives in code (built from parts); the list belongs in compliance/ (follow-up for the lead, shared file).
 - The stress and signal tests have a timing history; they passed in every run of this round.
 - shellcheck not run; macOS bash 3.2 and macOS system perl 5.18 not run; real codesign on a real Mach-O not exercised; no mutation checks.
+- Phase 1 follow-ups (from round 8, not done in the spike):
+  - `tool_file_ok` (the jq / git version probe) opens a file under a system prefix with only lstat, owner and mode checks: add a link-count check
+    and the CLI-home check (`path_refused` on the physical path) before the open.
+  - Pinned-name launchers: the pinned-name gate is by basename only; `env claude`, `sh -c`, version-number basenames and renamed copies are not
+    recognized by name. The Phase 1 runner (T-115/T-119) must decide by identity.
+  - Exported-function marker: a `BASH_FUNC_*` variable in the caller's environment is not specially handled; the Phase 1 runner should drop it.
 
 ## Confidence
 Medium-high for the logic on GNU bash 5.2 / perl 5.38 / Linux: each Opus finding has a regression that fails on the 26cbcb4 behavior by design (fake

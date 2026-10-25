@@ -1201,21 +1201,6 @@ sub cmd_resolve {
     return 0;
 }
 
-# magic <path> -> 0 if a regular, non-symlink file whose first four bytes are a Mach-O or universal magic.
-sub cmd_magic {
-    my ($p) = @_;
-    return 1 unless defined $p && substr($p, 0, 1) eq '/' && !has_ctl($p);
-    my @l = lstat($p);
-    return 1 unless @l && S_ISREG($l[2]) && !S_ISLNK($l[2]);
-    my $fh = open_ro($p) or return 1;
-    my @fs = stat($fh);
-    return 1 unless @fs && S_ISREG($fs[2]) && $fs[3] == 1;
-    my $b = '';
-    sysread($fh, $b, 4);
-    close $fh;
-    return is_macho($b) ? 0 : 1;
-}
-
 # clihome <path> -> 0 (refuse) if the path is, or lies inside, a CLI home, if it is a hard-linked regular file (it may be
 # a second name for a CLI home file), or if it cannot be resolved; 1 if it is outside every CLI home.
 sub cmd_clihome {
@@ -1254,7 +1239,6 @@ sub main {
     # Fail closed: without a usable compliance/denylist.txt no operation of this helper runs.
     unless (denylist_ok()) { msg(DENY_FAIL_MSG); return DENY_FAIL_RC; }
     return cmd_resolve(@a)    if $sub eq 'resolve';
-    return cmd_magic(@a)      if $sub eq 'magic';
     return cmd_clihome(@a)    if $sub eq 'clihome';
     return cmd_clihome_new(@a) if $sub eq 'clihome-new';
     return cmd_tool_path(@a)  if $sub eq 'tool-path';

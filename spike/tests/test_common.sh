@@ -1747,6 +1747,33 @@ else
 fi
 sbx_ln "$FH/.claude/smallcred" "$NB/claude"
 
+# --- round 9: the `magic` subcommand and spike_magic_ok are gone (dead code that could open a file in a CLI home) --------------
+chmod 700 "$FH/.claude/smallcred"
+magic_run() { # magic_run <file>: runner.pl magic <file> under the ut2 layout; prints "RC=<n>" then the combined output
+  local out rc
+  out="$(/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C SPIKE_IN_PATH="$PATH" SPIKE_IN_TMPDIR="$SANDBOX" SPIKE_IN_HOME="$FH" /usr/bin/perl "$RUNNER2" magic "$1" 2>&1)"
+  rc=$?
+  printf 'RC=%s\n%s\n' "$rc" "$out"
+}
+r="$(magic_run "$FH/.claude/smallcred")"
+has "magic: 'runner.pl magic <file>' is an unknown subcommand" "$r" "unknown subcommand: magic"
+case "$r" in RC=0*) bad "magic: the unknown subcommand exits non-zero" ;; RC=*) ok "magic: the unknown subcommand exits non-zero" ;; *) bad "magic: the unknown subcommand exits non-zero" ;; esac
+lacks "magic: the canary content of a file in a fake CLI home is not printed" "$r" "CANARY-NARROW"
+r="$(magic_run "$SANDBOX/ut2/spike/lib/runner.pl")"
+has "magic: an ordinary file is refused the same way (the subcommand does not exist at all)" "$r" "unknown subcommand: magic"
+lacks "magic: runner.pl defines no cmd_magic" "$(cat "$RUNNER_REAL")" "cmd_magic"
+lacks "magic: runner.pl dispatches no 'magic' subcommand" "$(cat "$RUNNER_REAL")" "eq 'magic'"
+r="$(/bin/bash -c '. "$1"; if declare -F spike_magic_ok >/dev/null 2>&1; then echo DEFINED; else echo ABSENT; fi' _ "$COMMON2" 2>/dev/null)"
+eq "magic: spike_magic_ok is not defined after sourcing common.sh" "ABSENT" "$r"
+lacks "magic: common.sh does not mention spike_magic_ok" "$(cat "$COMMON_REAL")" "spike_magic_ok"
+if command -v strace >/dev/null 2>&1 && strace -f -o "$SANDBOX/strace.probe2" -e trace=file /usr/bin/true >/dev/null 2>&1; then
+  strace -f -e trace=file -o "$SANDBOX/strace.magic" /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C SPIKE_IN_PATH="$PATH" SPIKE_IN_TMPDIR="$SANDBOX" SPIKE_IN_HOME="$FH" /usr/bin/perl "$RUNNER2" magic "$FH/.claude/smallcred" >/dev/null 2>&1
+  if [ "$(grep -c 'runner.pl' "$SANDBOX/strace.magic" 2>/dev/null)" -gt 0 ]; then ok "magic strace: the trace of the magic run was captured"; else bad "magic strace: the trace of the magic run was captured"; fi
+  eq "magic strace: the canary file in a fake CLI home was never opened (no open/openat/creat on it)" "0" "$(grep -E '(open|openat|openat2|creat)\(' "$SANDBOX/strace.magic" | grep -c 'smallcred')"
+else
+  printf 'skip strace test of the removed magic subcommand: strace is not available or may not trace here (the unknown-subcommand test above covers it)\n'
+fi
+
 # --- item 8: capture and scratch roots inside a CLI home are refused -----------------------------------------------------------
 EH="$SANDBOX/emptyhome"
 sbx_mkdir "$EH/captures-ok"

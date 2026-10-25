@@ -34,7 +34,7 @@ most Linux have it; only core modules are used).
   - **A pinned CLI name runs live only as the registered copy.** `spike_run_live` (and `spike_run_timeout` after its gate)
     refuses, rc 3 and the script stops, a command whose basename or resolved basename is `claude` or `codex` (also
     `claude.exe`, `claude-real`) unless it is the current registered, hash-verified copy (`$SPIKE_VERIFIED_COPY`).
-    `SPIKE_LIVE=1` does not lift that (rule 6). A renamed copy under another name cannot be recognised by name.
+    `SPIKE_LIVE=1` does not lift that (rule 6). A renamed copy under another name cannot be recognised by name, and neither can a launcher (`env claude`, `sh -c`, a version-number basename such as `2.1.0`): names are not identity. The Phase 1 runner (T-115/T-119) decides by identity.
   - **A run needs `HOME` to be the account home.** The child's `HOME` is always the password-database home. If the caller's
     `HOME` is set and is not that directory (same device and inode) the run is refused with rc 125 and nothing starts.
   - **The output file is opened `O_WRONLY|O_CREAT|O_APPEND|O_NOFOLLOW`, mode 0600.** A symlink, a hard-linked file, a
@@ -63,7 +63,7 @@ most Linux have it; only core modules are used).
   the watchdog is in the command's group and not in the caller's, **a SIGKILL to the caller, or to the caller's whole process
   group, cannot orphan the command**, and a SIGKILL to the helper's own group kills the command with it. The one case that
   can leave a command running is a SIGKILL sent to the helper process alone, by its pid (nothing is left to sweep): do not
-  do that. The `codesign` the helper starts for registration is watched the same way: TERM/INT/HUP to the helper, or the death of its direct parent, kills its group (no orphan under init). A command that exits but leaves children behind is swept. Timeouts are digits only, read as decimal (`08` and
+  do that. The `codesign` the helper starts for registration is watched the same way: TERM/INT/HUP to the helper, or the death of its direct parent, kills its group; a SIGKILL to the caller's whole process group can still orphan the `codesign` (see HANDOFF). A command that exits but leaves children behind is swept. Timeouts are digits only, read as decimal (`08` and
   `010` are 8 and 10, never octal), 1 to 3600. Children get stdin from `/dev/null` and write to the outfile. They are not
   in a new session, so a CLI that opens the terminal device is out of scope: the spikes are headless only (rule 3).
 - **Binaries are verified before they are executed; registration checks identity, not strings.** `preflight.sh` asks the
@@ -117,13 +117,13 @@ most Linux have it; only core modules are used).
 
 | Path | Status | Purpose |
 |---|---|---|
-| `lib/common.sh` | done (T-001) | sourced helpers: `spike_scratch_repo`, `spike_worktree_add`, `spike_cleanup`, `spike_require_live`, `spike_capture_dir`, `spike_redact`, `spike_resolve_path`, `spike_run_timeout`, `spike_run_live`, `spike_run_status <seconds> <out> "$SPIKE_VERIFIED_COPY" ...`, `spike_run_timed`, `spike_mark_verified <path> <cli>`, `spike_register_cli <name>`, `spike_magic_ok`, `spike_under_cli_home`, `spike_verify_init`, `spike_verify_dir`, `spike_verify_cleanup`, `spike_tool_path` |
+| `lib/common.sh` | done (T-001) | sourced helpers: `spike_scratch_repo`, `spike_worktree_add`, `spike_cleanup`, `spike_require_live`, `spike_capture_dir`, `spike_redact`, `spike_resolve_path`, `spike_run_timeout`, `spike_run_live`, `spike_run_status <seconds> <out> "$SPIKE_VERIFIED_COPY" ...`, `spike_run_timed`, `spike_mark_verified <path> <cli>`, `spike_register_cli <name>`, `spike_under_cli_home`, `spike_verify_init`, `spike_verify_dir`, `spike_verify_cleanup`, `spike_tool_path` |
 | `lib/runner.pl` | done (T-001) | the one Perl helper behind `common.sh` (resolve, CLI-home identity check, registration, gate, run with an in-group watchdog); not called directly |
 | `preflight.sh` | done (T-001) | table of install path, version, code-signature result and sign-in state for each CLI; verifies and runs only a private copy |
 | `tests/test_common.sh` | done (T-001) | offline tests for `lib/common.sh` and `lib/runner.pl` |
 | `tests/test_preflight.sh` | done (T-001) | offline tests for `preflight.sh` using fake CLIs on a private PATH |
 | `plan/hash.sh`, `plan/check.jq`, `tests/test_plan.sh` | planned (T-005) | plan hash and approval-binding checker |
-| `handoff/parse.sh`, `tests/test_handoff.sh` | planned (T-006) | HANDOFF.md parser |
+| `handoff/parse.sh`, `tests/test_handoff.sh` | done (T-006, merged) | HANDOFF.md parser |
 | `claude/run.sh`, `claude/resume.sh`, `claude/parse.jq`, `tests/test_claude_parse.sh` | planned (T-002) | Claude Code headless spike |
 | `codex/run.sh`, `codex/resume.sh`, `codex/parse.jq`, `tests/test_codex_parse.sh` | planned (T-003) | Codex headless spike |
 | `normalize/claude.jq`, `normalize/codex.jq`, `tests/test_normalize.sh` | planned (T-004) | normalized event mapping |

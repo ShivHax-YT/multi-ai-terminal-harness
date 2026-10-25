@@ -427,14 +427,6 @@ spike_resolve_path() {
   _spike_helper resolve "$1" 2>/dev/null
 }
 
-# spike_magic_ok <file>: 0 if <file> is a regular, non-symlink, singly linked file whose first four bytes are a Mach-O or
-# universal (fat) magic. The helper opens it once (O_NOFOLLOW) and reads exactly four bytes from that descriptor.
-spike_magic_ok() {
-  [ -n "${1:-}" ] || return 1
-  _spike_have_helper || return 1
-  _spike_helper magic "$1" >/dev/null 2>&1
-}
-
 # spike_under_cli_home <path>: 0 (refuse; rule 4) if the path is, or lies inside, one of the CLI homes of the account's
 # password-database home or of an absolute $HOME (compared by device and inode), if it is a hard-linked regular file, or
 # if it cannot be resolved. 1 if it is outside every CLI home.
