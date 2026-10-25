@@ -17,7 +17,7 @@
 
 set -o noclobber
 
-HERE="$(CDPATH= cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+HERE="$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 COMMON_REAL="$HERE/../lib/common.sh"
 RUNNER_REAL="$HERE/../lib/runner.pl"
 
@@ -49,7 +49,7 @@ lacks() { # lacks <name> <haystack> <needle>
 
 # ---- sandbox and guard ------------------------------------------------------------------------------------------------
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/spiketest.XXXXXX")" || exit 1
-SANDBOX="$(CDPATH= cd -P -- "$SANDBOX" && pwd -P)"
+SANDBOX="$(CDPATH='' cd -P -- "$SANDBOX" && pwd -P)"
 export TMPDIR="$SANDBOX"
 unset SPIKE_LIVE
 VIOLATIONS="$SANDBOX/.violations"
@@ -103,7 +103,7 @@ sbx_parent_ok() { # sbx_parent_ok <path>: the PHYSICAL parent directory must be 
   case "$f" in /*) ;; *) sbx_refuse "relative path $f"; return 1 ;; esac
   dir="${f%/*}"
   [ -n "$dir" ] || dir="/"
-  phys="$(CDPATH= cd -P -- "$dir" 2>/dev/null && pwd -P)" || { sbx_refuse "no parent for $f"; return 1; }
+  phys="$(CDPATH='' cd -P -- "$dir" 2>/dev/null && pwd -P)" || { sbx_refuse "no parent for $f"; return 1; }
   case "$phys/" in "$SANDBOX"/*) ;; *) sbx_refuse "parent of $f is outside the sandbox ($phys)"; return 1 ;; esac
   return 0
 }
@@ -131,7 +131,7 @@ sbx_mkdir() { # sbx_mkdir <dir>...: mkdir -p, but the nearest EXISTING ancestor 
       anc="${anc%/*}"
       [ -n "$anc" ] || anc="/"
     done
-    phys="$(CDPATH= cd -P -- "$anc" 2>/dev/null && pwd -P)" || { sbx_refuse "no ancestor for $d"; return 1; }
+    phys="$(CDPATH='' cd -P -- "$anc" 2>/dev/null && pwd -P)" || { sbx_refuse "no ancestor for $d"; return 1; }
     case "$phys/" in "$SANDBOX"/*) ;; *) sbx_refuse "directory $d resolves outside the sandbox ($phys)"; return 1 ;; esac
     mkdir -p -- "$d"
   done
@@ -431,7 +431,9 @@ sbx_put "$FAKE/claude.exe" <<EOF
 touch "$FAKE/ran-exe-\$\$"
 EOF
 chmod +x "$FAKE/claude.exe"
-ran() { ls "$FAKE" | grep -c '^ran-'; }
+# count_glob <glob...>: how many of the given paths exist (a glob that matched nothing counts 0).
+count_glob() { local n=0 f; for f in "$@"; do if [ -e "$f" ] || [ -L "$f" ]; then n=$((n + 1)); fi; done; echo "$n"; }
+ran() { count_glob "$FAKE"/ran-*; }
 rm -f "$FAKE"/ran-*
 out="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/claude" -p hi; echo CONTINUED' _ "$COMMON" "$FAKE" 2>/dev/null)"
 eq "run_timeout refuses a provider CLI prompt without SPIKE_LIVE (rc)" "3" "$?"
@@ -588,7 +590,7 @@ for n in cat printf echo true codesign jq; do
   printf '#!/bin/sh\ntouch "%s/marks/%s-$$"\nexit 0\n' "$SHADOW" "$n" | sbx_put "$SHADOW/$n"
   chmod +x "$SHADOW/$n"
 done
-marks() { ls "$SHADOW/marks" | grep -c . ; }
+marks() { count_glob "$SHADOW/marks"/*; }
 # shadow_denied <label> <path-prefix or -> <code>: with SPIKE_LIVE unset, <code> must exit 3, never reach the next
 # statement, and start no copy (the copy would leave a marker file).
 shadow_denied() {
@@ -870,7 +872,7 @@ RUPS=""
 i=0
 while [ "$i" -lt 14 ]; do RUPS="$RUPS/.."; i=$((i + 1)); done
 RCMD="$RQ/S$RUPS/usr/bin/printf"
-eq "reviewer repro resolves to the physical target, not /usr/bin/printf" "$(CDPATH= cd -P -- "$RR" && pwd -P)/usr/bin/printf" "$(spike_resolve_path "$RCMD")"
+eq "reviewer repro resolves to the physical target, not /usr/bin/printf" "$(CDPATH='' cd -P -- "$RR" && pwd -P)/usr/bin/printf" "$(spike_resolve_path "$RCMD")"
 rm -f "$RR"/rr-marker
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2" hi' _ "$COMMON" "$RCMD" >/dev/null 2>&1
 eq "reviewer repro with a prompt is refused (rc 3)" "3" "$?"
@@ -1050,7 +1052,7 @@ chmod 700 "$FH/.claude/spike-verify.abcdef12"
 denied "spike_run_status with a look-alike verify directory inside a CLI home (rc 3)" "export HOME='$FH'; _SPIKE_VERIFY_DIR='$FH/.claude/spike-verify.abcdef12'; spike_run_status 5 /dev/null '$FH/.claude/spike-verify.abcdef12/claude' --version"
 env -u SPIKE_LIVE HOME="$FH" TMPDIR="$FH/.claude" /bin/bash -c '. "$1"; spike_verify_init' _ "$COMMON" >/dev/null 2>&1
 eq "the helper refuses to create the verify directory inside a CLI home (rc 5)" "5" "$?"
-eq "no verify directory was created inside the CLI home (only the look-alike made by this test is there)" "1" "$(ls "$FH/.claude" | grep -c '^spike-verify\.')"
+eq "no verify directory was created inside the CLI home (only the look-alike made by this test is there)" "1" "$(count_glob "$FH/.claude"/spike-verify.*)"
 sbx_mkdir "$SANDBOX/loose-tmp"
 chmod 777 "$SANDBOX/loose-tmp"
 env -u SPIKE_LIVE TMPDIR="$SANDBOX/loose-tmp" /bin/bash -c '. "$1"; spike_verify_init' _ "$COMMON" >/dev/null 2>&1
@@ -1110,7 +1112,7 @@ echo "$t-wrapper"
 EOF
   chmod +x "$SANDBOX/probebin/$t"
 done
-pran() { ls "$SANDBOX/probebin" | grep -c '^ran-'; }
+pran() { count_glob "$SANDBOX/probebin"/ran-*; }
 PROBE="$SANDBOX/probe.out"
 : >| "$PROBE"
 JQ_PHYS="$(spike_resolve_path "$JQ_BIN")"

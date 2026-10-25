@@ -23,7 +23,7 @@ jobs:
           jq empty .claude/settings.json .mcp.json
       - name: Lint shell scripts
         run: |
-          shellcheck -S warning .claude/hooks/*.sh scripts/ci/*.sh tests/compliance/*.sh
+          shellcheck -S warning .claude/hooks/*.sh scripts/ci/*.sh tests/compliance/*.sh spike/lib/common.sh spike/preflight.sh spike/handoff/parse.sh spike/plan/hash.sh spike/tests/test_common.sh spike/tests/test_preflight.sh spike/tests/test_handoff.sh spike/tests/test_plan.sh
 
   stack:
     needs: compliance

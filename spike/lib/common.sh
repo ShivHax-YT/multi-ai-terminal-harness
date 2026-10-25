@@ -54,7 +54,7 @@ case "$_spike_src" in
   */*) _spike_src="${_spike_src%/*}" ;;
   *) _spike_src="." ;;
 esac
-SPIKE_DIR="$(CDPATH= cd -P -- "$_spike_src/.." 2>/dev/null && pwd -P)"
+SPIKE_DIR="$(CDPATH='' cd -P -- "$_spike_src/.." 2>/dev/null && pwd -P)"
 unset _spike_src
 SPIKE_HELPER="$SPIKE_DIR/lib/runner.pl"
 
@@ -531,8 +531,10 @@ _spike_register() {
   fi
   SPIKE_REG_STATUS="${out%%"$tab"*}"
   rest="${out#*"$tab"}"
+  # shellcheck disable=SC2034 # public API: read by callers that source this file
   SPIKE_REG_KIND="${rest%%"$tab"*}"
   rest="${rest#*"$tab"}"
+  # shellcheck disable=SC2034 # public API: read by callers that source this file
   SPIKE_REG_PATH="${rest%%"$tab"*}"
   rest="${rest#*"$tab"}"
   SPIKE_VERIFIED_COPY="${rest%%"$tab"*}"
@@ -541,6 +543,7 @@ _spike_register() {
     verified) return 0 ;;
     notfound) return 4 ;;
   esac
+  # shellcheck disable=SC2034 # public API: read by callers that source this file
   SPIKE_VERIFIED_COPY=""
   return 2
 }
@@ -552,6 +555,7 @@ _spike_register() {
 spike_mark_verified() {
   local p="${1:-}" name="${2:-}"
   SPIKE_SIG_TEXT=""
+  # shellcheck disable=SC2034 # public API: read by callers that source this file
   SPIKE_VERIFIED_COPY=""
   case "$p" in
     /*) ;;
