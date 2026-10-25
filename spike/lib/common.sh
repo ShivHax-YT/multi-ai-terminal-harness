@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Shared helpers for the Phase 0 spikes. Source this file; do not execute it.
+# Shared helpers for the Phase 0 spikes. Source this file from scripts only, never from an interactive shell (the live
+# gate can terminate the shell that sourced it). Do not execute it.
 #
 #   . "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 #
@@ -8,9 +9,10 @@
 # spike_require_live) unless the caller already has its own.
 #
 # Hard-rule notes:
-#   - spike_run_timeout is the only helper that starts an arbitrary command. It runs the command with a scrubbed
-#     environment, in its own process group, and refuses to start a provider CLI (claude, codex, grok, gemini, kimi)
-#     for anything except --version / auth status / login status unless SPIKE_LIVE=1 (spike_require_live).
+#   - spike_run_timeout / spike_run_live / spike_run_status are the only helpers that start a command. They run it with
+#     a scrubbed environment, in its own process group (killed on timeout and on any signal to the caller). The
+#     default is deny: only a short allowlist, or a provider CLI with exactly --version / auth status / login status,
+#     runs without SPIKE_LIVE=1 (spike_require_live). Real prompts use spike_run_live.
 #   - SPIKE_LIVE=1 is a guard against accidents, not an approval. Only the human sets it.
 #   - Nothing here reads or names any CLI credential location or config-home override.
 
@@ -131,11 +133,14 @@ spike_cleanup() {
 # spike_require_live -> stop the calling SCRIPT (exit status 3) unless SPIKE_LIVE is exactly "1".
 # Call it first in every script that starts a real CLI session. SPIKE_LIVE=1 is set by the human, never by an agent.
 # It also works from inside $(...), pipes and subshells: those only end their own subshell with `exit`, so it first
-# sends TERM to the top-level script ($$), whose trap (installed above) exits 3.
+# sends TERM to the top-level script ($$), whose trap (installed above) exits 3. Call it at the top level of the script,
+# as the first statement, and never override the TERM trap. As a fail-safe, a detached watchdog sends KILL to the
+# top-level script 0.3 s later if it is somehow still running (for example because it replaced the TERM trap).
 spike_require_live() {
   if [ "${SPIKE_LIVE:-}" != "1" ]; then
     spike_err "refusing to run: this step calls a real CLI. Re-run with SPIKE_LIVE=1 to opt in (human only)."
     kill -s TERM "$$" 2>/dev/null
+    ( sleep 0.3; if kill -0 "$$" 2>/dev/null; then kill -s KILL "$$" 2>/dev/null; fi ) >/dev/null 2>&1 &
     exit 3
   fi
 }
@@ -347,28 +352,108 @@ spike_resolve_path() {
   printf '%s/%s\n' "$d" "$(basename "$p")"
 }
 
-# _spike_provider_cli_name <command> -> 0 if the command (or what it resolves to) is a provider CLI binary name.
-_spike_provider_cli_name() {
-  local cmd="$1" full base p
-  full="$(command -v -- "$cmd" 2>/dev/null)" || full="$cmd"
-  for p in "$cmd" "$full" "$(spike_resolve_path "$full" 2>/dev/null)"; do
-    base="$(basename -- "$p" 2>/dev/null)"
-    base="${base%.exe}"
-    case "$base" in
-      claude|codex|grok|gemini|kimi) return 0 ;;
-    esac
+# --- command runner ---------------------------------------------------------------------------------------------------
+# Default-deny: spike_run_timeout runs only a short allowlist of harmless tools, and a provider CLI only for the exact
+# status shapes. Everything else (shells, env, xargs, interpreters, unknown names, anything that mentions a provider
+# name in its arguments) needs the live gate. Real prompts go through spike_run_live, which always checks the gate.
+
+_spike_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# _spike_base <path> -> lower-cased basename with a trailing .exe removed (macOS file systems are case-insensitive).
+_spike_base() {
+  local b
+  b="$(basename -- "$1" 2>/dev/null)"
+  b="$(_spike_lower "$b")"
+  printf '%s' "${b%.exe}"
+}
+
+_spike_is_provider_name() {
+  case "$1" in claude|codex|grok|gemini|kimi) return 0 ;; esac
+  return 1
+}
+
+_spike_is_allowlisted() {
+  case "$1" in git|jq|codesign|file|true|false|sleep|echo|cat|printf) return 0 ;; esac
+  return 1
+}
+
+# Programs that run other programs: never acceptable as the resolved target of an allowlisted name.
+_spike_is_launcher_name() {
+  case "$1" in
+    env|sh|bash|zsh|dash|ksh|csh|tcsh|fish|xargs|nohup|command|exec|time|nice|perl|python|python3|node|ruby|script|expect|osascript|open) return 0 ;;
+  esac
+  return 1
+}
+
+# Exactly the status shapes: --version | auth status | login status (the arguments after the command).
+_spike_status_shape() {
+  if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then return 0; fi
+  if [ "$#" -eq 2 ] && { [ "$1 $2" = "auth status" ] || [ "$1 $2" = "login status" ]; }; then return 0; fi
+  return 1
+}
+
+# codesign reading a binary: --verify --strict <path> | -dv --verbose=2 <path> (the path may name a provider CLI).
+_spike_codesign_shape() {
+  if [ "$#" -eq 3 ] && [ "$1 $2" = "--verify --strict" ]; then return 0; fi
+  if [ "$#" -eq 3 ] && [ "$1 $2" = "-dv --verbose=2" ]; then return 0; fi
+  if [ "$#" -eq 4 ] && [ "$1 $2" = "--verify --strict" ]; then
+    case "$3" in -R=anchor\ apple\ generic\ and\ certificate\ leaf\[subject.OU\]\ =\ \"*\") return 0 ;; esac
+  fi
+  return 1
+}
+
+# 0 if any argument contains a provider name as a whole word, in any letter case.
+_spike_args_mention_provider() {
+  local a
+  for a in "$@"; do
+    if printf '%s\n' "$a" | grep -Eiq '(^|[^A-Za-z0-9])(claude|codex|grok|gemini|kimi)([^A-Za-z0-9]|$)'; then
+      return 0
+    fi
   done
   return 1
 }
 
-# spike_run_timeout <seconds> <outfile> <cmd> [args...]
-# Runs cmd with stdin closed, a scrubbed environment (PATH HOME TMPDIR LANG TERM USER LOGNAME only), in its own process group,
-# stdout+stderr appended to <outfile> (use /dev/null to discard). The whole group is killed on timeout.
-# Returns the command's exit code, or 124 if it was killed for taking too long.
-# A provider CLI may be started only for --version / auth status / login status unless SPIKE_LIVE=1.
+# _spike_needs_live <cmd> [args...] -> 0 if running this needs SPIKE_LIVE=1, 1 if it may run without it.
+_spike_needs_live() {
+  local cmd="$1" full res b1 b2
+  shift
+  full="$(command -v -- "$cmd" 2>/dev/null)" || full=""
+  res=""
+  if [ -n "$full" ]; then res="$(spike_resolve_path "$full" 2>/dev/null)" || res=""; fi
+  b1="$(_spike_base "$cmd")"
+  b2=""
+  if [ -n "$res" ]; then b2="$(_spike_base "$res")"; fi
+
+  if _spike_is_provider_name "$b1" || _spike_is_provider_name "$b2"; then
+    if _spike_status_shape "$@"; then return 1; fi
+    return 0
+  fi
+  if _spike_is_allowlisted "$b1"; then
+    if [ -n "$b2" ] && _spike_is_launcher_name "$b2"; then return 0; fi
+    if [ "$b1" = "git" ] && ! { [ "$#" -eq 1 ] && [ "$1" = "--version" ]; }; then return 0; fi
+    if [ "$b1" = "codesign" ] && _spike_codesign_shape "$@"; then return 1; fi
+    if _spike_args_mention_provider "$@"; then return 0; fi
+    return 1
+  fi
+  return 0
+}
+
+# Kill the command's whole process group: TERM, a moment to exit, then KILL.
+_spike_kill_group() {
+  local p="${_SPIKE_CHILD_PID:-}"
+  [ -n "$p" ] || return 0
+  kill -s TERM -- "-$p" 2>/dev/null
+  kill -s TERM "$p" 2>/dev/null
+  sleep 0.3
+  kill -s KILL -- "-$p" 2>/dev/null
+  kill -s KILL "$p" 2>/dev/null
+  return 0
+}
+
+# Runs inside a subshell (see _spike_exec). Starts the command in its own process group with a scrubbed environment.
+# Any signal or exit path of this subshell kills that group, so nothing is left running.
 _spike_run_timeout_body() {
-  local secs="$1" out="$2" pid ticks=0 limit rc
-  local envargs
+  local secs="$1" out="$2" ticks=0 limit rc envargs
   shift 2
   limit=$((secs * 10))
   # USER/LOGNAME are passed because a CLI looks up its own stored login under the account name; without them
@@ -376,48 +461,109 @@ _spike_run_timeout_body() {
   envargs=(PATH="${PATH:-/usr/bin:/bin}" HOME="${HOME:-/}" TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-C}" TERM="${TERM:-dumb}")
   if [ -n "${USER:-}" ]; then envargs[${#envargs[@]}]="USER=$USER"; fi
   if [ -n "${LOGNAME:-}" ]; then envargs[${#envargs[@]}]="LOGNAME=$LOGNAME"; fi
+  _SPIKE_CHILD_PID=""
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+  trap '_spike_kill_group' EXIT
   perl -e 'setpgrp(0, 0); exec @ARGV' -- env -i "${envargs[@]}" "$@" </dev/null >>"$out" 2>&1 &
-  pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
+  _SPIKE_CHILD_PID=$!
+  while kill -0 "$_SPIKE_CHILD_PID" 2>/dev/null; do
     if [ "$ticks" -ge "$limit" ]; then
-      kill -s TERM -- "-$pid" 2>/dev/null
-      kill -s TERM "$pid" 2>/dev/null
-      sleep 0.3
-      kill -s KILL -- "-$pid" 2>/dev/null
-      kill -s KILL "$pid" 2>/dev/null
-      { wait "$pid"; } 2>/dev/null
+      _spike_kill_group
+      { wait "$_SPIKE_CHILD_PID"; } 2>/dev/null
+      _SPIKE_CHILD_PID=""
       return 124
     fi
     sleep 0.1
     ticks=$((ticks + 1))
   done
-  wait "$pid"
+  wait "$_SPIKE_CHILD_PID"
   rc=$?
+  trap - EXIT TERM INT HUP
   # Sweep anything the command left running in its group.
-  kill -s KILL -- "-$pid" 2>/dev/null
+  kill -s KILL -- "-$_SPIKE_CHILD_PID" 2>/dev/null
   return "$rc"
 }
 
-# The subshell keeps the shell's own "Terminated" job notice out of the caller's stderr.
-spike_run_timeout() {
-  local secs="${1:-}" out="${2:-}"
-  if [ "$#" -lt 3 ]; then
-    spike_err "usage: spike_run_timeout <seconds> <outfile> <cmd> [args...]"
-    return 2
+# In the caller: forward TERM/INT/HUP to the runner subshell (which kills the process group), then exit.
+_spike_forward() {
+  if [ -n "${_SPIKE_BG:-}" ]; then
+    kill -s TERM "$_SPIKE_BG" 2>/dev/null
+    wait "$_SPIKE_BG" 2>/dev/null
   fi
-  case "$secs" in ""|*[!0-9]*) spike_err "bad timeout: $secs"; return 2 ;; esac
+  exit "$1"
+}
+
+# _spike_exec <seconds> <outfile> <cmd> [args...] -- no gate here; callers decide. Returns the command's exit code,
+# or 124 if it was killed for taking too long. stdin is closed, stdout+stderr append to <outfile>.
+_spike_exec() {
+  local rc old_int old_term old_hup
   if ! command -v perl >/dev/null 2>&1; then
     spike_err "perl is required (used to put the command in its own process group)"
     return 2
   fi
-  if _spike_provider_cli_name "$3"; then
-    if [ "$#" -eq 4 ] && [ "$4" = "--version" ]; then
-      :
-    elif [ "$#" -eq 5 ] && { [ "$4 $5" = "auth status" ] || [ "$4 $5" = "login status" ]; }; then
-      :
-    else
-      spike_require_live
-    fi
+  old_int="$(trap -p INT)"
+  old_term="$(trap -p TERM)"
+  old_hup="$(trap -p HUP)"
+  _SPIKE_BG=""
+  trap '_spike_forward 130' INT
+  trap '_spike_forward 143' TERM
+  trap '_spike_forward 129' HUP
+  # The subshell keeps the shell's own "Terminated" job notice out of the caller's stderr.
+  ( _spike_run_timeout_body "$@" ) 2>/dev/null &
+  _SPIKE_BG=$!
+  wait "$_SPIKE_BG"
+  rc=$?
+  _SPIKE_BG=""
+  trap - INT TERM HUP
+  if [ -n "$old_int" ]; then eval "$old_int"; fi
+  if [ -n "$old_term" ]; then eval "$old_term"; fi
+  if [ -n "$old_hup" ]; then eval "$old_hup"; fi
+  return "$rc"
+}
+
+_spike_run_args_ok() { # usage check shared by the three entry points: needs seconds, outfile, cmd
+  if [ "$#" -lt 3 ]; then
+    spike_err "usage: <seconds> <outfile> <cmd> [args...]"
+    return 2
   fi
-  ( _spike_run_timeout_body "$@" ) 2>/dev/null
+  case "$1" in ""|*[!0-9]*) spike_err "bad timeout: $1"; return 2 ;; esac
+  return 0
+}
+
+# spike_run_timeout <seconds> <outfile> <cmd> [args...]
+# Non-live runner for harmless tools: git --version, jq, codesign, file, true, false, sleep, echo, cat, printf, and a
+# provider CLI with exactly --version / auth status / login status. Anything else needs SPIKE_LIVE=1.
+spike_run_timeout() {
+  local secs out cmd
+  _spike_run_args_ok "$@" || return 2
+  secs="$1" out="$2" cmd="$3"
+  shift 3
+  if _spike_needs_live "$cmd" "$@"; then
+    spike_require_live
+  fi
+  _spike_exec "$secs" "$out" "$cmd" "$@"
+}
+
+# spike_run_live <seconds> <outfile> <cmd> [args...]
+# The runner for every real prompt or session. Always checks the live gate first (SPIKE_LIVE=1, set by the human).
+spike_run_live() {
+  _spike_run_args_ok "$@" || return 2
+  spike_require_live
+  _spike_exec "$@"
+}
+
+# spike_run_status <seconds> <outfile> <bin> [args...]
+# For a binary the caller has ALREADY verified (preflight): any file name, but only the exact status shapes
+# (--version, auth status, login status); anything else needs the live gate.
+spike_run_status() {
+  local secs out cmd
+  _spike_run_args_ok "$@" || return 2
+  secs="$1" out="$2" cmd="$3"
+  shift 3
+  if ! _spike_status_shape "$@"; then
+    spike_require_live
+  fi
+  _spike_exec "$secs" "$out" "$cmd" "$@"
 }

@@ -4,16 +4,32 @@
 #
 #   spike/preflight.sh
 #
-# Order matters (rule 6): the code signature of the RESOLVED binary is verified first. A Mach-O binary whose signature
-# does not verify is never executed ("skipped (unverified)"). Version and sign-in are then run on that same resolved
-# binary. Sign-in state comes from the CLI's own status command and ONLY from its exit code: the output is discarded and
-# never printed or stored (it can contain account details). Children get a scrubbed environment (spike_run_timeout).
+# Order matters (rule 6): the code signature of the RESOLVED binary is verified first, and the binary is executed only
+# if the signature verifies AND is a "Developer ID Application" signature AND carries the pinned team identifier for
+# that CLI (see the pinned block below). Anything else (ad-hoc, unsigned, no authority, wrong team, script launcher,
+# unknown file type) is never executed. Version and sign-in are then run on that same resolved binary. Sign-in state
+# comes from the CLI's own status command and ONLY from its exit code: the output is discarded and never printed or
+# stored (it can contain account details). Children get a scrubbed environment (spike_run_status).
 # Exit 0 = report printed; exit 1 = jq or git missing.
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck disable=SC1091
 . "$HERE/lib/common.sh"
+
+# ---- PINNED SIGNER IDENTITIES (rule 6) ------------------------------------------------------------------------------
+# Apple Developer Team IDs that the official CLI binaries must be signed by. Taken from the binaries installed on the
+# developer's Mac on 2026-10-25 (claude: Anthropic PBC, codex: OpenAI). THE HUMAN MUST CONFIRM THESE AGAINST
+# VENDOR-PUBLISHED VALUES BEFORE ANY RELEASE; until then they only prove "same signer as the binary I installed".
+PINNED_AUTHORITY_PREFIX="Developer ID Application"
+pinned_team() {
+  case "$1" in
+    claude) printf 'Q6L2SF6YDW' ;;  # Anthropic PBC
+    codex) printf '2DC432GLL2' ;;   # OpenAI
+    *) printf '' ;;
+  esac
+}
+# ---------------------------------------------------------------------------------------------------------------------
 
 TMPOUT="$(mktemp "${TMPDIR:-/tmp}/spike-preflight.XXXXXX")" || exit 1
 trap 'rm -f "$TMPOUT"' EXIT
@@ -53,10 +69,22 @@ check_tool() { # check_tool <name> <version-args...>
   return 0
 }
 
-# Sets SIG (column text) and VERIFIED (1 = ok to execute) for the binary at $1.
+# verify_binary <bin> <kind> <cli-name>: sets SIG (column text) and VERIFIED (1 = ok to execute).
 verify_binary() {
-  local bin="$1" kind="$2" rc auth team sigkind
+  local bin="$1" kind="$2" name="$3" rc auth team want sigkind firstauth
   VERIFIED=0
+  case "$kind" in
+    script)
+      # A script cannot carry a trusted signature; it is never executed without a human decision.
+      SIG="launcher only, not executed (needs human approval)"
+      return
+      ;;
+    mach-o) ;;
+    *)
+      SIG="NOT VERIFIED (unrecognised file type)"
+      return
+      ;;
+  esac
   if ! command -v codesign >/dev/null 2>&1; then
     SIG="NOT VERIFIED (codesign unavailable)"
     return
@@ -64,38 +92,51 @@ verify_binary() {
   : > "$TMPOUT"
   spike_run_timeout 20 "$TMPOUT" codesign --verify --strict "$bin"
   rc=$?
-  case "$kind" in
-    mach-o)
-      if [ "$rc" -eq 0 ]; then
-        : > "$TMPOUT"
-        spike_run_timeout 20 "$TMPOUT" codesign -dv --verbose=2 "$bin"
-        auth="$(grep -m1 '^Authority=' "$TMPOUT" | cut -d= -f2- | clean | sed 's/ ([A-Z0-9]*)$//' | spike_redact | cut -c1-46)"
-        team="$(grep -m1 '^TeamIdentifier=' "$TMPOUT" | cut -d= -f2- | clean | cut -c1-12)"
-        sigkind=""
-        grep -q '^Signature=adhoc' "$TMPOUT" && sigkind="ad-hoc, "
-        SIG="valid; ${sigkind}${auth:-no authority}; team ${team:-none}"
-        VERIFIED=1
-      elif [ "$rc" -eq 124 ]; then
-        SIG="NOT VERIFIED (codesign timed out)"
-      elif grep -qi 'not signed at all' "$TMPOUT"; then
-        SIG="NOT SIGNED"
-      else
-        SIG="NOT VERIFIED (codesign rc=$rc)"
-      fi
-      ;;
-    script)
-      # A script cannot carry its own signature; the check only describes the launcher.
-      VERIFIED=1
-      if [ "$rc" -eq 0 ]; then
-        SIG="launcher only (valid signature on the launcher)"
-      else
-        SIG="launcher only (not signed / not a Mach-O)"
-      fi
-      ;;
+  if [ "$rc" -eq 124 ]; then
+    SIG="NOT VERIFIED (codesign timed out)"
+    return
+  fi
+  if [ "$rc" -ne 0 ]; then
+    if grep -qi 'not signed at all' "$TMPOUT"; then
+      SIG="NOT SIGNED"
+    else
+      SIG="NOT VERIFIED (codesign rc=$rc)"
+    fi
+    return
+  fi
+
+  # The signature is intact. Now identify the signer.
+  : > "$TMPOUT"
+  spike_run_timeout 20 "$TMPOUT" codesign -dv --verbose=2 "$bin"
+  firstauth="$(grep -m1 '^Authority=' "$TMPOUT" | cut -d= -f2-)"
+  team="$(grep -m1 '^TeamIdentifier=' "$TMPOUT" | cut -d= -f2-)"
+  auth="$(printf '%s' "$firstauth" | clean | sed 's/ ([A-Z0-9]*)$//' | spike_redact | cut -c1-46)"
+  team="$(printf '%s' "$team" | clean | cut -c1-12)"
+  sigkind=""
+  if grep -q '^Signature=adhoc' "$TMPOUT"; then sigkind="ad-hoc, "; fi
+  want="$(pinned_team "$name")"
+
+  case "$firstauth" in
+    "$PINNED_AUTHORITY_PREFIX"*) ;;
     *)
-      SIG="NOT VERIFIED (unrecognised file type)"
+      SIG="UNTRUSTED (valid but ${sigkind}${auth:-no authority}; not Developer ID)"
+      return
       ;;
   esac
+  if [ -z "$want" ] || [ "$team" != "$want" ]; then
+    SIG="UNTRUSTED (valid but team ${team:-not set} is not the pinned team)"
+    return
+  fi
+  # The text above can be forged by a self-made certificate; this asks codesign to check the chain to Apple's root.
+  : > "$TMPOUT"
+  spike_run_timeout 20 "$TMPOUT" codesign --verify --strict -R="anchor apple generic and certificate leaf[subject.OU] = \"$want\"" "$bin"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    SIG="UNTRUSTED (signer text matches but the certificate chain does not satisfy the pinned team)"
+    return
+  fi
+  SIG="valid; ${auth}; team ${team}"
+  VERIFIED=1
 }
 
 check_cli() { # check_cli <name> <signin-args...>
@@ -116,18 +157,19 @@ check_cli() { # check_cli <name> <signin-args...>
   esac
 
   # 1. Verify the resolved binary. 2. Only then execute that same binary.
-  verify_binary "$bin" "$kind"
+  verify_binary "$bin" "$kind" "$name"
   if [ "$VERIFIED" -ne 1 ]; then
     printf "$ROW_FMT" "$name" "yes" "skipped (unverified)" "$kind" "$SIG" "skipped (unverified)" "$(show_path "$bin")"
-    add_note "$name was NOT executed because its code signature did not verify (rule 6)."
+    if [ "$kind" = "script" ]; then
+      add_note "$name resolves to a script launcher and was NOT executed; a launcher's signature (if any) says nothing about the program it starts. A human must approve it explicitly."
+    else
+      add_note "$name was NOT executed because its code signature did not verify as the pinned vendor signer (rule 6)."
+    fi
     return 0
-  fi
-  if [ "$kind" = "script" ]; then
-    add_note "$name resolves to a script launcher; the signature column covers the launcher only, not the program it starts."
   fi
 
   : > "$TMPOUT"
-  spike_run_timeout 20 "$TMPOUT" "$bin" --version
+  spike_run_status 20 "$TMPOUT" "$bin" --version
   rc=$?
   if [ "$rc" -eq 0 ]; then
     ver="$(first_line "$TMPOUT" 26)"
@@ -138,7 +180,7 @@ check_cli() { # check_cli <name> <signin-args...>
   fi
 
   # Sign-in: documented status command, exit code only (output discarded).
-  spike_run_timeout 20 /dev/null "$bin" "$@"
+  spike_run_status 20 /dev/null "$bin" "$@"
   rc=$?
   if [ "$rc" -eq 0 ]; then
     signin="signed in"

@@ -10,15 +10,27 @@ are not product code. Requirements: macOS `/bin/bash` 3.2, `jq`, `git`.
   `spike_require_live` first; without `SPIKE_LIVE=1` it exits 3 and does nothing. Offline tests never set it.
   (`preflight.sh` only asks each CLI for its version and sign-in status. It sends no prompt.)
   `SPIKE_LIVE=1` is a guard against accidents, **not an approval**. An agent must never set it (not in a script, an
-  environment file or a command line) unless the human explicitly asks for that live run. `spike_require_live` stops the
-  whole calling script (exit 3), even when called inside `$(...)`, a pipe or a subshell, and `spike_run_timeout`
-  applies it itself to any provider CLI (claude, codex, grok, gemini, kimi) except for `--version`, `auth status` and
-  `login status`.
+  environment file or a command line) unless the human explicitly asks for that live run.
+  - **Call `spike_require_live` at the top level of the script, as its first statement, and never override the TERM
+    trap.** It stops the whole calling script (exit 3), even from `$(...)`, a pipe or a subshell, by sending TERM to the
+    top-level script; a detached watchdog sends KILL 0.3 s later as a fail-safe. Source `lib/common.sh` from scripts only,
+    never from an interactive shell.
+  - **Every real prompt or session goes through `spike_run_live`**, which always checks the gate first. The non-live
+    runner `spike_run_timeout` is default-deny: without `SPIKE_LIVE=1` it runs only `git --version`, `jq`, `codesign`
+    (read-only verify shapes), `file`, `true`, `false`, `sleep`, `echo`, `cat`, `printf`, and a provider CLI (claude,
+    codex, grok, gemini, kimi) with exactly `--version`, `auth status` or `login status`. Anything else needs the gate:
+    shells, `env`, `xargs`, interpreters, renamed or unknown programs, and any argument that mentions a provider name
+    as a whole word in any letter case. `spike_run_status` is for a binary the caller already verified: any file name,
+    but only the three status shapes.
 - **Children run with a scrubbed environment** (`PATH HOME TMPDIR LANG TERM`, plus `USER`/`LOGNAME` because a CLI looks up
-  its own stored login under the account name), in their own process group that is killed on timeout.
-- **Binaries are verified before they are executed.** `preflight.sh` checks the code signature of the resolved binary
-  first and never runs a Mach-O whose signature does not verify (`skipped (unverified)`). A script launcher is run, and
-  its SIGNATURE cell says `launcher only` because the signature then covers the launcher, not the program it starts.
+  its own stored login under the account name), in their own process group. The group is killed on timeout, when the
+  caller receives TERM, INT or HUP, and when the runner exits; a command that exits but leaves children behind is swept.
+- **Binaries are verified before they are executed.** `preflight.sh` runs a CLI only if its resolved binary passes
+  `codesign --verify --strict`, has a `Developer ID Application` authority, carries the pinned team identifier for that
+  CLI, and satisfies an `anchor apple generic` requirement for that team. Ad-hoc, unsigned, wrong-team, forged and
+  non-Mach-O files are reported (`skipped (unverified)`) and never executed. A script launcher is never executed either:
+  its SIGNATURE cell says `launcher only, not executed (needs human approval)`. The pinned team ids sit in one labeled
+  block at the top of `preflight.sh`; **the human must confirm them against vendor-published values before release.**
 - **Scratch repos live outside this repo**, under `${TMPDIR:-/tmp}/harness-spike/<run-id>/`, so this repo's CLAUDE.md,
   hooks and settings never load into a spiked CLI session. `spike_cleanup` refuses to delete anything outside that root.
 - **Captures are gitignored** (`spike/captures/<cli>/<UTC timestamp>/`). Run captured output through `spike_redact`

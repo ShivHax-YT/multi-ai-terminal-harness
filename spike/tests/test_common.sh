@@ -180,6 +180,81 @@ SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/claude" -p 
 eq "run_timeout runs a provider CLI prompt with SPIKE_LIVE=1" "0" "$?"
 eq "live provider CLI was started" "1" "$(ran)"
 
+# --- the gate is default-deny: indirect launches of a provider CLI are refused (rule 1) ------------------------------
+cp "$FAKE/claude" "$FAKE/renamed"
+cp "$FAKE/claude" "$FAKE/mytool"
+rm -f "$FAKE"/ran-*
+# denied <name> <code>: with SPIKE_LIVE unset and the fake claude first on PATH, <code> must exit 3, never reach the
+# line after it, and never start the fake.
+denied() {
+  local name="$1" code="$2" o rc
+  o="$(env -u SPIKE_LIVE PATH="$FAKE:$PATH" /bin/bash -c '. "$1"; eval "$2"; echo CONTINUED' _ "$COMMON" "$code" 2>/dev/null)"
+  rc=$?
+  eq "gate: $name (rc 3)" "3" "$rc"
+  lacks "gate: $name (caller stopped)" "$o" "CONTINUED"
+  eq "gate: $name (CLI not started)" "0" "$(ran)"
+}
+denied "env claude -p hi" 'spike_run_timeout 5 /dev/null env claude -p hi'
+denied "/usr/bin/env claude -p hi" 'spike_run_timeout 5 /dev/null /usr/bin/env claude -p hi'
+denied "sh -c 'claude -p hi'" "spike_run_timeout 5 /dev/null sh -c 'claude -p hi'"
+denied "bash -c 'claude -p hi'" "spike_run_timeout 5 /dev/null bash -c 'claude -p hi'"
+denied "/bin/bash -c with a path" "spike_run_timeout 5 /dev/null /bin/bash -c '$FAKE/claude -p hi'"
+denied "renamed copy of claude" "spike_run_timeout 5 /dev/null '$FAKE/renamed' -p hi"
+denied "renamed copy with --version" "spike_run_timeout 5 /dev/null '$FAKE/renamed' --version"
+denied "unknown tool name" "spike_run_timeout 5 /dev/null '$FAKE/mytool' -p hi"
+denied "upper-case CLAUDE path" "spike_run_timeout 5 /dev/null '$FAKE/CLAUDE' -p hi"
+denied "upper-case Codex exec" "spike_run_timeout 5 /dev/null '$FAKE/Codex' exec hi"
+denied "provider name in the args of an allowed tool (echo)" "spike_run_timeout 5 /dev/null echo CLAUDE"
+denied "provider name as a path component in cat" "spike_run_timeout 5 /dev/null cat /x/codex/y"
+denied "git with an alias that runs claude" "spike_run_timeout 5 /dev/null git -c 'alias.x=!claude -p hi' x"
+denied "git with anything but --version" "spike_run_timeout 5 /dev/null git status"
+for w in zsh dash ksh xargs nohup command exec time nice perl python python3 node ruby script expect osascript open; do
+  denied "launcher '$w'" "spike_run_timeout 5 /dev/null $w claude -p hi"
+done
+denied "spike_run_live without SPIKE_LIVE" "spike_run_live 5 /dev/null '$FAKE/claude' -p hi"
+denied "spike_run_status with a prompt" "spike_run_status 5 /dev/null '$FAKE/renamed' -p hi"
+denied "spike_run_status with --version and extra args" "spike_run_status 5 /dev/null '$FAKE/renamed' --version -p"
+
+# ...while the harmless shapes still work without SPIKE_LIVE.
+okrun() { # okrun <name> <code>: must not be stopped by the gate
+  local name="$1" code="$2" o
+  o="$(env -u SPIKE_LIVE PATH="$FAKE:$PATH" /bin/bash -c '. "$1"; eval "$2"; echo CONTINUED' _ "$COMMON" "$code" 2>/dev/null)"
+  has "gate allows: $name" "$o" "CONTINUED"
+}
+okrun "true" 'spike_run_timeout 5 /dev/null true'
+okrun "echo hello" 'spike_run_timeout 5 /dev/null echo hello'
+okrun "sleep" 'spike_run_timeout 5 /dev/null sleep 0'
+okrun "jq --version" 'spike_run_timeout 5 /dev/null jq --version'
+okrun "git --version" 'spike_run_timeout 5 /dev/null git --version'
+okrun "codesign --verify --strict <provider path>" "spike_run_timeout 5 /dev/null codesign --verify --strict '$FAKE/claude'"
+okrun "codesign -dv --verbose=2 <provider path>" "spike_run_timeout 5 /dev/null codesign -dv --verbose=2 '$FAKE/claude'"
+okrun "spike_run_status of a renamed binary with --version" "spike_run_status 5 /dev/null '$FAKE/renamed' --version"
+okrun "spike_run_status of a renamed binary with login status" "spike_run_status 5 /dev/null '$FAKE/renamed' login status"
+okrun "upper-case CLAUDE with --version" "spike_run_timeout 5 /dev/null '$FAKE/CLAUDE' --version"
+rm -f "$FAKE"/ran-*
+SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live 5 /dev/null "$2/renamed" -p hi' _ "$COMMON" "$FAKE" 2>/dev/null
+eq "spike_run_live runs when SPIKE_LIVE=1 (rc)" "0" "$?"
+eq "spike_run_live started the command" "1" "$(ran)"
+rm -f "$FAKE"/ran-*
+
+# --- require_live: documented top-level use, and the fail-safe for a caller that overrode TERM ---------------------
+cat > "$SANDBOX/toplevel.sh" <<EOF
+#!/bin/bash
+. "$COMMON"
+spike_require_live
+echo RAN
+EOF
+out="$(env -u SPIKE_LIVE /bin/bash "$SANDBOX/toplevel.sh" 2>/dev/null)"
+eq "documented top-level use stops with rc 3" "3" "$?"
+lacks "documented top-level use prints nothing after the gate" "$out" "RAN"
+out="$(SPIKE_LIVE=1 /bin/bash "$SANDBOX/toplevel.sh" 2>/dev/null)"
+has "documented top-level use continues when SPIKE_LIVE=1" "$out" "RAN"
+# A caller that ignores TERM is still stopped shortly after (watchdog sends KILL), even from inside $(...).
+out="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; trap "" TERM; x="$(spike_require_live)"; sleep 1; echo LATE' _ "$COMMON" 2>/dev/null)"
+lacks "a caller that ignores TERM is killed by the fail-safe" "$out" "LATE"
+out="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; trap "echo CAUGHT" TERM; ( spike_require_live ); sleep 1; echo LATE' _ "$COMMON" 2>/dev/null)"
+lacks "a caller with its own TERM trap is killed by the fail-safe" "$out" "LATE"
+
 # --- spike_capture_dir -----------------------------------------------------------------------------------------------
 export SPIKE_CAPTURES_ROOT="$SANDBOX/captures"
 CAP="$(spike_capture_dir demo)"
@@ -282,13 +357,41 @@ check "run_timeout returned promptly" test "$(($(date +%s) - START))" -lt 4
 # Environment is scrubbed (rules 2 and 4): only PATH HOME TMPDIR LANG TERM reach the child.
 ENVOUT="$SANDBOX/env.out"
 : > "$ENVOUT"
-SPIKE_TEST_SECRET=hunter2 SPIKE_LIVE=1 USER=tu LOGNAME=tu spike_run_timeout 5 "$ENVOUT" env
+SPIKE_TEST_SECRET=hunter2 SPIKE_LIVE=1 USER=tu LOGNAME=tu spike_run_live 5 "$ENVOUT" env
 has "run_timeout passes PATH" "$(cat "$ENVOUT")" "PATH="
 has "run_timeout passes HOME" "$(cat "$ENVOUT")" "HOME="
 has "run_timeout passes USER (CLIs look up their own login by account name)" "$(cat "$ENVOUT")" "USER=tu"
 lacks "run_timeout drops other variables" "$(cat "$ENVOUT")" "hunter2"
 lacks "run_timeout drops SPIKE_LIVE" "$(cat "$ENVOUT")" "SPIKE_LIVE"
 eq "run_timeout passes exactly 7 variables" "7" "$(wc -l < "$ENVOUT" | tr -d ' ')"
+
+# Closed set: whatever is exported in the caller (generic probes shaped like keys, homes and config dirs), the child sees
+# only HOME LANG LOGNAME PATH TERM TMPDIR USER (plus PWD SHLVL _ when a shell starts it).
+closed_set_check() { # closed_set_check <label> <file>
+  local label="$1" f="$2" line name stray=""
+  while IFS= read -r line; do
+    name="${line%%=*}"
+    case "$name" in
+      HOME|LANG|LOGNAME|PATH|TERM|TMPDIR|USER|PWD|SHLVL|_) ;;
+      *) stray="$stray $name" ;;
+    esac
+  done < "$f"
+  if [ -z "$stray" ]; then ok "$label: child environment is inside the closed set"; else bad "$label: stray variables:$stray"; fi
+}
+export FOO_API_KEY=k1 FOO_HOME=/h FOO_CONFIG_DIR=/c BAR_TOKEN=t2 HTTPS_PROXY=http://p SSH_AUTH_SOCK=/s XDG_CONFIG_HOME=/x
+: > "$ENVOUT"
+SPIKE_LIVE=1 spike_run_live 5 "$ENVOUT" env
+closed_set_check "env" "$ENVOUT"
+lacks "probe FOO_API_KEY is not passed" "$(cat "$ENVOUT")" "FOO_API_KEY"
+lacks "probe FOO_HOME is not passed" "$(cat "$ENVOUT")" "FOO_HOME"
+lacks "probe FOO_CONFIG_DIR is not passed" "$(cat "$ENVOUT")" "FOO_CONFIG_DIR"
+: > "$ENVOUT"
+SPIKE_LIVE=1 spike_run_live 5 "$ENVOUT" /bin/sh -c env
+closed_set_check "sh -c env" "$ENVOUT"
+: > "$ENVOUT"
+SPIKE_LIVE=1 spike_run_live 5 "$ENVOUT" /bin/bash -c env
+closed_set_check "bash -c env" "$ENVOUT"
+unset FOO_API_KEY FOO_HOME FOO_CONFIG_DIR BAR_TOKEN HTTPS_PROXY SSH_AUTH_SOCK XDG_CONFIG_HOME
 
 # The whole process group dies on timeout: a launcher that spawns a grandchild leaves no orphan.
 cat > "$SANDBOX/launcher.sh" <<EOF
@@ -299,7 +402,7 @@ wait
 EOF
 chmod +x "$SANDBOX/launcher.sh"
 rm -f "$SANDBOX/grandchild.pid"
-spike_run_timeout 1 /dev/null "$SANDBOX/launcher.sh"
+SPIKE_LIVE=1 spike_run_live 1 /dev/null "$SANDBOX/launcher.sh"
 eq "run_timeout times out a launcher (rc)" "124" "$?"
 sleep 0.3
 GC="$(cat "$SANDBOX/grandchild.pid" 2>/dev/null)"
@@ -319,7 +422,7 @@ echo \$! > "$SANDBOX/leftover.pid"
 exit 0
 EOF
 chmod +x "$SANDBOX/leaver.sh"
-spike_run_timeout 5 /dev/null "$SANDBOX/leaver.sh"
+SPIKE_LIVE=1 spike_run_live 5 /dev/null "$SANDBOX/leaver.sh"
 eq "run_timeout returns the leaver's exit code" "0" "$?"
 sleep 0.3
 LO="$(cat "$SANDBOX/leftover.pid" 2>/dev/null)"
@@ -329,6 +432,39 @@ if [ -n "$LO" ] && kill -0 "$LO" 2>/dev/null; then
 else
   ok "leftover background child was swept"
 fi
+
+# Signals sent to the caller must not leave the command (or its grandchild) running.
+alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
+for sig in TERM HUP; do
+  rm -f "$SANDBOX/sig.pids"
+  cat > "$SANDBOX/siglauncher.sh" <<EOF
+#!/bin/sh
+sleep 33 &
+echo "\$\$ \$!" > "$SANDBOX/sig.pids.tmp"
+mv "$SANDBOX/sig.pids.tmp" "$SANDBOX/sig.pids"
+wait
+EOF
+  chmod +x "$SANDBOX/siglauncher.sh"
+  SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live 60 /dev/null "$2"; echo AFTER' _ "$COMMON" "$SANDBOX/siglauncher.sh" > "$SANDBOX/sig.out" 2>/dev/null &
+  CALLER=$!
+  n=0
+  while [ ! -s "$SANDBOX/sig.pids" ] && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+  read -r LPID GPID < "$SANDBOX/sig.pids"
+  if alive "$LPID" && alive "$GPID"; then ok "SIG$sig: launcher and grandchild are running before the signal"; else bad "SIG$sig: launcher and grandchild are running before the signal"; fi
+  kill -s "$sig" "$CALLER"
+  wait "$CALLER" 2>/dev/null
+  RC=$?
+  sleep 0.8
+  if alive "$LPID"; then bad "SIG$sig to the caller: launcher is gone"; kill -9 "$LPID" 2>/dev/null; else ok "SIG$sig to the caller: launcher is gone"; fi
+  if alive "$GPID"; then bad "SIG$sig to the caller: grandchild is gone"; kill -9 "$GPID" 2>/dev/null; else ok "SIG$sig to the caller: grandchild is gone"; fi
+  if alive "$CALLER"; then bad "SIG$sig to the caller: caller exited"; kill -9 "$CALLER" 2>/dev/null; else ok "SIG$sig to the caller: caller exited"; fi
+  lacks "SIG$sig to the caller: nothing ran afterwards" "$(cat "$SANDBOX/sig.out")" "AFTER"
+  check "SIG$sig to the caller: exit status is a signal status" test "$RC" -gt 128
+done
+
+# The caller's own TERM trap is restored after a run.
+out="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; trap "echo MYTRAP" TERM; spike_run_live 5 /dev/null true; trap -p TERM' _ "$COMMON" 2>/dev/null)"
+has "caller TERM trap is restored after spike_run_live" "$out" "echo MYTRAP"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

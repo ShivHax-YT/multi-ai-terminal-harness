@@ -41,6 +41,45 @@ run_preflight() {
 
 mkdir -p "$SANDBOX/home"
 
+# mkcodesign <file> <mode> [logfile]: a fake codesign. Pinned team ids are the ones in preflight.sh.
+#   good      Developer ID Application, pinned team, chain check passes
+#   unsigned  verify fails: not signed at all
+#   adhoc     verify passes, ad-hoc signature, no authority, team not set
+#   wrongteam Developer ID Application but another team
+#   notdev    pinned team but an "Apple Development" authority
+#   forged    text looks right, but the -R chain requirement fails
+#   weird     verify fails with rc 3
+mkcodesign() {
+  local f="$1" mode="$2" log="${3:-/dev/null}"
+  cat > "$f" <<EOF
+#!/bin/sh
+echo "\$*" >> "$log"
+MODE="$mode"
+TEAM=UNKNOWN
+case "\$*" in *claude*) TEAM=Q6L2SF6YDW ;; *codex*) TEAM=2DC432GLL2 ;; esac
+case "\$MODE" in
+  unsigned) echo "code object is not signed at all" >&2; exit 1 ;;
+  weird) echo "weird failure" >&2; exit 3 ;;
+esac
+case "\$1" in
+  --verify)
+    case "\$3" in -R=*) [ "\$MODE" = forged ] && { echo "failed to satisfy requirement" >&2; exit 3; } ;; esac
+    exit 0 ;;
+  -dv)
+    case "\$MODE" in
+      good) printf 'Executable=/x\nAuthority=Developer ID Application: Fake Dev (%s)\nAuthority=Developer ID Certification Authority\nTeamIdentifier=%s\n' "\$TEAM" "\$TEAM" >&2 ;;
+      forged) printf 'Authority=Developer ID Application: Fake Dev (%s)\nTeamIdentifier=%s\n' "\$TEAM" "\$TEAM" >&2 ;;
+      adhoc) printf 'Signature=adhoc\nTeamIdentifier=not set\n' >&2 ;;
+      wrongteam) printf 'Authority=Developer ID Application: Evil Corp (WRONGTEAM1)\nTeamIdentifier=WRONGTEAM1\n' >&2 ;;
+      notdev) printf 'Authority=Apple Development: someone (%s)\nTeamIdentifier=%s\n' "\$TEAM" "\$TEAM" >&2 ;;
+    esac
+    exit 0 ;;
+esac
+exit 1
+EOF
+  chmod +x "$f"
+}
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Scenario 1: both CLIs are "Mach-O" with a valid signature. Their status commands print secrets: none may leak.
 B1="$SANDBOX/b1"
@@ -50,14 +89,7 @@ cat > "$B1/file" <<'EOF'
 #!/bin/sh
 echo "Mach-O 64-bit executable arm64"
 EOF
-cat > "$B1/codesign" <<'EOF'
-#!/bin/sh
-case "$1" in
-  --verify) exit 0 ;;
-  -dv) printf 'Executable=/x\nAuthority=Fake Dev ID (TEAM123456)\nAuthority=Fake CA\nTeamIdentifier=TEAM123456\n' >&2; exit 0 ;;
-esac
-exit 1
-EOF
+mkcodesign "$B1/codesign" good "$SANDBOX/codesign1.log"
 for n in claude codex; do
   cat > "$B1/$n" <<EOF
 #!/bin/sh
@@ -74,7 +106,7 @@ OUT1="$(run_preflight "$B1")"
 RC1=$?
 eq "scenario 1: preflight exits 0" "0" "$RC1"
 has "scenario 1: header has a SIGNATURE column" "$OUT1" "SIGNATURE"
-has "scenario 1: claude row is valid and shows the signer and team" "$(row "$OUT1" claude)" "valid; Fake Dev ID; team TEAM123456"
+has "scenario 1: claude row is valid and shows the signer and team" "$(row "$OUT1" claude)" "valid; Developer ID Application: Fake Dev; team Q6L2SF6YDW"
 has "scenario 1: claude is signed in (exit code 0)" "$(row "$OUT1" claude)" "signed in"
 has "scenario 1: codex is not signed in (exit code 1)" "$(row "$OUT1" codex)" "not signed in (rc=1)"
 has "scenario 1: version is shown" "$(row "$OUT1" claude)" "v9.9.9 (Fake)"
@@ -88,6 +120,7 @@ has "scenario 1: footer explains the path display" "$OUT1" "any at-sign in a pat
 has "scenario 1: claude was run with --version" "$(cat "$LOG1")" "claude --version"
 has "scenario 1: claude was run with auth status" "$(cat "$LOG1")" "claude auth status"
 has "scenario 1: codex was run with login status" "$(cat "$LOG1")" "codex login status"
+has "scenario 1: the chain-to-Apple requirement for the pinned team was checked" "$(cat "$SANDBOX/codesign1.log")" 'anchor apple generic and certificate leaf[subject.OU] = "Q6L2SF6YDW"'
 lacks "scenario 1: no prompt was ever sent" "$(cat "$LOG1")" " -p "
 lacks "scenario 1: no exec subcommand was run" "$(cat "$LOG1")" "codex exec"
 
@@ -100,11 +133,7 @@ cat > "$B2/file" <<'EOF'
 #!/bin/sh
 echo "Mach-O 64-bit executable arm64"
 EOF
-cat > "$B2/codesign" <<'EOF'
-#!/bin/sh
-echo "code object is not signed at all" >&2
-exit 1
-EOF
+mkcodesign "$B2/codesign" unsigned
 for n in claude codex; do
   cat > "$B2/$n" <<EOF
 #!/bin/sh
@@ -128,20 +157,38 @@ has "scenario 2: a note says it was not executed" "$OUT2" "NOT executed"
 B2B="$SANDBOX/b2b"
 mkbin "$B2B"
 cp "$B2/file" "$B2/claude" "$B2/codex" "$B2B/"
-printf '#!/bin/sh\necho "weird failure" >&2\nexit 3\n' > "$B2B/codesign"
-chmod +x "$B2B/codesign"
+mkcodesign "$B2B/codesign" weird
 rm -f "$MARK2"
 OUT2B="$(run_preflight "$B2B")"
 has "scenario 2b: other codesign failures are NOT VERIFIED" "$(row "$OUT2B" claude)" "NOT VERIFIED (codesign rc=3)"
 if [ -e "$MARK2" ]; then bad "scenario 2b: unverified binary was NOT executed"; else ok "scenario 2b: unverified binary was NOT executed"; fi
 
+# Scenarios 2c-2f: the signature verifies, but it is not the pinned vendor signature. Never executed.
+for mode in adhoc wrongteam notdev forged; do
+  BX="$SANDBOX/b2-$mode"
+  mkbin "$BX"
+  cp "$B2/file" "$B2/claude" "$B2/codex" "$BX/"
+  mkcodesign "$BX/codesign" "$mode"
+  rm -f "$MARK2"
+  OUTX="$(run_preflight "$BX")"
+  eq "scenario 2 ($mode): preflight exits 0" "0" "$?"
+  has "scenario 2 ($mode): claude is UNTRUSTED" "$(row "$OUTX" claude)" "UNTRUSTED"
+  has "scenario 2 ($mode): codex is UNTRUSTED" "$(row "$OUTX" codex)" "UNTRUSTED"
+  has "scenario 2 ($mode): version is skipped" "$(row "$OUTX" claude)" "skipped (unverified)"
+  if [ -e "$MARK2" ]; then bad "scenario 2 ($mode): binary was NOT executed"; else ok "scenario 2 ($mode): binary was NOT executed"; fi
+  lacks "scenario 2 ($mode): nothing leaked" "$OUTX" "SECRET"
+done
+has "scenario 2 (adhoc): reported as ad-hoc, not Developer ID" "$(run_preflight "$SANDBOX/b2-adhoc" | grep '^claude')" "ad-hoc"
+has "scenario 2 (wrongteam): reported as not the pinned team" "$(run_preflight "$SANDBOX/b2-wrongteam" | grep '^claude')" "not the pinned team"
+has "scenario 2 (forged): reported as chain mismatch" "$(run_preflight "$SANDBOX/b2-forged" | grep '^claude')" "certificate chain"
+
 # ---------------------------------------------------------------------------------------------------------------------
-# Scenario 3: script launchers (real `file`): executed, but the SIGNATURE column and a note say launcher only.
+# Scenario 3: script launchers (real `file`) are NOT executed; the SIGNATURE cell and a note say so.
 B3="$SANDBOX/b3"
 mkbin "$B3"
 ln -sf "$(command -v file)" "$B3/file"
 LOG3="$SANDBOX/log3"
-printf '#!/bin/sh\necho "not signed at all" >&2\nexit 1\n' > "$B3/codesign"
+mkcodesign "$B3/codesign" unsigned
 for n in claude codex; do
   cat > "$B3/$n" <<EOF
 #!/bin/sh
@@ -157,24 +204,28 @@ chmod +x "$B3/codesign" "$B3/claude" "$B3/codex"
 OUT3="$(run_preflight "$B3")"
 RC3=$?
 eq "scenario 3: preflight exits 0" "0" "$RC3"
-has "scenario 3: SIGNATURE column says launcher only" "$(row "$OUT3" claude)" "launcher only"
+has "scenario 3: SIGNATURE cell says launcher only, not executed" "$(row "$OUT3" claude)" "launcher only, not executed (needs human approval)"
 has "scenario 3: kind is script" "$(row "$OUT3" claude)" "script"
-has "scenario 3: note says the signature covers the launcher only" "$OUT3" "script launcher; the signature column covers the launcher only"
-has "scenario 3: launcher was run for --version" "$(cat "$LOG3")" "claude --version"
-has "scenario 3: version is shown" "$(row "$OUT3" claude)" "launcher 1.0"
+has "scenario 3: version is skipped" "$(row "$OUT3" claude)" "skipped (unverified)"
+has "scenario 3: note says the launcher was NOT executed" "$OUT3" "script launcher and was NOT executed"
+if [ -s "$LOG3" ]; then bad "scenario 3: no launcher was executed"; else ok "scenario 3: no launcher was executed"; fi
 
-# Scenario 3b: a symlinked launcher is resolved and the RESOLVED file is what gets executed.
+# Scenario 3b: a symlinked CLI is resolved; the RESOLVED file is what gets verified and then executed.
 B3B="$SANDBOX/b3b"
 mkbin "$B3B"
-ln -sf "$(command -v file)" "$B3B/file"
-cp "$B3/codesign" "$B3B/"
+cp "$B1/file" "$B3B/file"
+CS3B="$SANDBOX/codesign3b.log"
+mkcodesign "$B3B/codesign" good "$CS3B"
 mkdir -p "$SANDBOX/real3b"
 LOG3B="$SANDBOX/log3b"
 printf '#!/bin/sh\necho "RESOLVED $0 $*" >> "%s"\nexit 0\n' "$LOG3B" > "$SANDBOX/real3b/claude-real"
 chmod +x "$SANDBOX/real3b/claude-real"
 ln -s "$SANDBOX/real3b/claude-real" "$B3B/claude"
 OUT3B="$(run_preflight "$B3B")"
-has "scenario 3b: the resolved binary path is what ran" "$(cat "$LOG3B")" "RESOLVED $SANDBOX/real3b/claude-real --version"
+has "scenario 3b: codesign was asked about the resolved path" "$(cat "$CS3B")" "--verify --strict $SANDBOX/real3b/claude-real"
+lacks "scenario 3b: codesign was never asked about the symlink path" "$(cat "$CS3B")" "$B3B/claude"
+has "scenario 3b: the resolved binary is what ran (version)" "$(cat "$LOG3B")" "RESOLVED $SANDBOX/real3b/claude-real --version"
+has "scenario 3b: the resolved binary is what ran (status)" "$(cat "$LOG3B")" "RESOLVED $SANDBOX/real3b/claude-real auth status"
 has "scenario 3b: the resolved path is shown" "$(row "$OUT3B" claude)" "claude-real"
 
 # ---------------------------------------------------------------------------------------------------------------------
