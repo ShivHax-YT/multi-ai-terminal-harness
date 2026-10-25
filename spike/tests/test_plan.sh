@@ -27,6 +27,9 @@ expect_pass() {
   if [ "$rc" -eq 0 ] && [ -z "$out" ]; then ok "$1"; else bad "$1 (rc=$rc, out=$out)"; fi
 }
 
+# jq prelude for filters: fb("codex") builds a subscription fallback entry
+FB='def fb($p): {provider: $p, auth_mode: "subscription"}; def fbk($p): {provider: $p, auth_mode: "api_key"}; '
+
 # ---- hash stability -------------------------------------------------------------------------------------------
 base="$("$HASH" "$EX/plan-valid.json")"
 case "$base" in
@@ -54,7 +57,7 @@ jq '.' "$EX/plan-valid.json" > "$TMP/pretty.json"
 i=0
 while IFS= read -r filter; do
   i=$((i + 1))
-  jq "$filter" "$EX/plan-valid.json" > "$TMP/mut$i.json"
+  jq "$FB$filter" "$EX/plan-valid.json" > "$TMP/mut$i.json"
   h="$("$HASH" "$TMP/mut$i.json")"
   if [ "$h" != "$base" ]; then ok "hash changes: $filter"; else bad "hash changes: $filter"; fi
 done <<'EOF'
@@ -68,7 +71,7 @@ done <<'EOF'
 .tasks[0].depends_on = ["t2"]
 .tasks[0].estimated_usage.prompts += 1
 .tasks[0].estimated_usage.turns += 1
-.tasks[0].fallback_providers = ["kimi"]
+.tasks[0].fallback_providers = [fb("kimi")]
 .tasks[1].title = "other"
 .tasks += [.tasks[0]]
 .request_summary = "other"
@@ -79,37 +82,41 @@ EOF
 expect_pass "plan-valid.json passes check.jq" "$EX/plan-valid.json"
 expect_pass "plan-approved.json (approval matches hash) passes" "$EX/plan-approved.json"
 expect_reject "rule 2: plan-dup-fallback.json rejected" "$EX/plan-dup-fallback.json" "rule 2:"
+expect_reject "rule 2: plan-dup-fallback.json names the own-provider fallback" "$EX/plan-dup-fallback.json" "rule 2: .*lists its own provider"
 expect_reject "rule 7: plan-gemini-subscription.json rejected" "$EX/plan-gemini-subscription.json" "rule 7:"
+expect_reject "rule 7: plan-gemini-subscription.json says api_key only" "$EX/plan-gemini-subscription.json" "rule 7: .*gemini is api_key only"
 expect_reject "rule 1: plan-over-turns.json rejected" "$EX/plan-over-turns.json" "rule 1:"
+expect_reject "rule 1: plan-over-turns.json names the ceiling" "$EX/plan-over-turns.json" "rule 1: .*estimates 41 turns, ceiling is 40"
 expect_reject "rule 9: plan-stale-approval.json rejected" "$EX/plan-stale-approval.json" "rule 9:"
+expect_reject "rule 9: plan-stale-approval.json hash mismatch" "$EX/plan-stale-approval.json" "rule 9: .*does not match computed plan hash"
 
 # rule 9: edit one field of an approved plan -> rejected
-jq '.tasks[2].fallback_providers = ["codex"]' "$EX/plan-approved.json" > "$TMP/edited.json"
-expect_reject "rule 9: edited approved plan (fallback) rejected" "$TMP/edited.json" "rule 9:"
+jq "$FB"'.tasks[2].fallback_providers = [fb("codex")]' "$EX/plan-approved.json" > "$TMP/edited.json"
+expect_reject "rule 9: edited approved plan (fallback) rejected" "$TMP/edited.json" "rule 9: .*does not match computed plan hash"
 jq '.tasks[3].estimated_usage.prompts = 13' "$EX/plan-approved.json" > "$TMP/edited2.json"
-expect_reject "rule 9: edited approved plan (usage) rejected" "$TMP/edited2.json" "rule 9:"
+expect_reject "rule 9: edited approved plan (usage) rejected" "$TMP/edited2.json" "rule 9: .*does not match computed plan hash"
 jq '.approval.approved_via = "api"' "$EX/plan-approved.json" > "$TMP/notui.json"
-expect_reject "rule 9: approval not via ui rejected" "$TMP/notui.json" "rule 9:"
+expect_reject "rule 9: approval not via ui rejected" "$TMP/notui.json" "rule 9: approval approved_via must be"
 jq 'del(.approval.plan_hash)' "$EX/plan-approved.json" > "$TMP/nohash.json"
-expect_reject "rule 9: approval without plan_hash rejected" "$TMP/nohash.json" "rule 9:"
+expect_reject "rule 9: approval without plan_hash rejected" "$TMP/nohash.json" "rule 9: approval.plan_hash must be 64 lowercase hex"
 
 # re-approving an edited plan binds to the new hash and passes
 "$HASH" --approve "$TMP/edited.json" > "$TMP/reapproved.json"
 expect_pass "re-approved edited plan passes" "$TMP/reapproved.json"
 
 # rule 2: own provider as fallback, and a repeat
-jq '.tasks[0].fallback_providers = ["claude"]' "$EX/plan-valid.json" > "$TMP/own.json"
-expect_reject "rule 2: own provider as fallback rejected" "$TMP/own.json" "rule 2:"
-jq '.tasks[1].fallback_providers = ["kimi", "kimi"]' "$EX/plan-valid.json" > "$TMP/repeat.json"
-expect_reject "rule 2: repeated fallback rejected" "$TMP/repeat.json" "rule 2:"
+jq "$FB"'.tasks[0].fallback_providers = [fb("claude")]' "$EX/plan-valid.json" > "$TMP/own.json"
+expect_reject "rule 2: own provider as fallback rejected" "$TMP/own.json" "rule 2: .*lists its own provider"
+jq "$FB"'.tasks[1].fallback_providers = [fb("kimi"), fb("kimi")]' "$EX/plan-valid.json" > "$TMP/repeat.json"
+expect_reject "rule 2: repeated fallback rejected" "$TMP/repeat.json" "rule 2: .*repeats fallback provider kimi"
 
 # rule 9: fallback provider not used anywhere in the plan
-jq '.tasks[0].fallback_providers = ["grok"]' "$EX/plan-valid.json" > "$TMP/unused.json"
-expect_reject "rule 9: fallback provider not in plan rejected" "$TMP/unused.json" "rule 9:"
+jq "$FB"'.tasks[0].fallback_providers = [fb("grok")]' "$EX/plan-valid.json" > "$TMP/unused.json"
+expect_reject "rule 9: fallback provider not in plan rejected" "$TMP/unused.json" "rule 9: .*not used by any task in the plan"
 
 # rule 1: summed subscription prompts over 30 (each task is under the turn ceiling)
 jq '.tasks[0].estimated_usage.prompts = 31' "$EX/plan-valid.json" > "$TMP/prompts.json"
-expect_reject "rule 1: subscription prompts over 30 rejected" "$TMP/prompts.json" "rule 1:"
+expect_reject "rule 1: subscription prompts over 30 rejected" "$TMP/prompts.json" "rule 1: .*ceiling is 30"
 jq '.tasks[0].estimated_usage.turns = 40' "$EX/plan-valid.json" > "$TMP/turns40.json"
 expect_pass "rule 1: exactly 40 turns allowed" "$TMP/turns40.json"
 # api_key prompts do not count against the subscription ceiling
@@ -124,7 +131,7 @@ CHECKJQ="$ROOT/spike/plan/check.jq"
 mut() {
   local name="$1" filter="$2" rule="$3" base="${4:-$EX/plan-valid.json}" f out rc
   f="$TMP/mut-$(printf '%s' "$name" | cksum | cut -d' ' -f1).json"
-  jq "$filter" "$base" > "$f"
+  jq "$FB$filter" "$base" > "$f"
   expect_reject "$name" "$f" "$rule"
   rc=0
   out="$(jq -r --arg hash x --argjson require_approval false -f "$CHECKJQ" "$f" 2>&1)" || rc=$?
@@ -134,7 +141,7 @@ mut() {
 mut_pass() {
   local name="$1" filter="$2" base="${3:-$EX/plan-valid.json}" f
   f="$TMP/mutp-$(printf '%s' "$name" | cksum | cut -d' ' -f1).json"
-  jq "$filter" "$base" > "$f"
+  jq "$FB$filter" "$base" > "$f"
   expect_pass "$name" "$f"
 }
 
@@ -147,10 +154,12 @@ mut 'rule 7: provider number' '.tasks[0].provider = 5' "rule 7:"
 mut 'rule 7: unknown provider' '.tasks[0].provider = "other"' "rule 7:"
 mut 'rule 7: lead provider "Claude"' '.lead.provider = "Claude"' "rule 7:"
 mut 'rule 7: lead missing' 'del(.lead)' "rule 7:"
-mut 'rule 7: fallback "Gemini"' '.tasks[0].fallback_providers = ["Gemini"]' "rule 2:"
-mut 'rule 2: fallback "claude " (trailing space)' '.tasks[0].fallback_providers = ["codex", "claude "]' "rule 2:"
-mut 'rule 2: case-variant fallback "Kimi" next to "kimi"' '.tasks[1].fallback_providers = ["kimi", "Kimi"]' "rule 2:"
+mut 'rule 2: fallback provider "Gemini" (case variant)' '.tasks[0].fallback_providers = [{provider: "Gemini", auth_mode: "api_key"}]' "rule 2:"
+mut 'rule 2: fallback provider "claude " (trailing space)' '.tasks[0].fallback_providers = [fb("codex"), {provider: "claude ", auth_mode: "subscription"}]' "rule 2:"
+mut 'rule 2: case-variant fallback "Kimi" next to "kimi"' '.tasks[1].fallback_providers = [fb("kimi"), fb("Kimi")]' "rule 2:"
 mut 'rule 2: fallback null element' '.tasks[0].fallback_providers = [null]' "rule 2:"
+mut 'rule 2: legacy string fallback entry' '.tasks[0].fallback_providers = ["codex"]' "rule 2:"
+mut 'rule 2: fallback entry with extra key' '.tasks[0].fallback_providers = [fb("codex") + {max_turns: 999}]' "rule 9: .*unknown key"
 
 # 2. rule 1: type bypasses and fail-closed auth_mode
 mut 'rule 1: turns true' '.tasks[0].estimated_usage.turns = true' "rule 1:"
@@ -230,8 +239,124 @@ mut 'rule 9: task id number' '.tasks[0].id = 1' "rule 9:"
 
 # the original good plans still pass after all the hardening
 expect_pass "plan-valid.json still passes" "$EX/plan-valid.json"
-mut_pass "integer-valued float turns (20.0) is an integer" '.tasks[0].estimated_usage.turns = 20.0'
 mut_pass "zero usage allowed" '.tasks[2].estimated_usage = {prompts: 0, turns: 0}'
+
+# ---- round 2: single document, schema-exact shape, numbers, spec gaps --------------------------------------------
+
+# mut_sed NAME SED_EXPR RULE_PATTERN: edit the raw text of plan-valid.json (jq would normalise number literals)
+mut_sed() {
+  local name="$1" expr="$2" rule="$3" f out rc
+  f="$TMP/sed-$(printf '%s' "$name" | cksum | cut -d' ' -f1).json"
+  sed -e "$expr" "$EX/plan-valid.json" > "$f"
+  if cmp -s "$f" "$EX/plan-valid.json"; then bad "$name (sed expression changed nothing)"; return; fi
+  expect_reject "$name" "$f" "$rule"
+  rc=0
+  out="$(jq -r --arg hash x --argjson require_approval false -f "$CHECKJQ" "$f" 2>&1)" || rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q "^$rule"; then ok "no crash: $name"; else bad "no crash: $name (rc=$rc, out=$out)"; fi
+}
+
+# 1. exactly one JSON document (a concatenated pair must never pass, even with a hash covering both)
+cat "$EX/plan-valid.json" "$EX/plan-valid.json" > "$TMP/cat-same.json"
+expect_reject "rule 9: two concatenated plans rejected" "$TMP/cat-same.json" "rule 9: plan file must contain exactly one JSON document"
+jq '.plan_id = "plan-other" | .tasks[0].provider = "grok"' "$EX/plan-valid.json" > "$TMP/planB.json"
+cat "$EX/plan-valid.json" "$TMP/planB.json" > "$TMP/combo.json"
+att_hash="$(jq -S -c 'del(.approval)' "$TMP/combo.json" | shasum -a 256 | cut -d' ' -f1)"
+jq --arg h "$att_hash" '.approval = {plan_hash: $h, approved_at: "2026-10-25T10:00:00Z", approved_via: "ui", nonce: "0123456789abcdef0123"}' \
+  "$TMP/planB.json" > "$TMP/planB-approved.json"
+cat "$EX/plan-valid.json" "$TMP/planB-approved.json" > "$TMP/attack.json"
+out="$("$HASH" --check --require-approval "$TMP/attack.json" 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q '^rule 9: plan file must contain exactly one JSON document'; then
+  ok "rule 9: concatenated plans + one approval covering both rejected in scheduler mode"
+else
+  bad "rule 9: concatenated plans + one approval covering both rejected in scheduler mode (rc=$rc, out=$out)"
+fi
+"$HASH" "$TMP/attack.json" >/dev/null 2>&1; [ $? -ne 0 ] && ok "hash of a concatenated file is refused" || bad "hash of a concatenated file is refused"
+"$HASH" --approve "$TMP/attack.json" >/dev/null 2>&1; [ $? -ne 0 ] && ok "--approve of a concatenated file is refused" || bad "--approve of a concatenated file is refused"
+
+# 2. schema-exact shape: unknown keys
+mut 'rule 9: unknown top-level key ceiling_override' '.ceiling_override = 1000' "rule 9: .*unknown key"
+mut 'rule 9: unknown lead key' '.lead.max_turns = 1000' "rule 9: .*unknown key"
+mut 'rule 9: unknown task key max_turns' '.tasks[0].max_turns = 1000' "rule 9: .*unknown key"
+mut 'rule 9: unknown estimated_usage key' '.tasks[0].estimated_usage.hours = 99' "rule 9: .*unknown key"
+mut 'rule 9: unknown approval key' '.approval.scope = "all"' "rule 9: .*unknown key" "$EX/plan-approved.json"
+
+# 2. schema-exact shape: required fields and types
+mut 'rule 9: plan_id missing' 'del(.plan_id)' "rule 9: plan_id"
+mut 'rule 9: plan_id number' '.plan_id = 5' "rule 9: plan_id"
+mut 'rule 9: plan_id empty' '.plan_id = ""' "rule 9: plan_id"
+mut 'rule 9: created_at missing' 'del(.created_at)' "rule 9: created_at"
+mut 'rule 9: created_at not a timestamp' '.created_at = "yesterday"' "rule 9: created_at"
+mut 'rule 9: created_at trailing newline' '.created_at = "2026-10-25T09:00:00Z\n"' "rule 9: created_at"
+mut 'rule 9: request_summary missing' 'del(.request_summary)' "rule 9: request_summary"
+mut 'rule 9: request_summary number' '.request_summary = 1' "rule 9: request_summary"
+mut 'rule 9: title missing' 'del(.tasks[0].title)' "rule 9: tasks\[0\]\.title"
+mut 'rule 9: title empty' '.tasks[0].title = ""' "rule 9: tasks\[0\]\.title"
+mut 'rule 9: role missing' 'del(.tasks[0].role)' "rule 9: tasks\[0\]\.role"
+mut 'rule 9: role number' '.tasks[0].role = 1' "rule 9: tasks\[0\]\.role"
+mut 'rule 9: acceptance string' '.tasks[0].acceptance = "all"' "rule 9: tasks\[0\]\.acceptance"
+mut 'rule 9: acceptance missing' 'del(.tasks[0].acceptance)' "rule 9: tasks\[0\]\.acceptance"
+mut 'rule 9: acceptance with non-string' '.tasks[0].acceptance = [1]' "rule 9: tasks\[0\]\.acceptance"
+mut 'rule 9: owned_files string "**"' '.tasks[0].owned_files = "**"' "rule 9: tasks\[0\]\.owned_files"
+mut 'rule 9: owned_files missing' 'del(.tasks[0].owned_files)' "rule 9: tasks\[0\]\.owned_files"
+mut 'rule 9: owned_files with null' '.tasks[0].owned_files = [null]' "rule 9: tasks\[0\]\.owned_files"
+mut 'rule 9: task id "../x y"' '.tasks[0].id = "../x y"' "rule 9: tasks\[0\]\.id"
+mut 'rule 9: task id with space' '.tasks[0].id = "t 1"' "rule 9: tasks\[0\]\.id"
+mut 'rule 9: task id empty' '.tasks[0].id = ""' "rule 9: tasks\[0\]\.id"
+mut 'rule 9: task id trailing newline' '.tasks[0].id = "t1\n"' "rule 9: tasks\[0\]\.id"
+mut 'rule 9: summary_budget_tokens missing' 'del(.summary_budget_tokens)' "rule 9: summary_budget_tokens"
+mut 'rule 9: summary_budget_tokens 0' '.summary_budget_tokens = 0' "rule 9: summary_budget_tokens"
+mut 'rule 9: summary_budget_tokens negative' '.summary_budget_tokens = -1' "rule 9: summary_budget_tokens"
+mut 'rule 9: summary_budget_tokens string' '.summary_budget_tokens = "200"' "rule 9: summary_budget_tokens"
+mut 'rule 9: summary_budget_tokens bool' '.summary_budget_tokens = true' "rule 9: summary_budget_tokens"
+mut 'rule 9: summary_budget_tokens fractional' '.summary_budget_tokens = 200.5' "rule 9: summary_budget_tokens"
+mut 'rule 9: format_version missing' 'del(.format_version)' "rule 9: format_version"
+mut 'rule 9: format_version 2' '.format_version = 2' "rule 9: format_version"
+mut 'rule 9: format_version "1"' '.format_version = "1"' "rule 9: format_version"
+mut 'rule 9: approval.plan_hash uppercase' '.approval.plan_hash |= ascii_upcase' "rule 9: approval.plan_hash" "$EX/plan-approved.json"
+mut 'rule 9: approval.plan_hash short' '.approval.plan_hash = "abc123"' "rule 9: approval.plan_hash" "$EX/plan-approved.json"
+mut 'rule 9: approval.plan_hash trailing newline' '.approval.plan_hash += "\n"' "rule 9: approval.plan_hash" "$EX/plan-approved.json"
+mut 'rule 9: approval.nonce too short' '.approval.nonce = "abc"' "rule 9: approval.nonce" "$EX/plan-approved.json"
+mut 'rule 9: approval.nonce number' '.approval.nonce = 12345678901234567890' "rule 9: approval.nonce" "$EX/plan-approved.json"
+mut 'rule 9: approval.approved_at empty' '.approval.approved_at = ""' "rule 9: approval.approved_at" "$EX/plan-approved.json"
+mut 'rule 9: approval.approved_at not a timestamp' '.approval.approved_at = "now"' "rule 9: approval.approved_at" "$EX/plan-approved.json"
+
+# 3. approval present-but-falsy is still malformed in pre-approval mode (jq's // treats false like null)
+mut 'rule 9: approval false (pre-approval mode)' '.approval = false' "rule 9: approval must be an object"
+mut 'rule 9: approval 0 (pre-approval mode)' '.approval = 0' "rule 9: approval must be an object"
+mut 'rule 9: approval empty string (pre-approval mode)' '.approval = ""' "rule 9: approval must be an object"
+out="$("$HASH" --check --require-approval <(jq '.approval = false' "$EX/plan-valid.json") 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q '^rule 9:' && ok "approval:false rejected in scheduler mode" \
+  || bad "approval:false rejected in scheduler mode (rc=$rc, out=$out)"
+
+# 4. numbers: only canonical integer text (jq 1.7 keeps literals, so 20.0 and 20 would hash differently)
+mut_sed 'rule 1: turns written 20.0' 's/"turns": 20$/"turns": 20.0/' "rule 1: .*turns must be an integer"
+mut_sed 'rule 1: turns written 2e1' 's/"turns": 20$/"turns": 2e1/' "rule 1: .*turns must be an integer"
+mut_sed 'rule 1: prompts written 10.0' 's/"prompts": 10,/"prompts": 10.0,/' "rule 1: .*prompts must be an integer"
+mut_sed 'rule 1: prompts written -0' 's/"prompts": 10,/"prompts": -0,/' "rule 1: .*prompts must be an integer"
+mut_sed 'rule 9: summary_budget_tokens written 200.0' 's/"summary_budget_tokens": 200/"summary_budget_tokens": 200.0/' "rule 9: summary_budget_tokens"
+mut_sed 'rule 9: format_version written 1.0' 's/"format_version": 1/"format_version": 1.0/' "rule 9: format_version"
+
+# 5. lead.auth_mode and fallback {provider, auth_mode}: rule 7 applies to every gemini use
+mut 'rule 7: lead.auth_mode missing' 'del(.lead.auth_mode)' "rule 7: lead.auth_mode"
+mut 'rule 7: lead.auth_mode invalid' '.lead.auth_mode = "oauth"' "rule 7: lead.auth_mode"
+mut 'rule 7: gemini lead on subscription' '.lead = {provider: "gemini", auth_mode: "subscription"}' "rule 7: .*gemini is api_key only"
+mut_pass 'gemini lead on api_key passes' '.lead = {provider: "gemini", auth_mode: "api_key"}'
+mut 'rule 7: gemini fallback on subscription' '.tasks[0].fallback_providers = [fb("gemini")]' "rule 7: .*gemini fallback.*api_key only"
+mut 'rule 7: fallback auth_mode missing' 'del(.tasks[0].fallback_providers[0].auth_mode)' "rule 7: .*fallback_providers.*auth_mode"
+mut 'rule 7: fallback auth_mode invalid' '.tasks[0].fallback_providers[0].auth_mode = "oauth"' "rule 7: .*fallback_providers.*auth_mode"
+mut_pass 'gemini fallback on api_key passes' '.tasks[0].fallback_providers = [fbk("gemini")]'
+mut 'rule 2: fallback entry provider equals own provider (object form)' '.tasks[1].fallback_providers = [fbk("codex")]' "rule 2: .*lists its own provider"
+mut 'rule 2: repeated fallback provider with different auth_mode' '.tasks[1].fallback_providers = [fb("kimi"), fbk("kimi")]' "rule 2: .*repeats fallback provider kimi"
+mut 'rule 9: fallback provider not used (object form)' '.tasks[0].fallback_providers = [fb("grok")]' "rule 9: .*not used by any task"
+
+# 6. depends_on must form a DAG over ids in the plan
+mut 'rule 9: depends_on dangling id' '.tasks[0].depends_on = ["nope"]' "rule 9: .*unknown task"
+mut 'rule 9: depends_on self-dependency' '.tasks[0].depends_on = ["t1"]' "rule 9: .*depends on itself"
+mut 'rule 9: depends_on duplicate entry' '.tasks[2].depends_on = ["t1", "t1"]' "rule 9: .*more than once"
+mut 'rule 9: depends_on 2-cycle' '.tasks[0].depends_on = ["t2"] | .tasks[1].depends_on = ["t1"]' "rule 9: depends_on has a cycle"
+mut 'rule 9: depends_on 3-cycle' '.tasks[0].depends_on = ["t3"]' "rule 9: depends_on has a cycle"
+mut 'rule 9: depends_on non-string entry' '.tasks[0].depends_on = [1]' "rule 9: .*depends_on must be an array of strings"
+mut_pass 'diamond depends_on (a DAG) passes' '.tasks[3].depends_on = ["t2", "t3"]'
 
 # schema/examples are valid JSON
 for f in "$EX"/*.json "$ROOT/docs/spec/plan.schema.json"; do

@@ -2,21 +2,33 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://example.invalid/schemas/plan.schema.json",
   "title": "Plan",
-  "description": "A plan produced by the lead and approved by the user (docs/spec/plan.md). Structural checks only; hard-rule checks (rules 1, 2, 7, 9) live in spike/plan/check.jq because they span several fields. Ceilings are deliberately not encoded here so an over-ceiling plan is still a well-formed plan the UI can warn about.",
+  "description": "A plan produced by the lead and approved by the user (docs/spec/plan.md). Shape and types only; hard-rule checks that span several fields (rules 1, 2, 7, 9: ceilings, fallbacks, gemini auth, depends_on DAG, hash binding) live in spike/plan/check.jq. spike/plan/check.jq enforces exactly the keys, types and patterns below. Every field is required (defaults are never filled in before hashing) except approval. Integers must be written in canonical form (20, never 20.0 or 2e1). Ceilings are deliberately not encoded so an over-ceiling plan is still well-formed and the UI can warn about it.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["plan_id", "created_at", "lead", "request_summary", "tasks"],
+  "required": [
+    "format_version",
+    "plan_id",
+    "created_at",
+    "lead",
+    "request_summary",
+    "summary_budget_tokens",
+    "tasks"
+  ],
   "properties": {
+    "format_version": { "const": 1 },
     "plan_id": { "type": "string", "minLength": 1 },
-    "created_at": { "type": "string", "format": "date-time" },
+    "created_at": { "$ref": "#/$defs/timestamp" },
     "lead": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["provider"],
-      "properties": { "provider": { "$ref": "#/$defs/provider" } }
+      "required": ["provider", "auth_mode"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/provider" },
+        "auth_mode": { "$ref": "#/$defs/auth_mode" }
+      }
     },
     "request_summary": { "type": "string" },
-    "summary_budget_tokens": { "type": "integer", "minimum": 1, "default": 200 },
+    "summary_budget_tokens": { "type": "integer", "minimum": 1 },
     "tasks": {
       "type": "array",
       "minItems": 1,
@@ -26,6 +38,21 @@
   },
   "$defs": {
     "provider": { "enum": ["claude", "codex", "grok", "kimi", "gemini", "glm"] },
+    "auth_mode": { "enum": ["subscription", "api_key"] },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "task_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+    "fallback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "auth_mode"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/provider" },
+        "auth_mode": { "$ref": "#/$defs/auth_mode" }
+      }
+    },
     "task": {
       "type": "object",
       "additionalProperties": false,
@@ -42,14 +69,19 @@
         "fallback_providers"
       ],
       "properties": {
-        "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+        "id": { "$ref": "#/$defs/task_id" },
         "title": { "type": "string", "minLength": 1 },
         "role": { "type": "string", "minLength": 1 },
         "provider": { "$ref": "#/$defs/provider" },
-        "auth_mode": { "enum": ["subscription", "api_key"] },
+        "auth_mode": { "$ref": "#/$defs/auth_mode" },
         "owned_files": { "type": "array", "items": { "type": "string" } },
         "acceptance": { "type": "array", "items": { "type": "string" } },
-        "depends_on": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "depends_on": {
+          "description": "Ids of other tasks in this plan. No duplicates, no self-reference, no unknown ids, no cycles (checked in check.jq).",
+          "type": "array",
+          "items": { "$ref": "#/$defs/task_id" },
+          "uniqueItems": true
+        },
         "estimated_usage": {
           "type": "object",
           "additionalProperties": false,
@@ -59,7 +91,11 @@
             "turns": { "type": "integer", "minimum": 0 }
           }
         },
-        "fallback_providers": { "type": "array", "items": { "$ref": "#/$defs/provider" } }
+        "fallback_providers": {
+          "description": "Ordered failover targets. Never the task's own provider, no repeated provider, each provider used by some task in the plan, gemini only with auth_mode api_key. Actual failover usage is enforced by live per-provider counters at dispatch, not by estimates.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/fallback" }
+        }
       }
     },
     "approval": {
@@ -68,7 +104,7 @@
       "required": ["plan_hash", "approved_at", "approved_via", "nonce"],
       "properties": {
         "plan_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "approved_at": { "type": "string", "format": "date-time" },
+        "approved_at": { "$ref": "#/$defs/timestamp" },
         "approved_via": { "const": "ui" },
         "nonce": { "type": "string", "minLength": 16 }
       }
