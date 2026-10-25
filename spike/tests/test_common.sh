@@ -23,6 +23,17 @@ has() { # has <name> <haystack> <needle>
 lacks() { # lacks <name> <haystack> <needle>
   case "$2" in *"$3"*) bad "$1 (found [$3] in [$2])" ;; *) ok "$1" ;; esac
 }
+# alive <pid>: 0 if the process is still running. kill -0 alone is not enough: a killed process whose parent is already
+# gone stays a zombie (state Z) until PID 1 reaps it, and kill -0 succeeds on a zombie. A zombie has exited and cannot
+# run code, so it counts as gone. If ps cannot report a state, the process counts as alive (fail closed).
+alive() {
+  local st
+  [ -n "$1" ] || return 1
+  kill -0 "$1" 2>/dev/null || return 1
+  st="$(ps -o stat= -p "$1" 2>/dev/null)"
+  case "$st" in Z*) return 1 ;; esac
+  return 0
+}
 
 # child <code>: run code in a fresh /bin/bash with common.sh sourced and SPIKE_LIVE unset unless the caller exported it.
 child() {
@@ -407,7 +418,7 @@ eq "run_timeout times out a launcher (rc)" "124" "$?"
 sleep 0.3
 GC="$(cat "$SANDBOX/grandchild.pid" 2>/dev/null)"
 check "launcher wrote its grandchild pid" test -n "$GC"
-if [ -n "$GC" ] && kill -0 "$GC" 2>/dev/null; then
+if [ -n "$GC" ] && alive "$GC"; then
   bad "grandchild was killed with the launcher"
   kill -9 "$GC" 2>/dev/null
 else
@@ -426,15 +437,37 @@ SPIKE_LIVE=1 spike_run_live 5 /dev/null "$SANDBOX/leaver.sh"
 eq "run_timeout returns the leaver's exit code" "0" "$?"
 sleep 0.3
 LO="$(cat "$SANDBOX/leftover.pid" 2>/dev/null)"
-if [ -n "$LO" ] && kill -0 "$LO" 2>/dev/null; then
+if [ -n "$LO" ] && alive "$LO"; then
   bad "leftover background child was swept"
   kill -9 "$LO" 2>/dev/null
 else
   ok "leftover background child was swept"
 fi
 
+# Controls for alive(): a running process is alive, and a zombie (exited, parent has not reaped it) is not.
+sleep 5 &
+RUNPID=$!
+check "alive: a running process is alive" alive "$RUNPID"
+kill -9 "$RUNPID" 2>/dev/null
+{ wait "$RUNPID"; } 2>/dev/null
+rm -f "$SANDBOX/zombie.pid"
+perl -e 'my $p = fork; exit 0 unless $p; open my $f, ">", $ARGV[0] or exit 1; print $f "$p\n"; close $f; sleep 6' \
+  "$SANDBOX/zombie.pid" </dev/null >/dev/null 2>&1 &
+ZP=$!
+n=0
+while [ ! -s "$SANDBOX/zombie.pid" ] && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+ZCHILD="$(cat "$SANDBOX/zombie.pid" 2>/dev/null)"
+sleep 0.3
+check "zombie fixture wrote its pid" test -n "$ZCHILD"
+case "$(ps -o stat= -p "$ZCHILD" 2>/dev/null)" in
+  Z*) ok "zombie fixture is in state Z" ;;
+  *) bad "zombie fixture is in state Z" ;;
+esac
+if [ -n "$ZCHILD" ] && alive "$ZCHILD"; then bad "alive: a zombie is not alive"; else ok "alive: a zombie is not alive"; fi
+kill -9 "$ZP" 2>/dev/null
+{ wait "$ZP"; } 2>/dev/null
+
 # Signals sent to the caller must not leave the command (or its grandchild) running.
-alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
 for sig in TERM HUP; do
   rm -f "$SANDBOX/sig.pids"
   cat > "$SANDBOX/siglauncher.sh" <<EOF
