@@ -13,16 +13,16 @@ malformed, not defaulted, so the hash always covers exactly what the user saw.
 |---|---|---|
 | `format_version` | integer, currently `1` | Any other value is rejected. A future format bumps this. |
 | `plan_id` | non-empty string | Unique per plan. |
-| `created_at` | RFC 3339 string | |
+| `created_at` | RFC 3339 string | Real ranges are enforced (month 01-12, day valid for the month incl. leap years, hour 00-23, minute 00-59, second 00-60, offset hours 00-23 and minutes 00-59). |
 | `lead` | `{provider, auth_mode}` | Provider and auth mode of the headless session that produced the plan. Rule 7 applies: a `gemini` lead must be `api_key`. |
 | `request_summary` | string | The user's request, summarized. Untrusted text when displayed. |
-| `summary_budget_tokens` | integer > 0 | Token budget for the lead's final summary. The UI proposes 200; the plan always states it. |
+| `summary_budget_tokens` | integer 1 to 1000000 | Token budget for the lead's final summary. The UI proposes 200; the plan always states it. |
 | `tasks[]` | non-empty array | See below. |
 | `approval` | object, optional | Absent until the user approves. Excluded from the hash. |
 
 Task fields (all required): `id` (matches `[A-Za-z0-9_-]+`, unique in the plan), `title` and `role` (non-empty strings),
 `provider`, `auth_mode` (`subscription` or `api_key`), `owned_files[]` and `acceptance[]` (arrays of strings),
-`depends_on[]` (array of task ids), `estimated_usage {prompts, turns}` (integers >= 0), `fallback_providers[]`.
+`depends_on[]` (array of task ids), `estimated_usage {prompts, turns}` (integers 0 to 1000000), `fallback_providers[]`.
 
 A `fallback_providers` entry is an object `{provider, auth_mode}`. Rule 7 applies to each entry: a `gemini` fallback must
 be `api_key`. Rules 2 and 9 look at `.provider`. A fallback is a permission to fail over, not a reservation: actual
@@ -54,8 +54,10 @@ drop insignificant whitespace. Known gaps:
 - **Number literals.** jq 1.7 preserves number literals, so `20.0` and `20` are different bytes and hash differently, and
   the result depends on the jq version's number handling. JCS would print both as `20`. The spike therefore rejects
   any integer field not written as canonical integer text (`0` or `[1-9][0-9]*`: no `20.0`, `2e1`, `-0`, no sign, no
-  leading zero), so the hash never depends on that behaviour. The app must parse integers into an integer type
-  and hash the JCS form of the value.
+  leading zero), so the hash never depends on that behaviour. Every integer is also capped at 2^53-1 (the largest
+  integer a double holds exactly; checked by text length and value), and `turns`, `prompts` and
+  `summary_budget_tokens` at 1000000, so no consumer that reads numbers as doubles sees a different value. The app must
+  parse integers into an integer type and hash the JCS form of the value.
 - **U+007F.** `jq` escapes U+007F as `\u007f` where JCS emits the raw character.
 - The app must not use `jq` output as its canonical form and needs its own JCS test vectors.
 
@@ -100,19 +102,20 @@ Callers must check the exit code, not just whether output is empty. `hash.sh --c
 1 on any violation, unparsable or multi-document input, or checker failure (fail closed).
 
 **Shape validation runs first**, before any default value is applied, and never crashes: a wrong type, a missing field
-or an unknown key is itself a violation. `approval: false`, `0` and `""` count as a present, malformed approval (only
-absent or `null` means "no approval"). Only a well-shaped plan reaches the rule checks below.
+or an unknown key is itself a violation. `approval: false`, `0` and `""` count as a present, malformed approval, and so
+does `null`: only an absent `approval` key means "not yet approved", because the schema allows only an object when the
+key is present. Only a well-shaped plan reaches the rule checks below.
 
 | Rule | Rejects |
 |---|---|
 | 9 | Unknown keys at any level (plan, `lead`, task, `estimated_usage`, fallback entry, `approval`); a missing or wrong-typed `format_version`, `plan_id`, `created_at`, `request_summary`, `summary_budget_tokens`, task `title`, `role`, `owned_files`, `acceptance`; a task `id` not matching `[A-Za-z0-9_-]+`. |
 | 7 | A `provider` (task, fallback or lead) that is not exactly `claude`, `codex`, `grok`, `kimi`, `gemini` or `glm`. No case folding or trimming: `Gemini` and `gemini ` are rejected. |
 | 7 | An `auth_mode` (lead, task or fallback) that is not exactly `subscription` or `api_key`. |
-| 1 | `estimated_usage` missing or not an object, or `turns` / `prompts` that are not canonical integers >= 0 (booleans, null, strings, negatives, fractions, `20.0`, `2e1`). |
+| 1 | `estimated_usage` missing or not an object, or `turns` / `prompts` that are not canonical integers from 0 to 1000000 (booleans, null, strings, negatives, fractions, `20.0`, `2e1`). |
 | 2 | `fallback_providers` that is not an array of `{provider, auth_mode}` objects with exact provider names. |
 | 9 | `tasks` that is not a non-empty array, a task that is not an object, a missing or non-string task `id`, duplicate task ids. |
-| 9 | `depends_on` that is not an array of strings, lists an id twice, references an unknown id, depends on its own task, or forms a cycle. |
-| 9 | An `approval` that is not an object with the four keys: `plan_hash` (64 lowercase hex), `approved_at` (RFC 3339 string), `approved_via` (string), `nonce` (string of at least 16 characters). |
+| 9 | `depends_on` that is not an array of strings, lists an id twice, references an unknown id, depends on its own task, or forms a cycle (reported as "tasks blocked by a dependency cycle": the tasks in the cycle plus every task downstream of it). |
+| 9 | An `approval` that is not an object with the four keys: `plan_hash` (64 lowercase hex), `approved_at` (RFC 3339 string with real ranges, as for `created_at`), `approved_via` (string), `nonce` (string of at least 16 characters). |
 | 2 | A task whose `fallback_providers` contains its own `provider`, or repeats a provider. |
 | 9 | A fallback provider that no task in the plan uses (failover only to providers in the approved plan). |
 | 7 | A `gemini` lead, task or fallback whose `auth_mode` is not `api_key`. |

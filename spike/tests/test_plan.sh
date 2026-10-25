@@ -195,7 +195,7 @@ out="$("$HASH" --check --require-approval "$EX/plan-stale-approval.json" 2>&1)";
   || bad "--require-approval rejects stale approval (rc=$rc, out=$out)"
 jq '.approval = null' "$EX/plan-valid.json" > "$TMP/null-approval.json"
 out="$("$HASH" --check --require-approval "$TMP/null-approval.json" 2>&1)"; rc=$?
-[ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q '^rule 9: plan has no approval' && ok "--require-approval rejects approval:null" \
+[ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q '^rule 9: approval must be an object' && ok "--require-approval rejects approval:null (present key, malformed)" \
   || bad "--require-approval rejects approval:null (rc=$rc, out=$out)"
 expect_pass "plain --check still accepts unapproved plan (pre-approval UI warning)" "$EX/plan-valid.json"
 "$HASH" --check --bogus "$EX/plan-valid.json" >/dev/null 2>&1; [ $? -ne 0 ] && ok "unknown --check flag is an error" || bad "unknown --check flag is an error"
@@ -353,10 +353,56 @@ mut 'rule 9: fallback provider not used (object form)' '.tasks[0].fallback_provi
 mut 'rule 9: depends_on dangling id' '.tasks[0].depends_on = ["nope"]' "rule 9: .*unknown task"
 mut 'rule 9: depends_on self-dependency' '.tasks[0].depends_on = ["t1"]' "rule 9: .*depends on itself"
 mut 'rule 9: depends_on duplicate entry' '.tasks[2].depends_on = ["t1", "t1"]' "rule 9: .*more than once"
-mut 'rule 9: depends_on 2-cycle' '.tasks[0].depends_on = ["t2"] | .tasks[1].depends_on = ["t1"]' "rule 9: depends_on has a cycle"
-mut 'rule 9: depends_on 3-cycle' '.tasks[0].depends_on = ["t3"]' "rule 9: depends_on has a cycle"
+mut 'rule 9: depends_on 2-cycle' '.tasks[0].depends_on = ["t2"] | .tasks[1].depends_on = ["t1"]' "rule 9: tasks blocked by a dependency cycle"
+mut 'rule 9: depends_on 3-cycle' '.tasks[0].depends_on = ["t3"]' "rule 9: tasks blocked by a dependency cycle"
 mut 'rule 9: depends_on non-string entry' '.tasks[0].depends_on = [1]' "rule 9: .*depends_on must be an array of strings"
 mut_pass 'diamond depends_on (a DAG) passes' '.tasks[3].depends_on = ["t2", "t3"]'
+# a task downstream of a cycle is blocked too, and is named
+mut 'rule 9: task downstream of a cycle is reported as blocked' '.tasks[0].depends_on = ["t2"] | .tasks[1].depends_on = ["t1"] | .tasks[3].depends_on = ["t3"]' "rule 9: tasks blocked by a dependency cycle: t1, t2, t3, t4"
+# a long acyclic chain listed in reverse order (each task depends on the next one in the array) must pass
+CHAIN='.tasks = [range(0; 25) as $i | .tasks[0] + {id: "c\($i)", depends_on: (if $i < 24 then ["c\($i + 1)"] else [] end), fallback_providers: [], estimated_usage: {prompts: 1, turns: 1}}]'
+mut_pass 'long reverse-order acyclic chain (25 tasks) passes' "$CHAIN"
+mut 'rule 9: same long chain closed into a cycle is rejected' "$CHAIN | .tasks[24].depends_on = [\"c0\"]" "rule 9: tasks blocked by a dependency cycle"
+
+# 7. approval: a present key must hold an object (null is malformed, in both modes); only an absent key means unapproved
+mut 'rule 9: approval null (pre-approval mode)' '.approval = null' "rule 9: approval must be an object"
+mut 'rule 9: approval null on an otherwise approved plan' '.approval = null' "rule 9: approval must be an object" "$EX/plan-approved.json"
+
+# 8. timestamps need real ranges (created_at and approval.approved_at)
+for ts_case in \
+  'month 00|2026-00-10T10:00:00Z' 'month 13|2026-13-10T10:00:00Z' 'day 00|2026-10-00T10:00:00Z' \
+  'day 32|2026-10-32T10:00:00Z' 'Apr 31|2026-04-31T10:00:00Z' 'Feb 30|2024-02-30T10:00:00Z' \
+  'Feb 29 2026 (not leap)|2026-02-29T10:00:00Z' 'Feb 29 1900 (not leap)|1900-02-29T10:00:00Z' \
+  'Feb 29 2100 (not leap)|2100-02-29T10:00:00Z' 'hour 24|2026-10-10T24:00:00Z' 'minute 60|2026-10-10T10:60:00Z' \
+  'second 61|2026-10-10T10:00:61Z' 'offset hour 24|2026-10-10T10:00:00+24:00' 'offset minute 60|2026-10-10T10:00:00-05:60' \
+  'all out of range|2026-99-99T99:99:99Z' 'missing zone|2026-10-10T10:00:00' 'lowercase t|2026-10-10t10:00:00Z'; do
+  ts_name="${ts_case%%|*}"
+  ts_val="${ts_case#*|}"
+  mut "rule 9: created_at $ts_name" ".created_at = \"$ts_val\"" "rule 9: created_at"
+  mut "rule 9: approved_at $ts_name" ".approval.approved_at = \"$ts_val\"" "rule 9: approval.approved_at" "$EX/plan-approved.json"
+done
+for ts_case in \
+  'Feb 29 2024 (leap)|2024-02-29T10:00:00Z' 'Feb 29 2000 (leap, divisible by 400)|2000-02-29T10:00:00Z' \
+  'Feb 28 2026|2026-02-28T23:59:59Z' 'leap second|2016-12-31T23:59:60Z' 'fraction and offset|2026-10-10T10:00:00.123456+05:30' \
+  'offset 23:59|2026-10-10T10:00:00-23:59' 'Dec 31|2026-12-31T00:00:00Z'; do
+  ts_name="${ts_case%%|*}"
+  ts_val="${ts_case#*|}"
+  mut_pass "timestamp ok: created_at $ts_name" ".created_at = \"$ts_val\""
+done
+
+# 9. integer bounds: estimates and summary_budget_tokens are capped at 1000000, every integer at 2^53-1
+mut_pass 'prompts 1000000 on an api_key task is within bounds' '.tasks[3].estimated_usage.prompts = 1000000'
+mut 'rule 1: prompts 1000001' '.tasks[3].estimated_usage.prompts = 1000001' "rule 1: .*prompts must be an integer from 0 to 1000000"
+mut 'rule 1: prompts 2^53-1 (above the estimate cap)' '.tasks[3].estimated_usage.prompts = 9007199254740991' "rule 1: .*prompts must be an integer"
+mut_sed 'rule 1: prompts 2^53+1' 's/"prompts": 12,/"prompts": 9007199254740993,/' "rule 1: .*prompts must be an integer"
+mut_sed 'rule 1: turns 2^53+1' 's/"turns": 20$/"turns": 9007199254740993/' "rule 1: .*turns must be an integer"
+mut_sed 'rule 1: turns 2^53-1' 's/"turns": 20$/"turns": 9007199254740991/' "rule 1: .*turns must be an integer"
+mut_sed 'rule 1: turns with 400 digits' "s/\"turns\": 20\$/\"turns\": 1$(printf '0%.0s' $(seq 1 399))/" "rule 1: .*turns must be an integer"
+mut_pass 'summary_budget_tokens 1000000 passes' '.summary_budget_tokens = 1000000'
+mut 'rule 9: summary_budget_tokens 1000001' '.summary_budget_tokens = 1000001' "rule 9: summary_budget_tokens"
+mut_sed 'rule 9: summary_budget_tokens 2^53+1' 's/"summary_budget_tokens": 200/"summary_budget_tokens": 9007199254740993/' "rule 9: summary_budget_tokens"
+mut_sed 'rule 9: summary_budget_tokens 2^53-1' 's/"summary_budget_tokens": 200/"summary_budget_tokens": 9007199254740991/' "rule 9: summary_budget_tokens"
+mut_sed 'rule 9: format_version 2^53+1' 's/"format_version": 1/"format_version": 9007199254740993/' "rule 9: format_version"
 
 # schema/examples are valid JSON
 for f in "$EX"/*.json "$ROOT/docs/spec/plan.schema.json"; do

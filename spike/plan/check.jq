@@ -34,12 +34,32 @@ def is_nonempty_str: type == "string" and length > 0;
 def is_str_array: type == "array" and all(.[]; type == "string");
 # Canonical integer text only: jq 1.7 keeps number literals, so 20.0 and 1e1 would otherwise hash differently from 20.
 # The regex also rejects negatives and "-0". \A..\z (not ^..$) so a trailing newline cannot slip through.
-def is_count: type == "number" and (tojson | test("\\A(0|[1-9][0-9]*)\\z"));
-def is_pos_count: is_count and . > 0;
+# Every integer is also capped at 2^53-1 (the largest integer a double holds exactly), by text length and by value, so
+# no consumer parsing numbers as doubles can see a different value. Estimates and the summary budget are capped lower.
+def max_safe_int: 9007199254740991;
+def max_estimate: 1000000;
+def is_count: type == "number" and (tojson | length <= 16 and test("\\A(0|[1-9][0-9]*)\\z")) and . <= max_safe_int;
+def is_count_max($max): is_count and . <= $max;
+def is_pos_count_max($max): is_count_max($max) and . > 0;
+
+def days_in_month($y; $m):
+  if $m == 2 then (if ($y % 4 == 0 and $y % 100 != 0) or $y % 400 == 0 then 29 else 28 end)
+  elif $m == 4 or $m == 6 or $m == 9 or $m == 11 then 30
+  else 31 end;
+def ts_re:
+  "\\A(?<y>[0-9]{4})-(?<mo>[0-9]{2})-(?<d>[0-9]{2})T(?<h>[0-9]{2}):(?<mi>[0-9]{2}):(?<s>[0-9]{2})(?:\\.[0-9]+)?(?:Z|[+-](?<oh>[0-9]{2}):(?<om>[0-9]{2}))\\z";
+# RFC 3339 text with real ranges: month 01-12, day valid for the month (leap years), hour 00-23, minute 00-59,
+# second 00-60 (leap second), offset hours 00-23 and minutes 00-59.
 def is_rfc3339:
   type == "string"
-  and test("\\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})\\z");
-def has_approval: has("approval") and .approval != null;   # explicit: `false` and 0 count as present (and malformed)
+  and test(ts_re)
+  and ( capture(ts_re)
+        | (.y | tonumber) as $y | (.mo | tonumber) as $mo
+        | $mo >= 1 and $mo <= 12
+          and (.d | tonumber) >= 1 and (.d | tonumber) <= days_in_month($y; $mo)
+          and (.h | tonumber) <= 23 and (.mi | tonumber) <= 59 and (.s | tonumber) <= 60
+          and (.oh == null or ((.oh | tonumber) <= 23 and (.om | tonumber) <= 59)) );
+def has_approval: has("approval");   # the key is present; a present value must be an object (null is malformed)
 
 def unknown_keys($where; $allowed):
   (keys - $allowed)[] | "rule 9: \($where) has unknown key \(.[0:40] | @json)";
@@ -84,10 +104,10 @@ def task_shape_errors($i):
        then "rule 1: tasks[\($i)] estimated_usage must be an object with prompts and turns"
        else
          (.estimated_usage | unknown_keys("tasks[\($i)].estimated_usage"; ["prompts", "turns"])),
-         (if (.estimated_usage.turns | is_count | not)
-          then "rule 1: tasks[\($i)] estimated_usage.turns must be an integer >= 0" else empty end),
-         (if (.estimated_usage.prompts | is_count | not)
-          then "rule 1: tasks[\($i)] estimated_usage.prompts must be an integer >= 0" else empty end)
+         (if (.estimated_usage.turns | is_count_max(max_estimate) | not)
+          then "rule 1: tasks[\($i)] estimated_usage.turns must be an integer from 0 to 1000000" else empty end),
+         (if (.estimated_usage.prompts | is_count_max(max_estimate) | not)
+          then "rule 1: tasks[\($i)] estimated_usage.prompts must be an integer from 0 to 1000000" else empty end)
        end)
     ]
   end;
@@ -137,8 +157,8 @@ def shape_errors:
     (if (.plan_id | is_nonempty_str | not) then "rule 9: plan_id must be a non-empty string" else empty end),
     (if (.created_at | is_rfc3339 | not) then "rule 9: created_at must be an RFC 3339 timestamp" else empty end),
     (if (.request_summary | type) != "string" then "rule 9: request_summary must be a string" else empty end),
-    (if (.summary_budget_tokens | is_pos_count | not)
-     then "rule 9: summary_budget_tokens is required and must be an integer > 0 (defaults are never filled in)"
+    (if (.summary_budget_tokens | is_pos_count_max(max_estimate) | not)
+     then "rule 9: summary_budget_tokens is required and must be an integer from 1 to 1000000 (defaults are never filled in)"
      else empty end),
     lead_shape_errors[],
     (if (.tasks | type) != "array" or (.tasks | length) == 0
@@ -205,7 +225,7 @@ def rule_errors:
 
       # Rule 9: the scheduler needs a DAG.
       ( stuck_tasks | select(length > 0)
-        | "rule 9: depends_on has a cycle involving tasks \(join(", "))" ),
+        | "rule 9: tasks blocked by a dependency cycle: \(join(", "))" ),
 
       # Rule 9: an approval must be a UI approval bound to the hash of exactly this plan.
       ( if has_approval | not then empty
