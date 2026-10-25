@@ -44,6 +44,36 @@ ours() {
   return 1
 }
 
+# gone_within <tenths> <pid>...: poll alive() every 0.1 s and return 0 as soon as none of the pids is alive. A zombie and
+# an empty pid count as gone. After <tenths> tenths of a second with a pid still alive, return 1 and print one ps line per
+# survivor. This replaces fixed post-signal sleeps: PID 1 can reap a re-parented zombie late on a loaded machine (about
+# 1.6 s seen here). A genuine orphan stays alive past the deadline and still fails.
+gone_within() {
+  local limit="$1" n=0 p any
+  shift
+  while :; do
+    any=""
+    for p in "$@"; do
+      if alive "$p"; then
+        any=1
+        break
+      fi
+    done
+    [ -z "$any" ] && return 0
+    if [ "$n" -ge "$limit" ]; then
+      for p in "$@"; do
+        if alive "$p"; then
+          printf '  still alive: '
+          ps -o pid=,ppid=,pgid=,stat=,etime=,args= -p "$p" 2>/dev/null
+        fi
+      done
+      return 1
+    fi
+    sleep 0.1
+    n=$((n + 1))
+  done
+}
+
 # child <code>: run code in a fresh /bin/bash with common.sh sourced and SPIKE_LIVE unset unless the caller exported it.
 child() {
   /bin/bash -c '. "$1"; eval "$2"' _ "$COMMON" "$1"
@@ -393,6 +423,7 @@ printf 'captures/\n' > "$CAPREPO/.gitignore"
 CAP2="$(SPIKE_CAPTURES_ROOT="$CAPREPO/captures" spike_capture_dir demo)"
 eq "capture dir accepts a root inside a repo when git ignores it (rc)" "0" "$?"
 check "ignored capture dir exists" test -d "$CAP2"
+# This test uses the shared default root spike/captures, so the suite must not run concurrently in one worktree.
 CAP3="$(unset SPIKE_CAPTURES_ROOT; spike_capture_dir selftest)"
 eq "default capture root (spike/captures) is accepted (ignored by spike/.gitignore)" "0" "$?"
 case "$CAP3" in "$HERE/../captures/selftest/"*|"$(cd "$HERE/.." && pwd -P)/captures/selftest/"*) rm -rf "$CAP3" ;; esac
@@ -521,14 +552,13 @@ chmod +x "$SANDBOX/launcher.sh"
 rm -f "$SANDBOX/grandchild.pid"
 SPIKE_LIVE=1 spike_run_live 1 /dev/null "$SANDBOX/launcher.sh"
 eq "run_timeout times out a launcher (rc)" "124" "$?"
-sleep 0.3
 GC="$(cat "$SANDBOX/grandchild.pid" 2>/dev/null)"
 check "launcher wrote its grandchild pid" test -n "$GC"
-if [ -n "$GC" ] && alive "$GC"; then
+if gone_within 30 "$GC"; then
+  ok "grandchild was killed with the launcher"
+else
   bad "grandchild was killed with the launcher"
   kill -9 "$GC" 2>/dev/null
-else
-  ok "grandchild was killed with the launcher"
 fi
 
 # A command that exits normally but leaves a background child is swept too.
@@ -541,13 +571,12 @@ EOF
 chmod +x "$SANDBOX/leaver.sh"
 SPIKE_LIVE=1 spike_run_live 5 /dev/null "$SANDBOX/leaver.sh"
 eq "run_timeout returns the leaver's exit code" "0" "$?"
-sleep 0.3
 LO="$(cat "$SANDBOX/leftover.pid" 2>/dev/null)"
-if [ -n "$LO" ] && alive "$LO"; then
+if gone_within 30 "$LO"; then
+  ok "leftover background child was swept"
+else
   bad "leftover background child was swept"
   kill -9 "$LO" 2>/dev/null
-else
-  ok "leftover background child was swept"
 fi
 
 # Controls for alive(): a running process is alive, and a zombie (exited, parent has not reaped it) is not.
@@ -593,16 +622,15 @@ EOF
   kill -s "$sig" "$CALLER"
   wait "$CALLER" 2>/dev/null
   RC=$?
-  sleep 0.8
-  if alive "$LPID"; then bad "SIG$sig to the caller: launcher is gone"; kill -9 "$LPID" 2>/dev/null; else ok "SIG$sig to the caller: launcher is gone"; fi
-  if alive "$GPID"; then bad "SIG$sig to the caller: grandchild is gone"; kill -9 "$GPID" 2>/dev/null; else ok "SIG$sig to the caller: grandchild is gone"; fi
+  if gone_within 30 "$LPID"; then ok "SIG$sig to the caller: launcher is gone"; else bad "SIG$sig to the caller: launcher is gone"; kill -9 "$LPID" 2>/dev/null; fi
+  if gone_within 30 "$GPID"; then ok "SIG$sig to the caller: grandchild is gone"; else bad "SIG$sig to the caller: grandchild is gone"; kill -9 "$GPID" 2>/dev/null; fi
   if alive "$CALLER"; then bad "SIG$sig to the caller: caller exited"; kill -9 "$CALLER" 2>/dev/null; else ok "SIG$sig to the caller: caller exited"; fi
   lacks "SIG$sig to the caller: nothing ran afterwards" "$(cat "$SANDBOX/sig.out")" "AFTER"
   check "SIG$sig to the caller: exit status is a signal status" test "$RC" -gt 128
 done
 
 # Orphan sweep (decision 4): the caller is killed with SIGKILL, so no trap can run. The runner must notice that its caller
-# is gone and kill the command's group: the CLI and its grandchild must be gone within 2 s.
+# is gone and kill the command's group: the CLI and its grandchild must be gone within 3 s (bounded poll, gone_within).
 cat > "$SANDBOX/orphan.sh" <<EOF
 #!/bin/sh
 sleep 33 &
@@ -625,10 +653,8 @@ else
   bad "orphan fixture: the launcher and its grandchild run before the caller is killed"
 fi
 kill -9 "$ORPHAN_CALLER" 2>/dev/null
-n=0
-while { alive "$OLPID" || alive "$OGPID"; } && [ "$n" -lt 20 ]; do sleep 0.1; n=$((n + 1)); done
-if alive "$OLPID"; then bad "orphan sweep: the CLI launcher is gone within 2 s of kill -9 of its caller"; kill -9 "$OLPID" 2>/dev/null; else ok "orphan sweep: the CLI launcher is gone within 2 s of kill -9 of its caller"; fi
-if alive "$OGPID"; then bad "orphan sweep: the grandchild is gone within 2 s of kill -9 of its caller"; kill -9 "$OGPID" 2>/dev/null; else ok "orphan sweep: the grandchild is gone within 2 s of kill -9 of its caller"; fi
+if gone_within 30 "$OLPID"; then ok "orphan sweep: the CLI launcher is gone within 3 s of kill -9 of its caller"; else bad "orphan sweep: the CLI launcher is gone within 3 s of kill -9 of its caller"; kill -9 "$OLPID" 2>/dev/null; fi
+if gone_within 30 "$OGPID"; then ok "orphan sweep: the grandchild is gone within 3 s of kill -9 of its caller"; else bad "orphan sweep: the grandchild is gone within 3 s of kill -9 of its caller"; kill -9 "$OGPID" 2>/dev/null; fi
 { wait "$ORPHAN_CALLER"; } 2>/dev/null
 lacks "orphan sweep: the killed caller ran no further statement" "$(cat "$SANDBOX/orphan.out")" "AFTER"
 
@@ -643,8 +669,7 @@ out="$(/bin/bash -c '. "$1"; sleep 30 & _SPIKE_CHILD_PID=$!; echo "PID=$_SPIKE_C
 eq "signal after the pid is known: exits with the signal status (rc)" "143" "$?"
 lacks "signal after the pid is known: nothing runs after the handler" "$out" "LATE"
 SIGPID="$(printf '%s\n' "$out" | sed -n 's/^PID=//p')"
-sleep 0.3
-if [ -n "$SIGPID" ] && alive "$SIGPID"; then bad "signal after the pid is known: the command is gone"; kill -9 "$SIGPID" 2>/dev/null; else ok "signal after the pid is known: the command is gone"; fi
+if gone_within 30 "$SIGPID"; then ok "signal after the pid is known: the command is gone"; else bad "signal after the pid is known: the command is gone"; kill -9 "$SIGPID" 2>/dev/null; fi
 out="$(/bin/bash -c '. "$1"; _spike_forward 143; echo "PEND=$_SPIKE_BG_PENDING"' _ "$COMMON" 2>/dev/null)"
 has "caller: a signal before the runner exists is recorded for the handoff" "$out" "PEND=143"
 
@@ -666,17 +691,23 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
   STC=$!
   kill -s "$sig" "$STC" 2>/dev/null
   wait "$STC" 2>/dev/null
-  sleep 0.3
   # Reset first: read leaves the variables alone when the file is missing (the launcher had not started yet).
   SL=""
   SG=""
   read -r SL SG < "$SANDBOX/strl.pids" 2>/dev/null
+  # Bounded poll of up to 3.0 s instead of a fixed sleep. ours() is zombie-aware and matches the command line, so a reused
+  # pid does not count.
   n=0
-  while [ "$n" -lt 20 ] && { ours "$SL" strl.sh || ours "$SG" "sleep 33"; }; do sleep 0.1; n=$((n + 1)); done
+  while [ "$n" -lt 30 ] && { ours "$SL" strl.sh || ours "$SG" "sleep 33"; }; do sleep 0.1; n=$((n + 1)); done
   if ours "$SL" strl.sh || ours "$SG" "sleep 33"; then
     STRESS_BAD=$((STRESS_BAD + 1))
     echo "stress survivor (iteration $i, signal $sig): launcher=$SL grandchild=$SG"
-    ps -o pid,ppid,pgid,stat,args -p "$SL" -p "$SG" 2>/dev/null
+    for p in "$SL" "$SG"; do
+      if [ -n "$p" ]; then
+        printf '  still alive: '
+        ps -o pid=,ppid=,pgid=,stat=,etime=,args= -p "$p" 2>/dev/null
+      fi
+    done
     kill -9 "$SL" "$SG" 2>/dev/null
   fi
 done

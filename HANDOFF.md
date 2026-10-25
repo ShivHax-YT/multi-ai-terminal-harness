@@ -118,6 +118,20 @@ Status key: DONE = implemented and tested here on Linux bash 5.2. PARTIAL = impl
 
 7. HANDOFF (decision 7): DONE (this section).
 
+### Round 5
+Fixed post-signal sleeps replaced by a bounded poll (test file only; `spike/lib/common.sh` unchanged). New helper
+`gone_within <tenths> <pid>...` polls `alive()` every 0.1 s and passes as soon as no pid is alive (zombies and empty pids
+count as gone). With a pid still alive at the deadline it fails and prints one `ps -o pid=,ppid=,pgid=,stat=,etime=,args=`
+line per survivor. Used in the TERM/HUP caller checks, the grandchild and leftover sweep checks, the orphan-sweep kill -9
+checks, the signal-after-pid check, and the stress loop (which now polls `ours()` for 3.0 s, not 2.0 s). Removed sleeps:
+0.3 s (grandchild, leftover, signal-after-pid, stress) and 0.8 s (TERM/HUP). Deadline change: the orphan-sweep gone checks
+moved from 2 s to 3 s, as the lead decided. A genuine orphan still fails. The zombie fixture's 0.3 s precondition sleep is
+unchanged (residual risk under load). The "default capture root" assertion is unchanged; a comment above it says the
+suite must not run concurrently in one worktree (shared spike/captures). Negative check: a live survivor makes
+`gone_within` return 1 with the diagnostic line; exited and empty pids return 0. Results: 5 sequential runs of
+`/bin/bash spike/tests/test_common.sh` gave 387 passed, 0 failed each; 3 rounds of 4 parallel copies (each a `cp -a`
+clone of the worktree) gave 12 of 12 runs at 387 passed, 0 failed. Linux bash 5.2 only; bash 3.2 not run.
+
 ## Assertions changed in round 4 (none deleted; each change follows a decision above)
 test_common.sh:
 - "run_timeout allows claude --version / claude auth status / codex login status without SPIKE_LIVE" (3 assertions) ->
