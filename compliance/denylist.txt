@@ -1,0 +1,12 @@
+# Provider CLI homes the harness never opens, reads, copies or enters (hard rule 4).
+# One entry per line, relative to the account's home directory. A listed entry and everything under it is refused.
+# This file is the single source of truth; code reads it at run time and fails closed if it is missing or empty.
+# The hooks' CRED_DIRS (.claude/hooks/lib.sh) is narrower for .claude (credentials file only); code refuses the
+# whole directory.
+.claude
+.claude.json
+.codex
+.grok
+.kimi-code
+.kimi
+.gemini
