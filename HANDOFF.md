@@ -1,50 +1,61 @@
 # HANDOFF T-006
 
 ## Summary
-Round 4 of T-006 (worker HANDOFF format and parser). The input is opened once, by perl sysopen with O_NOFOLLOW and O_NONBLOCK; a symlink, a hard link, a FIFO or any non-regular file is refused at open and nothing is copied. Only the handle that was checked is copied, which closes the hard-link blocker and the check-then-read race.
-UTF-8 is checked by perl's strict decoder (iconv is dropped), the invisible-character blocklist is wider, and INT, HUP and TERM remove the temp dir and print nothing. The round 3 behavior (exit 3 for internal errors, ASCII-only JSON) is unchanged.
+Round 5 of T-006 (worker HANDOFF format and parser), the fix for the round 4 blockers on hard rule 4. The parser now requires --root and resolves the input in one perl process: every parent is lstat'ed, entered and identity-checked, and the leaf is opened with O_NOFOLLOW relative to the verified directory, which closes the parent-directory swap race.
+Also: paths outside the root and '.', '..' or empty components are refused; Cf characters and noncharacters are refused explicitly and through perl's \p{Cf}; a reason made only of separators is refused on any line; QUIT exits 131; a failing tr, wc, awk or jq is exit 3.
 
 ## Files changed
-- docs/spec/handoff.md - format spec: single no-follow open, parent-directory rule, remaining race, strict UTF-8, character table, exit codes
-- spike/handoff/parse.sh - parser: perl sysopen with O_NOFOLLOW, perl strict UTF-8 and blocklist, cleanup and signal traps, output printed last
-- spike/tests/test_handoff.sh - offline checks: 343 (round 3 had 260), new round 4 block, one source guard replaced by stronger checks
+- docs/spec/handoff.md - format spec: required --root and input rules, identity-checked walk, Cf and noncharacter table, usage and exit codes
+- spike/handoff/parse.sh - parser: --root, one perl walk (lstat, chdir, identity check, leaf open), Cf and noncharacter refusal, confidence reason check, exit and signal fixes
+- spike/tests/test_handoff.sh - offline checks: 750 passed (round 4 had 343), round 5 block, round 4 call sites now pass --root
 - HANDOFF.md - this file
 
 ## Tests run
-/bin/bash spike/tests/test_handoff.sh - 343 passed, 0 failed (run 3 times, Linux, GNU bash 5.2)
-/bin/bash spike/tests/test_handoff.sh on the round 3 tree, before any change - 260 passed, 0 failed
-mutation check on scratch copies, one protection removed per copy: no O_NOFOLLOW (11 failed), no O_NONBLOCK (3 failed), no INT trap (1 failed), no link-count check (2 failed), no parent-directory check (5 failed), no strict decoder (12 failed), no FE00-FE0F range (4 failed), no E0000-E0FFF block (10 failed)
-bash -n spike/handoff/parse.sh and bash -n spike/tests/test_handoff.sh - clean
+/bin/bash spike/tests/test_handoff.sh - 750 passed, 0 failed (3 runs, Linux, GNU bash 5.2, perl 5.38.2 with Unicode 15.0)
 make -s check-fast - PASS (compliance-scan clean; no app stack yet)
-manual perl checks: the code point bytes for every new range, and the strict decoder on f5, f4, f8, c0, ed and f0 forms
-macOS /bin/bash 3.2: not re-run this round, human to run
+bash -n spike/handoff/parse.sh and bash -n spike/tests/test_handoff.sh - clean
+spike/handoff/parse.sh --root "$PWD" HANDOFF.md - parses with the new parser (checked after this file was written)
+mutation checks on scratch copies, one protection removed per copy: no parent identity check (race test passes, deterministic test 4 failed); reason check back to any text (4 failed); no Cf class and no listed ranges (82 failed); Cf class kept without the listed ranges (0 failed, expected: \p{Cf} covers them on this perl); no explicit noncharacter expression (66 failed); no QUIT trap (2 failed); no pipefail (1 failed); no lstat link-count check (2 failed)
+race probe on scratch copies, 1500 runs each: real parser 0 canary leaks, parser without the identity check 10 leaks
+macOS /bin/bash 3.2 and macOS system perl: not run, human to run /bin/bash spike/tests/test_handoff.sh on macOS before merge
 
 ## Hard rules touched
-- Rule 4 (never touch CLI credentials; the parser never reads outside the worktree) - round 4 block: "symlink as the last component is refused (rc)", "symlinked parent directory is refused (rc)", "hard-linked file outside the sandbox root is refused (rc)", "FIFO input is refused without blocking", "a '..' component in the input path is refused (rc)"; canary text never appears in output or in TMPDIR
-- Security (ARCHITECTURE.md, worker output is untrusted) - injection tests unchanged (payloads verbatim, marker file never created); strict UTF-8 tests; invisible-character tests; signal checks (INT, HUP, TERM); source guards "input path is named in exactly one code line", "the input path is not a shell redirect", "the open is sysopen with O_NOFOLLOW and O_NONBLOCK"
+- Rule 4 (never touch CLI credentials; the parser never opens a file outside --root) - round 5 block: "an absolute path outside the root is refused (rc 1)", "a relative path with .. is refused (rc 1)", "a parent swapped after its lstat is refused (rc 1)", "race: 200 runs against a swapped parent directory, none printed the outside canary", "hard link refused before open: the lstat message says so", "a relative FIFO is refused without blocking"; the canary text is checked in every refusal
+- Security (ARCHITECTURE.md, worker output is untrusted) - injection tests unchanged (payloads verbatim, marker file never created); strict UTF-8; "every \p{Cf} code point of this perl is refused"; "noncharacter U+... is refused by the regular expression alone"; signal checks (INT, HUP, QUIT, TERM)
 - Rule 9 (indirectly) - n/a in Phase 0
 
 ## Open risks / questions
-- Remaining race (documented in the spec, not closed): a process that can write to the worktree could swap a parent directory for a symlink between the directory check and the open. The caller must parse only after the worker's whole process tree has exited. The scheduler has to enforce that; this is a follow-up for the lead.
-- A relative input is checked through the shell's logical working directory, so a parser run from a symlinked directory refuses relative paths. Callers pass absolute paths (documented in the spec).
-- Encode's strict decoder also refuses noncharacters (U+FDD0-U+FDEF, U+xFFFE, U+xFFFF). That is stricter than RFC 3629 and is documented in the spec.
-- perl is now a required tool (preinstalled on macOS and Linux). iconv is neither used nor required. No shared-file change is needed for this task.
-- macOS /bin/bash 3.2 and the BSD userland were not exercised this round. Human to run `/bin/bash spike/tests/test_handoff.sh` on macOS before merge.
-- The signal checks use a 2 s fake perl and take about 7 s in total.
-- This file is written in the six-section format so the same parser can read it. The round 4 mapping is a `###` subsection below, because a `## Round 4` heading would be an unknown section.
+- Parent-directory race: closed by the walk (see Round 5). The caller-side "no concurrent writer" precondition is removed from the spec as a security requirement and kept as advice. Residual: a directory renamed out of the root after its lstat can still be read through the directory the process holds, which then reads only a one-link regular file inside it. That needs write access to both places, so it adds no power an attacker with that access lacks. Lead to decide whether to accept.
+- The root and its parents are trusted: the caller chooses --root, and it is resolved once with pwd -P.
+- The race test is probabilistic and weak on its own (see Round 5). The deterministic identity test is the real guard for the identity check.
+- Cf: the explicit list now includes the code points the brief lists, so refusal does not depend on the perl's Unicode version. \p{Cf} adds the rest of the set of the perl that runs the check.
+- A signal during the final cat can still truncate stdout (documented; the exit status names the signal, so callers treat non-zero as failed).
+- macOS /bin/bash 3.2, the BSD userland and macOS perl were not exercised this round. Human to run the suite on macOS before merge.
+- No shared-file change is needed for this task.
 
-### Round 4
-Each finding, its fix and the test that proves it. Test names are from spike/tests/test_handoff.sh, round 4 block.
-- Hard-link blocker (rule 4): a link count other than one is refused, checked on the open handle. Tests: "hard-linked file outside the sandbox root is refused (rc)", "a hard link whose other name is also inside the sandbox is refused (rc)".
-- Check-then-read race: the separate -L and -f checks and the head read are replaced by one perl sysopen (O_NOFOLLOW, O_NONBLOCK, O_NOCTTY), an fstat of that handle, and a copy of at most 16385 bytes from it. Tests: "symlink as the last component is refused (rc)", "symlink refused at open: the message comes from the open", "dangling symlink is refused at open (rc)", "FIFO input is refused without blocking", "a directory is refused (rc)", "/dev/null is refused (rc)".
-- Symlinked parent directories: pwd -L is compared with pwd -P before the open, and a '..' component is refused. Tests: "symlinked parent directory is refused (rc)", "relative path through a symlinked parent is refused (rc)", "a '..' component in the input path is refused (rc)".
-- Remaining race on parent directories: documented in the spec (parse only after the worker's process tree has exited). "refused before any read" is now "refused at open; nothing is copied" in the spec, the parser messages and this file. Documentation change, no test.
-- Strict UTF-8 (iconv dropped, perl Encode strict): tests "strict UTF-8: f5 80 80 80 (lead byte F5)", "strict UTF-8: f4 90 80 80 (above U+10FFFF)", "strict UTF-8: 5-byte form f8 88 80 80 80", "strict UTF-8: overlong c0 af", "strict UTF-8: surrogate ed a0 80", "strict UTF-8: overlong 4-byte f0 80 80 80", "iconv is no longer used by the parser".
-- Invisible characters: FE00-FE0F, E0000-E0FFF, 180B-180F, 3164, 2800, FFA0, 115F, 1160, 17B4 and 17B5 are refused, one test per range (for example "U+FE00-VS1 (FE00-FE0F range) in Summary", "U+E0100-VS17 (E0000-E0FFF block) in Summary", "U+3164-HANGUL-FILLER in Summary", "U+17B5-KHMER-VOWEL-INHERENT-AA in Summary"). Near misses stay accepted: "U+FE10 (outside FE00-FE0F) is accepted", "U+E1000 (outside the E0000-E0FFF block) is accepted", "U+1F600 emoji is accepted".
-- Signals and cleanup: the trap is installed before mktemp and the rm is guarded on WORK being non-empty; INT, HUP and TERM exit 130, 129 and 143 through the EXIT trap. Tests: the INT, HUP and TERM checks in the round 4 block (temp dir empty, stdout empty, marker reached).
-- Exit 3 for more internal errors: "a failing jq (building the JSON) is exit 3", "a failing awk (line length check) is exit 3", "a failing perl open and copy is exit 3", "a failing perl character check is exit 3". Exit 2 for a missing tool: "perl missing is a missing-tool error (exit 2)", "jq missing is a missing-tool error (exit 2)".
-- Output is built in a temp file and printed last, so an interrupt before that point leaves stdout empty. No separate test; the INT check covers the interrupt path.
-- Source guard "parser opens the input path exactly once" (a count of the `<"$file"` redirect) is replaced by three checks: the input path is named in exactly one code line, that is not a redirect, and the open is sysopen with O_NOFOLLOW and O_NONBLOCK. The behavior tests above are the stronger check.
+### Round 5
+Each finding, its fix and the test that proves it. Test names are from spike/tests/test_handoff.sh (round 5 block unless noted).
+- Parent-directory swap (reviewer repro, 9 in 300): the bash pwd check and the path open are replaced by one perl walk. Each parent is lstat'ed, refused if a symlink or not a directory, entered, and its (dev, ino) compared with the lstat. The leaf is lstat'ed (regular, one link), then opened with O_NOFOLLOW, O_NONBLOCK, O_NOCTTY relative to the verified directory. Tests: "race: 200 runs against a swapped parent directory, none printed the outside canary" (probabilistic); "a parent swapped after its lstat is refused (rc 1)" (deterministic: lstat overridden by a test-only module through PERL5OPT); round 4 "symlinked parent directory is refused (rc)" kept.
+- Root required and input inside it: "--root is required (rc 2)", "--root that is not a directory is a usage error (rc 2)", "--root given twice is a usage error (rc 2)", "an absolute path outside the root is refused (rc 1)", "a file outside the root is refused (rc 1)", "/dev/null outside the root is refused (rc 1)", "a valid file inside the root passes (rc 0)", "a relative path is relative to the root, not the working directory (rc 0)".
+- Dot and dot-dot components: "a relative path with .. is refused (rc 1)", "./-g.md is refused: a '.' component", "./-n.md is refused: a '.' component" (the ESC loop, round 4 name kept with the absolute path).
+- Root given as a symlink, resolved once: "root given as a symlink: an input under its physical path passes (rc 0)", "root given as a symlink: an input under the logical path is outside the root (rc 1)", "root given as a symlink: a relative input resolves in the physical root (rc 0)".
+- Hard link refused before the open: "hard link refused before open: the lstat message says so", "the lstat link-count check comes before the open in the source". Round 4 hard-link tests kept.
+- FIFO by relative name: "a relative FIFO is refused without blocking (rc 1, not the alarm's 142)". A parent that is a regular file: "a parent that is a regular file is refused (rc 1)".
+- Confidence reason of separators only on the next line (finding 4): fixed by reason_ok, which applies to the whole reason. Tests: "confidence: a next-line reason of '- .' is separators only", "... of ';' ...", "... of '-  ,' ...", "confidence: several separator-only lines are no reason"; accepted: "confidence: a next-line reason with a word is accepted".
+- Format characters (finding 5): \p{Cf} is refused in the strict-decode step, plus the explicit list (which now includes the brief's 41 code points). Tests: "listed Cf code point U+... is refused" (41), "every \p{Cf} code point of this perl is refused: U+..." (170 on this perl), "the Cf sweep covered a real set". Spec table updated.
+- Noncharacters (finding 6): an explicit expression for U+FDD0-U+FDEF and U+xFFFE, U+xFFFF in each plane. Tests: "noncharacter U+... is refused" (66), and "noncharacter U+... is refused by the regular expression alone" (66, with a lax Encode stub on PERL5LIB; the message names the expression, which proves the stub is in use), "with the lax stub a valid handoff still parses (rc 0)", near misses "U+FDCF (next to the noncharacters, not one) is accepted" and three more.
+- Nits (finding 7): load_lines uses "local -a all" then "all=()" (bash 3.2 form). A failing tr or wc is exit 3: pipefail, every tool result checked. Tests: "a failing tr (NUL check) is exit 3, not a NUL refusal", "a failing wc (size check) is exit 3". QUIT is trapped like TERM and exits 131: "signal QUIT 131" and "QUIT is trapped like TERM (exit 131)". The final JSON is one cat of the prepared file: "stdout is written once, from the prepared file".
+- Usage: "--root" is required; "two file arguments with --root is a usage error (rc 2)", "no file argument with --root is a usage error (rc 2)".
+- Round 4 assertions were not weakened. Changed: the "./" tests (above), the description "symlink refused at open: the message comes from the open" (renamed "symlink refused before open: the message names the symbolic link"; same assertion), the source guard pattern for the open (now "sysopen($in, $leaf, ...)"), and the call sites, which now pass --root.
+
+Decisions made in round 5 (lead to confirm):
+- "./name" is refused as a '.' component, as the brief specifies, so the round 4 "./" assertions now assert the refusal. A dash-named file is still tested with "--" and with its absolute path.
+- The 41 brief code points are in the explicit list too, not only in \p{Cf}. U+0890-U+0891 are Unicode 14 code points, so an older macOS perl would otherwise accept them.
+- A missing or non-directory --root, and a repeated --root, are usage errors (exit 2).
+- Relative inputs are relative to --root (round 4 used the shell's directory).
+- The race test is probabilistic. A parser without the identity check leaked in 10 of 1500 runs, so N=200 would catch it about one time in four. The deterministic test is the guard. N=200 and the 30 s bound are kept as the brief asks.
+
+Confidence: medium. The Linux suite passes three runs, each mutation above fails the test meant to catch it, and the real parser had no canary leak in 1500 race runs. macOS bash 3.2 and macOS perl are not run, the Cf set depends on the perl's Unicode version, and the race test alone is weak (the deterministic test is the guard).
 
 ## Confidence
-medium, the Linux suite passes three runs and each removed protection makes it fail, but macOS bash 3.2, the BSD userland and macOS perl were not exercised this round.
+medium, the Linux suite passes three runs, the mutation checks each fail the test meant to catch them, and the real parser shows no race leak in 1500 runs; macOS bash 3.2 and macOS perl are not exercised, and the probabilistic race test is weak on its own.
