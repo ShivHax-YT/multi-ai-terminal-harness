@@ -2,7 +2,7 @@
 
 Runtime compliance data lives here and is the **only** place in app code allowed to name provider credential paths:
 
-- `denylist.*` (create in Phase 1 in your stack's format): the credential-store paths and Keychain service names the
+- `denylist.txt` (Phase 0 spike tools read it at run time; Phase 1 ports it to the stack's format): the credential-store paths and Keychain service names the
   file-access layer refuses (hard rule 4). Start from `.claude/hooks/lib.sh` `CRED_DIRS`.
 - `ceilings.*`: the compiled-in subscription ceilings from hard rule 1 (2 sessions, 30 prompts/h, 40 turns/task,
   8 h/day, 30 min idle pause), pacing from rule 10 (5 s gap, 60 s backoff base, pause after 3 limit errors).
