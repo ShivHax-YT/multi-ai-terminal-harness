@@ -3,7 +3,8 @@
 #
 #   {task_id, summary, files_changed:[{path,note}], tests_run, hard_rules:[..], risks, confidence:{level,why}}
 #
-# Exit codes: 0 valid, 1 invalid handoff (message on stderr, nothing on stdout), 2 usage error / jq missing.
+# Exit codes: 0 valid, 1 invalid handoff (message on stderr, nothing on stdout), 2 usage error / jq or iconv missing,
+#             3 internal error (temp dir, copy, jq or tool failure; the input was not judged).
 #
 # SECURITY: the input file is written by a worker AI and is untrusted data. This script never eval's, sources or
 # expands file content. Content only ever sits inside quoted "$variables" and reaches jq through --arg or stdin.
@@ -14,7 +15,7 @@ set -f
 export LC_ALL=C
 
 MAX_BYTES=16384
-MAX_LINE=500
+MAX_LINE=2000
 MAX_FILES=100
 MAX_RULES=20
 
@@ -23,6 +24,12 @@ SECTIONS=("Summary" "Files changed" "Tests run" "Hard rules touched" "Open risks
 die() {
   printf 'handoff: %s\n' "$*" >&2
   exit 1
+}
+
+# Internal errors (the parser itself could not do its job) are exit 3, never confused with an invalid handoff.
+internal() {
+  printf 'handoff: internal error: %s\n' "$*" >&2
+  exit 3
 }
 
 # Arguments: parse.sh [--] <file>. Without "--", a first argument that looks like an option is a usage error.
@@ -40,12 +47,19 @@ if [ $# -ne 1 ]; then
   printf 'usage: parse.sh [--] <HANDOFF.md>\n' >&2
   exit 2
 fi
-if ! command -v jq >/dev/null 2>&1; then
-  printf 'handoff: jq is required but was not found\n' >&2
-  exit 2
-fi
+for tool in jq iconv; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    printf 'handoff: %s is required but was not found\n' "$tool" >&2
+    exit 2
+  fi
+done
 
 file=$1
+# A symlink is never followed: a worker controls its worktree and could point HANDOFF.md at a file it must not read.
+# The caller passes a canonical path inside the worker's worktree (symlinked parent directories are its concern).
+if [ -L "$file" ]; then
+  die "symlink not allowed: the input must be a regular file"
+fi
 if [ ! -f "$file" ] || [ ! -r "$file" ]; then
   die "cannot read input file"
 fi
@@ -54,15 +68,15 @@ fi
 # read that copy through stdin redirection, so a file name can never act as an option or an awk assignment and the
 # file cannot change between the checks and the parse (TOCTOU). External commands never receive a path argument
 # derived from the input.
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/handoff-parse.XXXXXX") || die "cannot create temp dir"
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/handoff-parse.XXXXXX") || internal "cannot create temp dir"
 trap 'rm -rf "$WORK"' EXIT
 copy="$WORK/copy"
-head -c $((MAX_BYTES + 1)) <"$file" >"$copy" 2>/dev/null || die "cannot read input file"
+head -c $((MAX_BYTES + 1)) <"$file" >"$copy" 2>/dev/null || internal "cannot copy input file"
 
 # ---- whole-file checks (before any line is interpreted) ----------------------------------------------------------
 size=$(wc -c <"$copy" | tr -d '[:space:]')
 case $size in
-  '' | *[!0-9]*) die "cannot determine file size" ;;
+  '' | *[!0-9]*) internal "cannot determine file size" ;;
 esac
 if [ "$size" -gt "$MAX_BYTES" ]; then
   die "oversize: file is larger than $MAX_BYTES bytes"
@@ -75,27 +89,42 @@ if [ "$nonul" != "$size" ]; then
   die "control character: NUL byte in file"
 fi
 
+# Must be valid UTF-8 (the spec says UTF-8; jq would silently turn bad bytes into U+FFFD).
+if ! iconv -f UTF-8 -t UTF-8 <"$copy" >/dev/null 2>&1; then
+  die "invalid UTF-8 in file"
+fi
+
 # Control characters and look-alikes, all rejected (LC_ALL=C, so these are raw byte patterns):
 #   C0 controls except tab and LF (includes CR and ESC), DEL
 #   C1 controls U+0080-U+009F (U+009B is CSI, a terminal escape introducer)
 #   U+200B-U+200F zero-width and direction marks, U+2028-U+202E line/paragraph separators and bidi overrides
-#   U+2066-U+2069 bidi isolates, U+FEFF byte order mark / zero-width no-break space
+#   U+2060-U+206F invisible operators, bidi isolates and deprecated format characters, U+00AD soft hyphen,
+#   U+034F combining grapheme joiner, U+061C Arabic letter mark, U+180E Mongolian vowel separator,
+#   U+FFF9-U+FFFB interlinear annotation, U+E0000-U+E007F tag characters (invisible text smuggling),
+#   U+FEFF byte order mark / zero-width no-break space
 # grep reads stdin; only exit status 1 (no match) counts as clean. 0 (match) and >= 2 (error) both fail closed.
-BAD_CHARS=$'[\001-\010\013-\037\177]|\xC2[\x80-\x9F]|\xE2\x80[\x8B-\x8F\xA8-\xAE]|\xE2\x81[\xA6-\xA9]|\xEF\xBB\xBF'
+BAD_CHARS=$'[\001-\010\013-\037\177]|\xC2[\x80-\x9F]|\xC2\xAD|\xCD\x8F|\xD8\x9C|\xE1\xA0\x8E|\xE2\x80[\x8B-\x8F\xA8-\xAE]|\xE2\x81[\xA0-\xAF]|\xEF\xBB\xBF|\xEF\xBF[\xB9-\xBB]|\xF3\xA0[\x80-\x81]'
 grep -q -E -e "$BAD_CHARS" <"$copy" 2>/dev/null
 case $? in
   1) ;;
   0) die "control character in file (only tab, LF and plain text allowed; no CR, ESC, C1, bidi or zero-width characters)" ;;
-  *) die "internal error checking control characters" ;;
+  *) internal "control character check failed" ;;
 esac
 
-long_line=$(awk -v max="$MAX_LINE" 'length($0) > max { print NR; exit }' <"$copy") || die "internal error checking line length"
+long_line=$(awk -v max="$MAX_LINE" 'length($0) > max { print NR; exit }' <"$copy") || internal "line length check failed"
 if [ -n "$long_line" ]; then
   die "line too long: line $long_line exceeds $MAX_LINE bytes"
 fi
 
 # ---- helpers -----------------------------------------------------------------------------------------------------
-NONBLANK_RE='[^[:space:]]'
+NBSP=$'\xC2\xA0'
+
+# nonblank <text>: true if the text has any character other than ASCII whitespace and U+00A0 (no-break space).
+nonblank() {
+  local t=${1//[[:space:]]/}
+  t=${t//"$NBSP"/}
+  [ -n "$t" ]
+}
 
 # Sets RT to $1 without trailing whitespace.
 rtrim() {
@@ -111,7 +140,7 @@ load_lines() {
     all+=("$line")
   done <<<"$text"
   for ((i = 0; i < ${#all[@]}; i++)); do
-    if [[ ${all[i]} =~ $NONBLANK_RE ]]; then
+    if nonblank "${all[i]}"; then
       if [ "$first" -lt 0 ]; then first=$i; fi
       last=$i
     fi
@@ -231,7 +260,7 @@ while IFS= read -r line || [ -n "$line" ]; do
   fi
 
   if [ "$cur_idx" -lt 0 ]; then
-    if [[ $line =~ $NONBLANK_RE ]]; then
+    if nonblank "$line"; then
       die "unexpected content before first section (line $lineno)"
     fi
     continue
@@ -262,34 +291,42 @@ load_lines "$S0" "Summary" 5
 join_lines
 summary=$J
 
-# Files changed
+# Files changed (blank lines between bullets are allowed; only items are counted)
 FILE_RE='^([]A-Za-z0-9_./@+=,()[-]+)( - (.*))?$'
-load_lines "$S1" "Files changed" "$MAX_FILES"
+load_lines "$S1" "Files changed" 100000
 files_tsv=''
 if [ "$LN" -eq 1 ] && is_none "${L[0]}"; then
   files_json='[]'
 else
+  items=0
   for ((i = 0; i < LN; i++)); do
     line=${L[i]}
+    if ! nonblank "$line"; then
+      continue
+    fi
+    items=$((items + 1))
+    if [ "$items" -gt "$MAX_FILES" ]; then
+      die "too many lines in section: Files changed has more than $MAX_FILES entries"
+    fi
     if [[ $line != '- '* ]]; then
-      die "bad files_changed entry: item $((i + 1)) must start with '- '"
+      die "bad files_changed entry: item $items must start with '- '"
     fi
     entry=${line#- }
     if ! [[ $entry =~ $FILE_RE ]]; then
-      die "bad files_changed entry: item $((i + 1)) must be '- <path> - <note>' with a plain relative path"
+      die "bad files_changed entry: item $items must be '- <path> - <note>' with a plain relative path"
     fi
     path=${BASH_REMATCH[1]}
     note=${BASH_REMATCH[3]}
     if [ "${#path}" -gt 256 ]; then
-      die "bad files_changed entry: item $((i + 1)) path longer than 256 bytes"
+      die "bad files_changed entry: item $items path longer than 256 bytes"
     fi
     case "/$path/" in
-      /-* | //* | */../*) die "bad files_changed entry: item $((i + 1)) path must be relative, not start with '-', and contain no '..'" ;;
+      /-* | //* | */../*) die "bad files_changed entry: item $items path must be relative (no leading '/'), must not start with '-', and contain no '..' component" ;;
     esac
     files_tsv+="$path"$'\t'"$note"$'\n'
   done
   files_json=$(printf '%s' "$files_tsv" | jq -Rn '[inputs | index("\t") as $i | {path: .[:$i], note: .[$i+1:]}]') ||
-    die "internal error building files_changed"
+    internal "building files_changed failed"
 fi
 
 # Tests run
@@ -297,25 +334,33 @@ load_lines "$S2" "Tests run" 60
 join_lines
 tests_run=$J
 
-# Hard rules touched
-load_lines "$S3" "Hard rules touched" "$MAX_RULES"
+# Hard rules touched (blank lines between bullets are allowed; only items are counted)
+load_lines "$S3" "Hard rules touched" 100000
 if [ "$LN" -eq 1 ] && is_none "${L[0]}"; then
   rules_json='[]'
 else
   rules_txt=''
+  items=0
   for ((i = 0; i < LN; i++)); do
     line=${L[i]}
+    if ! nonblank "$line"; then
+      continue
+    fi
+    items=$((items + 1))
+    if [ "$items" -gt "$MAX_RULES" ]; then
+      die "too many lines in section: Hard rules touched has more than $MAX_RULES entries"
+    fi
     if [[ $line != '- '* ]]; then
-      die "bad hard_rules entry: item $((i + 1)) must start with '- '"
+      die "bad hard_rules entry: item $items must start with '- '"
     fi
     entry=${line#- }
-    if ! [[ $entry =~ $NONBLANK_RE ]]; then
-      die "bad hard_rules entry: item $((i + 1)) is empty"
+    if ! nonblank "$entry"; then
+      die "bad hard_rules entry: item $items is empty"
     fi
     rules_txt+="$entry"$'\n'
   done
   rules_json=$(printf '%s' "$rules_txt" | jq -Rn '[inputs]') ||
-    die "internal error building hard_rules"
+    internal "building hard_rules failed"
 fi
 
 # Open risks / questions
@@ -323,21 +368,27 @@ load_lines "$S4" "Open risks / questions" 60
 join_lines
 risks=$J
 
-# Confidence
-CONF_RE='^(low|medium|high)([[:space:],:;.]|$)(.*)$'
+# Confidence: the level is case-insensitive and is output in lowercase.
+CONF_RE='^([A-Za-z]+)([[:space:],:;.]|$)(.*)$'
 load_lines "$S5" "Confidence" 10
 if ! [[ ${L[0]} =~ $CONF_RE ]]; then
   die "bad confidence level: the Confidence section must start with low, medium or high"
 fi
-level=${BASH_REMATCH[1]}
+word=${BASH_REMATCH[1]}
 rest=${BASH_REMATCH[3]}
+case $word in
+  [Ll][Oo][Ww]) level=low ;;
+  [Mm][Ee][Dd][Ii][Uu][Mm]) level=medium ;;
+  [Hh][Ii][Gg][Hh]) level=high ;;
+  *) die "bad confidence level: the Confidence section must start with low, medium or high" ;;
+esac
 prefix=${rest%%[![:space:],:;.-]*}
 rest=${rest#"$prefix"}
 L[0]=$rest
 join_lines
 nl=$'\n'
 why=${J#"${J%%[!"$nl"]*}"} # drop leading newlines (level alone on the first line)
-if ! [[ $why =~ $NONBLANK_RE ]]; then
+if ! nonblank "$why"; then
   die "confidence missing reason: give a reason after the level"
 fi
 
@@ -353,4 +404,4 @@ jq -a -n \
   --arg why "$why" \
   '{task_id: $task_id, summary: $summary, files_changed: $files, tests_run: $tests_run,
     hard_rules: $hard_rules, risks: $risks, confidence: {level: $level, why: $why}}' ||
-  die "internal error building output"
+  internal "building output failed"

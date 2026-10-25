@@ -199,8 +199,9 @@ expect_fail "unterminated fence" "$unterminated" "unterminated code fence"
 expect_fail "summary over 5 lines" "$(mkd sum6 $'1\n2\n3\n4\n5\n6')" "too many lines in section: Summary"
 expect_ok "summary of exactly 5 lines" "$(mkd sum5 $'1\n2\n3\n4\n5')"
 expect_fail "empty summary" "$(mkd sum0 '')" "empty section: Summary"
-expect_fail "line over 500 bytes" "$(mkd longline "$(printf '%501s' '' | tr ' ' q)")" "line too long"
-expect_ok "line of exactly 500 bytes" "$(mkd line500 "$(printf '%500s' '' | tr ' ' q)")"
+expect_fail "line over 2000 bytes" "$(mkd longline "$(printf '%2001s' '' | tr ' ' q)")" "line too long"
+expect_ok "line of exactly 2000 bytes" "$(mkd line2000 "$(printf '%2000s' '' | tr ' ' q)")"
+expect_ok "line of 600 bytes (Markdown paragraph, not hard-wrapped)" "$(mkd line600 "$(printf '%600s' '' | tr ' ' q)")"
 
 printf '%s' "$(mk "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF")" >"$TMP/esc.md"
 printf '\033[31mred\033[0m\n' >>"$TMP/esc.md"
@@ -249,7 +250,13 @@ eq "confidence dash why" "$(jq -r .confidence.why "$TMP/out")" "one gap"
 expect_ok "confidence reason on next line" "$(mkd c_next "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" $'high\nall green')"
 eq "confidence next-line why" "$(jq -r .confidence.why "$TMP/out")" "all green"
 expect_fail "confidence 'highly'" "$(mkd c1 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" 'highly sure')" "bad confidence level"
-expect_fail "confidence 'High' (capital)" "$(mkd c2 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" 'High, sure')" "bad confidence level"
+expect_ok "confidence 'High' (capital) is accepted" "$(mkd c2 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" 'High, sure')"
+eq "confidence 'High' is output as lowercase" "$(jq -r .confidence.level "$TMP/out")" "high"
+expect_ok "confidence 'MEDIUM' is accepted" "$(mkd c2b "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" 'MEDIUM: ok')"
+eq "confidence 'MEDIUM' is output as lowercase" "$(jq -r .confidence.level "$TMP/out")" "medium"
+expect_ok "confidence 'lOw' is accepted" "$(mkd c2c "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" 'lOw; flaky')"
+eq "confidence 'lOw' is output as lowercase" "$(jq -r .confidence.level "$TMP/out")" "low"
+expect_fail "confidence 'HIGHLY' still rejected" "$(mkd c2d "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" 'HIGHLY sure')" "bad confidence level"
 expect_fail "confidence 'high-ish'" "$(mkd c3 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" 'high-ish')" "bad confidence level"
 expect_fail "confidence without reason" "$(mkd c4 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" 'high')" "missing reason"
 expect_fail "confidence empty" "$(mkd c5 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" '')" "empty section: Confidence"
@@ -366,9 +373,9 @@ eq "-- alone is a usage error" "$?" "2"
 assigndir="$TMP/assign"
 mkdir -p "$assigndir"
 for n in max=1 max=99999999; do
-  mkd "assign-src" "$(printf '%600s' '' | tr ' ' q)" >/dev/null
+  mkd "assign-src" "$(printf '%2100s' '' | tr ' ' q)" >/dev/null
   cp "$TMP/assign-src.md" "$assigndir/$n"
-  expect_named_fail "600-byte line in file named $n" "$assigndir" "$n" "line too long"
+  expect_named_fail "2100-byte line in file named $n" "$assigndir" "$n" "line too long"
 done
 cp "$FIX/good.md" "$assigndir/max=1"
 run_named "$assigndir" "max=1"
@@ -393,6 +400,19 @@ reject_char "U+200F-RLM" $'\xE2\x80\x8F'
 reject_char "U+2066-LRI" $'\xE2\x81\xA6'
 reject_char "U+2069-PDI" $'\xE2\x81\xA9'
 reject_char "U+FEFF-BOM-mid" $'\xEF\xBB\xBF'
+reject_char "U+00AD-SHY" $'\xC2\xAD'
+reject_char "U+034F-CGJ" $'\xCD\x8F'
+reject_char "U+061C-ALM" $'\xD8\x9C'
+reject_char "U+180E-MVS" $'\xE1\xA0\x8E'
+reject_char "U+2060-WJ" $'\xE2\x81\xA0'
+reject_char "U+2064-INVISIBLE-PLUS" $'\xE2\x81\xA4'
+reject_char "U+206A-ISS" $'\xE2\x81\xAA'
+reject_char "U+206F-NODS" $'\xE2\x81\xAF'
+reject_char "U+FFF9-IAA" $'\xEF\xBF\xB9'
+reject_char "U+FFFB-IAT" $'\xEF\xBF\xBB'
+reject_char "U+E0001-TAG-LANGUAGE" $'\xF3\xA0\x80\x81'
+reject_char "U+E0020-TAG-SPACE" $'\xF3\xA0\x80\xA0'
+reject_char "U+E007F-TAG-CANCEL" $'\xF3\xA0\x81\xBF'
 { printf '\xEF\xBB\xBF'; cat "$FIX/good.md"; } >"$TMP/bom.md"
 expect_fail "BOM at start of file" "$TMP/bom.md" "control character"
 # ordinary non-ASCII text stays allowed, and the JSON output is ASCII-only (jq -a)
@@ -403,6 +423,106 @@ check "output is ASCII only" test "$(LC_ALL=C tr -d '\000-\177' <"$TMP/out" | wc
 # the input path is opened exactly once (source-level guard)
 check "parser opens the input path exactly once" test "$(grep -v '^[[:space:]]*#' "$PARSE" | grep -c '<"\$file"')" = "1"
 check "no other command receives the input path as an argument" test -z "$(grep -v '^[[:space:]]*#' "$PARSE" | grep -E '(wc|tr|grep|awk|head|cat|sed)[^|<]*"\$file"[^|]*$' | grep -v '<"\$file"')"
+
+# ---- round 3: symlinks, exit codes, UTF-8, blank lines, limits, temp-dir hygiene -------------------------------------
+tdir="$TMP/tmpd"
+mkdir -p "$tdir"
+count_tmp() { ls -A "$tdir" | wc -l | tr -d ' '; }
+run_tmp() { # file: runs the parser with a private TMPDIR; sets RC/ERR
+  TMPDIR="$tdir" "$SH" "$PARSE" "$1" >"$TMP/out" 2>"$TMP/err" </dev/null
+  RC=$?
+  ERR=$(cat "$TMP/err")
+}
+
+# symlinks are never followed (a canary stands in for a file the worker must not make us read)
+printf 'CANARY-SECRET-DO-NOT-COPY\n' >"$TMP/canary.txt"
+ln -s "$TMP/canary.txt" "$TMP/link-canary.md"
+ln -s "$FIX/good.md" "$TMP/link-good.md"
+ln -s "$TMP/does-not-exist" "$TMP/link-dangling.md"
+for l in link-canary link-good link-dangling; do
+  run_tmp "$TMP/$l.md"
+  eq "symlink $l is rejected (rc)" "$RC" "1"
+  check "symlink $l error names the problem" test "${ERR#*symlink not allowed}" != "$ERR"
+  eq "symlink $l: nothing copied to TMPDIR" "$(count_tmp)" "0"
+  eq "symlink $l: nothing on stdout" "$(cat "$TMP/out")" ""
+  check "symlink $l: canary text not in any output" test "${ERR#*CANARY}" = "$ERR"
+done
+ln -s "$FIX/good.md" "$dashdir/-link.md"
+run_named "$dashdir" "-link.md" --
+eq "symlink with dash name (after --) is rejected" "$RC" "1"
+
+# temp dir hygiene and exit code 3 for internal errors
+run_tmp "$FIX/good.md"
+eq "success exit code (tmp check)" "$RC" "0"
+eq "temp dir removed after success" "$(count_tmp)" "0"
+run_tmp "$FIX/missing-section.md"
+eq "failure exit code (tmp check)" "$RC" "1"
+eq "temp dir removed after failure" "$(count_tmp)" "0"
+run_tmp "$TMP/esc-payload.md"
+eq "temp dir removed after control-character failure" "$(count_tmp)" "0"
+TMPDIR="$TMP/no/such/dir" "$SH" "$PARSE" "$FIX/good.md" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "unusable TMPDIR is an internal error (exit 3)" "$?" "3"
+check "internal error message says so" grep -q '^handoff: internal error' "$TMP/err"
+eq "internal error leaves stdout empty" "$(cat "$TMP/out")" ""
+
+# invalid UTF-8
+expect_fail "invalid UTF-8 (ff fe)" "$(mkd badutf1 $'bad \xff\xfe bytes')" "invalid UTF-8"
+expect_fail "truncated UTF-8 sequence" "$(mkd badutf2 $'cut \xe2\x80')" "invalid UTF-8"
+expect_fail "lone continuation byte" "$(mkd badutf3 $'x \x80 y')" "invalid UTF-8"
+expect_fail "invalid UTF-8 in Confidence" "$(mkd badutf4 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" $'high, \xff')" "invalid UTF-8"
+
+# blank lines between bullets
+expect_ok "files: blank lines between bullets" "$(mkd fblank "$D_SUM" $'- a.txt - one\n\n- b.txt - two\n\n\n- c.txt')"
+eq "files: blank lines skipped, items counted" "$(jq -c '[.files_changed[].path]' "$TMP/out")" '["a.txt","b.txt","c.txt"]'
+expect_ok "rules: blank lines between bullets" "$(mkd rblank "$D_SUM" "$D_FILES" "$D_TESTS" $'- Rule 1 - t1\n\n- Rule 2 - t2')"
+eq "rules: blank lines skipped, items counted" "$(jq -c .hard_rules "$TMP/out")" '["Rule 1 - t1","Rule 2 - t2"]'
+spaced_files() { # count: n bullets separated by blank lines
+  local n=$1 k out=''
+  for ((k = 1; k <= n; k++)); do out+="- f$k.txt - n"$'\n\n'; done
+  printf '%s' "${out%$'\n\n'}"
+}
+expect_ok "files: exactly 100 entries separated by blank lines" "$(mkd f100b "$D_SUM" "$(spaced_files 100)")"
+eq "files: 100 entries counted" "$(jq '.files_changed | length' "$TMP/out")" "100"
+expect_fail "files: 101 entries separated by blank lines" "$(mkd f101b "$D_SUM" "$(spaced_files 101)")" "too many lines in section: Files changed"
+nbsp_line=$'\xC2\xA0'
+expect_ok "files: NBSP-only line between bullets is blank" "$(mkd fnbsp "$D_SUM" "- a.txt - one"$'\n'"$nbsp_line"$'\n'"- b.txt - two")"
+
+# more limit branches
+bullets() { # prefix count
+  local k out=''
+  for ((k = 1; k <= $2; k++)); do out+="- $1 $k - t"$'\n'; done
+  printf '%s' "${out%$'\n'}"
+}
+lines_of() { # count: n numbered lines
+  local k out=''
+  for ((k = 1; k <= $1; k++)); do out+="line $k"$'\n'; done
+  printf '%s' "${out%$'\n'}"
+}
+expect_ok "rules: exactly 20 entries" "$(mkd r20 "$D_SUM" "$D_FILES" "$D_TESTS" "$(bullets Rule 20)")"
+expect_fail "rules: 21 entries" "$(mkd r21 "$D_SUM" "$D_FILES" "$D_TESTS" "$(bullets Rule 21)")" "too many lines in section: Hard rules touched"
+expect_ok "tests: exactly 60 lines" "$(mkd t60 "$D_SUM" "$D_FILES" "$(lines_of 60)")"
+expect_fail "tests: 61 lines" "$(mkd t61 "$D_SUM" "$D_FILES" "$(lines_of 61)")" "too many lines in section: Tests run"
+expect_ok "risks: exactly 60 lines" "$(mkd k60 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$(lines_of 60)")"
+expect_fail "risks: 61 lines" "$(mkd k61 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$(lines_of 61)")" "too many lines in section: Open risks / questions"
+expect_ok "confidence: exactly 10 lines" "$(mkd cf10 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "high, why
+$(lines_of 9)")"
+expect_fail "confidence: 11 lines" "$(mkd cf11 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "high, why
+$(lines_of 10)")" "too many lines in section: Confidence"
+p256=$(printf '%256s' '' | tr ' ' a)
+expect_ok "files: path of exactly 256 bytes" "$(mkd p256 "$D_SUM" "- $p256 - n")"
+expect_fail "files: path of 257 bytes" "$(mkd p257 "$D_SUM" "- ${p256}a - n")" "path longer than 256"
+printf '# HANDOFF T-006\n\n```\n## Summary\n```\nx\n' >"$TMP/fencepre.md"
+expect_fail "fence before first section" "$TMP/fencepre.md" "before first section"
+expect_fail "confidence: separators only after level" "$(mkd cs1 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" 'high, -.;:')" "missing reason"
+expect_fail "confidence: level then dash only" "$(mkd cs2 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" 'high -')" "missing reason"
+expect_fail "confidence: NBSP-only reason" "$(mkd cs3 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "high, $nbsp_line")" "missing reason"
+expect_fail "rules: bullet containing only a no-break space" "$(mkd rn "$D_SUM" "$D_FILES" "$D_TESTS" "- $nbsp_line")" "bad hard_rules entry"
+expect_fail "summary of only a no-break space" "$(mkd sn "$nbsp_line")" "empty section: Summary"
+
+# path rules and their message
+expect_fail "files: leading dash path reports the dash rule" "$(mkd pd "$D_SUM" '- -rf/x - n')" "must not start with '-'"
+expect_ok "files: dash inside a component is fine" "$(mkd pd2 "$D_SUM" '- a/-b/c-d.txt - n')"
+expect_fail "files: .. component reports the rule" "$(mkd pd3 "$D_SUM" '- a/../b - n')" "'..' component"
 
 # ---- usage -----------------------------------------------------------------------------------------------------------
 "$SH" "$PARSE" >/dev/null 2>&1

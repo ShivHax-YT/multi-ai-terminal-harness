@@ -2,35 +2,37 @@
 
 ## Summary
 Defined the worker HANDOFF.md format (docs/spec/handoff.md) and spike/handoff/parse.sh, a bash 3.2 parser that fails closed.
-File content is untrusted: no eval/source/expansion; text reaches JSON only via jq --arg or stdin; output is ASCII-only (jq -a).
-Gate fixes: one bounded read into a private copy, every check via stdin (no fail-open grep, awk assignment or TOCTOU).
-C1, bidi, zero-width and BOM characters are rejected; `parse.sh [--] <file>` rejects option-looking first args.
-172 offline tests cover good, missing-section, bad-confidence, oversize, injection and the gate cases.
+File content is untrusted: no eval/source/expansion; one bounded read into a private copy; ASCII-only JSON output (jq -a).
+Round 3: symlink inputs refused, exit 3 for internal errors, UTF-8 validated, wider invisible-character blocklist,
+case-insensitive confidence (lowercased), 2000-byte lines, blank lines between bullets, NBSP counts as blank.
+260 offline tests cover the brief cases plus every gate finding.
 
 ## Files changed
-- docs/spec/handoff.md - format spec: sections, allowed content, size caps, error messages, exit codes
-- spike/handoff/parse.sh - parser, JSON on stdout, exit 1 on invalid handoff, 2 on usage error; single bounded read, stdin-only checks, fail-closed grep, jq -a
+- docs/spec/handoff.md - format spec: exact parse rules, limits, character table, symlink and timeout notes, exit codes
+- spike/handoff/parse.sh - parser, JSON on stdout; exit 1 invalid handoff, 2 usage or missing tool, 3 internal error
 - spike/fixtures/handoff/good.md - valid handoff
 - spike/fixtures/handoff/missing-section.md - lacks Tests run
 - spike/fixtures/handoff/bad-confidence.md - level is "certain"
 - spike/fixtures/handoff/injection.md - instruction-like text, command substitution and backtick payloads (__MARKER__ placeholder)
-- spike/tests/test_handoff.sh - 172 offline checks (oversize files generated at test time; dash-named, max=1-named, ESC, C1, bidi, BOM cases)
+- spike/tests/test_handoff.sh - 260 offline checks (oversize files generated at test time)
 - HANDOFF.md - this file
 
 ## Tests run
-/bin/bash spike/tests/test_handoff.sh - 172 passed, 0 failed (also run under macOS /bin/bash 3.2.57)
+/bin/bash spike/tests/test_handoff.sh - 260 passed, 0 failed (also under the default bash)
 make check-fast - PASS
 
 ## Hard rules touched
-- Security (ARCHITECTURE.md, worker output is untrusted) - test_handoff.sh injection section: injection.md parses, payloads appear verbatim in the JSON, marker file never created, hostile file name does not execute, source has no eval/source; files named -n.md/-q.md/./-n.md with ESC content and max=1 with a 600-byte line are rejected; U+009B and U+202E rejected
+- Rule 4 (never touch CLI credentials) - symlink tests: a symlink to a canary file is refused before any read, nothing is copied to TMPDIR, canary text never appears in output
+- Security (ARCHITECTURE.md, worker output is untrusted) - injection tests: payloads kept verbatim, marker file never created, hostile file names do not execute, source has no eval/source; ESC, C1, bidi, tag, invisible and invalid-UTF-8 input rejected
 - Rule 9 (indirectly) - n/a in Phase 0
 
 ## Open risks / questions
-- The format is strict (exact headings, no suffix text such as "## Summary (3-5 lines)", reason required after the confidence level). AGENTS.md's template shows hint text in parentheses; workers must write bare headings. If the lead prompt should tolerate hints, the spec needs a v2.
-- The old parser failed open on option-looking file names and awk-assignment names; the new tests fail against the old parser (39 failures) and pass against the fix.
-- File paths are limited to a conservative charset (no spaces, no non-ASCII); a worker that changes such a file must list it another way or the handoff is rejected.
-- Consumers (lead, scheduler) must still check task_id against the dispatched task and treat all strings as untrusted; the parser cannot do that for them.
-- No shared-file changes needed. Optional follow-up for the lead: add `/bin/bash spike/tests/test_handoff.sh` to a Makefile target (Makefile is not owned by this task).
+- Callers must run parse.sh under a timeout (a FIFO swapped in after the regular-file check blocks the open) and pass a canonical path inside the worktree; symlinked parent directories are the caller's job. Both are in the spec.
+- Headings stay strict (bare, no hint text) and extra sections are rejected; the lead is removing the hint text from the AGENTS.md template.
+- Paths in Files changed use a conservative charset (no spaces or non-ASCII), so a worker touching such a file gets its handoff rejected.
+- iconv is a new required tool (present on macOS and Linux); a missing iconv exits 2 like a missing jq.
+- Consumers must still check task_id against the dispatched task and treat all strings as untrusted.
+- No shared-file changes needed. Optional: add /bin/bash spike/tests/test_handoff.sh to a Makefile target.
 
 ## Confidence
-high, every acceptance criterion has a test and the suite passes offline under both bash 3.2 and the default bash.
+high, every gate finding has a test, and the suite passes offline under bash 3.2 and the default bash.
