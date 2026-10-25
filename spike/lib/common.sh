@@ -4,11 +4,14 @@
 #   . "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 #
 # Works on macOS /bin/bash 3.2 (no associative arrays, no mapfile, no case-conversion expansions).
-# It never changes the caller's shell options (no set -e / -u here).
+# It never changes the caller's shell options (no set -e / -u here). It does install one TERM trap (see
+# spike_require_live) unless the caller already has its own.
 #
 # Hard-rule notes:
-#   - No helper here launches a provider CLI except spike_run_timeout, which runs whatever command the caller passes.
-#     Scripts that start a real CLI session must call spike_require_live first (SPIKE_LIVE=1 is the opt-in).
+#   - spike_run_timeout is the only helper that starts an arbitrary command. It runs the command with a scrubbed
+#     environment, in its own process group, and refuses to start a provider CLI (claude, codex, grok, gemini, kimi)
+#     for anything except --version / auth status / login status unless SPIKE_LIVE=1 (spike_require_live).
+#   - SPIKE_LIVE=1 is a guard against accidents, not an approval. Only the human sets it.
 #   - Nothing here reads or names any CLI credential location or config-home override.
 
 if [ -n "${SPIKE_COMMON_LOADED:-}" ]; then
@@ -17,6 +20,11 @@ fi
 SPIKE_COMMON_LOADED=1
 
 SPIKE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+
+# spike_require_live ends the whole calling script by sending TERM to it; this trap turns that into exit status 3.
+if [ -z "$(trap -p TERM)" ]; then
+  trap 'exit 3' TERM
+fi
 
 spike_err() { printf 'spike: %s\n' "$*" >&2; }
 
@@ -72,10 +80,12 @@ spike_worktree_add() {
 }
 
 # spike_cleanup <run-dir> -> remove spike worktrees, prune, delete the run dir.
-# Refuses (returns 2) anything that is not strictly inside <TMPDIR>/harness-spike/.
+# Refuses (returns 2) anything that is not strictly inside <TMPDIR>/harness-spike/ (physical or logical spelling).
 spike_cleanup() {
-  local target="${1:-}" root phys wt line
+  local target="${1:-}" root lroot phys line
   root="$(spike_root)"
+  lroot="${TMPDIR:-/tmp}"
+  lroot="${lroot%/}/harness-spike"
   if [ -z "$target" ]; then
     spike_err "cleanup: no path given"
     return 2
@@ -89,7 +99,7 @@ spike_cleanup() {
     */../*|*/./*|*//*) spike_err "cleanup refused (unsafe path): $target"; return 2 ;;
   esac
   case "$target" in
-    "$root"/?*) ;;
+    "$root"/?*|"$lroot"/?*) ;;
     *) spike_err "cleanup refused (outside $root): $target"; return 2 ;;
   esac
   if [ -L "$target" ]; then
@@ -118,39 +128,89 @@ spike_cleanup() {
   rm -rf "$phys"
 }
 
-# spike_require_live -> exit 3 unless SPIKE_LIVE=1. Call first in every script that starts a real CLI session.
+# spike_require_live -> stop the calling SCRIPT (exit status 3) unless SPIKE_LIVE is exactly "1".
+# Call it first in every script that starts a real CLI session. SPIKE_LIVE=1 is set by the human, never by an agent.
+# It also works from inside $(...), pipes and subshells: those only end their own subshell with `exit`, so it first
+# sends TERM to the top-level script ($$), whose trap (installed above) exits 3.
 spike_require_live() {
   if [ "${SPIKE_LIVE:-}" != "1" ]; then
-    spike_err "refusing to run: this step calls a real CLI. Re-run with SPIKE_LIVE=1 to opt in."
+    spike_err "refusing to run: this step calls a real CLI. Re-run with SPIKE_LIVE=1 to opt in (human only)."
+    kill -s TERM "$$" 2>/dev/null
     exit 3
   fi
 }
 
-# spike_capture_dir <cli> -> echoes spike/captures/<cli>/<UTC timestamp>/ (created; gitignored).
+# spike_capture_dir <cli> -> echoes <captures root>/<cli>/<UTC timestamp>/ (created). The default root is
+# spike/captures, which spike/.gitignore ignores. A root inside any git repo is refused unless git ignores it.
 spike_capture_dir() {
-  local cli="${1:-}" dir
+  local cli="${1:-}" root dir anc
   case "$cli" in
     ""|*[!A-Za-z0-9._-]*|.*) spike_err "bad capture name: $cli"; return 2 ;;
   esac
-  dir="${SPIKE_CAPTURES_ROOT:-$SPIKE_DIR/captures}/$cli/$(date -u +%Y%m%dT%H%M%SZ)/"
+  root="${SPIKE_CAPTURES_ROOT:-$SPIKE_DIR/captures}"
+  case "$root" in /*) ;; *) root="$PWD/$root" ;; esac
+  dir="$root/$cli/$(date -u +%Y%m%dT%H%M%SZ)/"
+  anc="$root"
+  while [ ! -d "$anc" ] && [ "$anc" != "/" ]; do anc="$(dirname "$anc")"; done
+  if git -C "$anc" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if ! git -C "$anc" check-ignore -q -- "$dir" 2>/dev/null; then
+      spike_err "capture root is inside a git repo and not ignored by it: $root"
+      return 2
+    fi
+  fi
   mkdir -p "$dir" || return 1
   printf '%s\n' "$dir"
 }
 
-# spike_redact -> stdin to stdout. Rewrites, in this order:
-#   scratch run dir      -> <WORKTREE>
-#   absolute $HOME paths -> $HOME/...
-#   email-shaped text    -> <EMAIL>
-#   UUID-like ids        -> <ID-n>   (n is stable within one invocation, i.e. within one file)
+# spike_redact -> stdin to stdout. Rewrites, in this order (n in <ID-n> is stable within one invocation):
+#   JSON-escaped slashes (\/)   -> /
+#   scratch run dir             -> <WORKTREE>
+#   $HOME paths (incl. spaces)  -> $HOME/...
+#   any /Users/<name> or /home/<name> path -> /Users/<USER>/...
+#   any @ between two non-space tokens (emails, user@host) -> <EMAIL>
+#   UUIDs, dashed or 32 hex     -> <ID-n>
+# Over-redacting is the intended failure mode.
 spike_redact() {
   SPIKE_R_ROOT1="$(spike_root)" SPIKE_R_ROOT2="${TMPDIR:-/tmp}" SPIKE_R_HOME="${HOME:-}" awk '
     function rep(s, n,   o, i) { o = ""; for (i = 0; i < n; i++) o = o s; return o }
+    function isdelim(c) { return (c == " " || c == "\t" || index(DELIMS, c) > 0) }
+
+    # First index after a path that starts just before position j. A path stops at a quote, backslash, angle or
+    # closing bracket, at a , ; : followed by a space, and at a space unless one of the next two words has a slash
+    # (so "My Docs/secret" stays one path).
+    function tail_end(s, j,   n, c, rest, k, tok, found) {
+      n = length(s)
+      while (j <= n) {
+        c = substr(s, j, 1)
+        if (index(TERMS, c) > 0) break
+        if (c == " " || c == "\t") {
+          rest = substr(s, j + 1)
+          found = 0
+          for (k = 0; k < 2; k++) {
+            if (!match(rest, /^[^ \t]+/)) break
+            tok = substr(rest, 1, RLENGTH)
+            if (index(TERMS, substr(tok, 1, 1)) > 0) break
+            if (index(tok, "/") > 0) { found = 1; break }
+            rest = substr(rest, RLENGTH + 1)
+            if (substr(rest, 1, 1) != " ") break
+            rest = substr(rest, 2)
+          }
+          if (!found) break
+          j++
+          continue
+        }
+        if ((c == "," || c == ";" || c == ":") && (j == n || substr(s, j + 1, 1) ~ /[ \t]/)) break
+        j++
+      }
+      return j
+    }
+
     function scratch(s, root,   out, i, rest) {
       if (root == "") return s
       out = ""
       while ((i = index(s, root)) > 0) {
         rest = substr(s, i + length(root))
-        if (match(rest, /^\/[^\/[:space:]"]+/)) {
+        if (match(rest, /^\/[^\/ \t"]+/)) {
           out = out substr(s, 1, i - 1) "<WORKTREE>"
           s = substr(rest, RLENGTH + 1)
         } else {
@@ -160,60 +220,110 @@ spike_redact() {
       }
       return out s
     }
-    function homes(s, home,   out, i, rest, c, p) {
-      if (home == "" || home == "/") return s
+
+    # Replace every occurrence of head (an absolute path such as the home dir) plus the path below it.
+    function homes(s, head,   out, i, j, c) {
+      if (head == "" || head == "/") return s
       out = ""
-      while ((i = index(s, home)) > 0) {
-        p = (i > 1) ? substr(s, i - 1, 1) : ""
-        rest = substr(s, i + length(home))
-        c = substr(rest, 1, 1)
-        if (p ~ /[A-Za-z0-9_.\/-]/) {
-          out = out substr(s, 1, i + length(home) - 1)
-          s = rest
-        } else if (c == "/") {
-          match(rest, /^\/[^[:space:]"<>,;)]*/)
+      while ((i = index(s, head)) > 0) {
+        j = i + length(head)
+        c = substr(s, j, 1)
+        if (c == "/") {
+          j = tail_end(s, j + 1)
           out = out substr(s, 1, i - 1) "$HOME/..."
-          s = substr(rest, RLENGTH + 1)
-        } else if (c == "" || c ~ /[[:space:]"<>,;):]/) {
+          s = substr(s, j)
+        } else if (c == "" || (c !~ /[A-Za-z0-9_-]/ && !(c == "." && substr(s, j + 1, 1) ~ /[A-Za-z0-9]/))) {
           out = out substr(s, 1, i - 1) "$HOME/..."
-          s = rest
+          s = substr(s, j)
         } else {
-          out = out substr(s, 1, i + length(home) - 1)
-          s = rest
+          out = out substr(s, 1, j - 1)
+          s = substr(s, j)
         }
       }
       return out s
     }
-    function emails(s,   out) {
+
+    # Any other user home: base is "/Users/" or "/home/".
+    function users(s, base,   out, i, j, k) {
       out = ""
-      while (match(s, /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z][A-Za-z]+/)) {
-        out = out substr(s, 1, RSTART - 1) "<EMAIL>"
-        s = substr(s, RSTART + RLENGTH)
+      while ((i = index(s, base)) > 0) {
+        j = i + length(base)
+        k = j
+        while (k <= length(s) && index(DELIMS ":/ \t", substr(s, k, 1)) == 0) k++
+        if (k == j) {
+          out = out substr(s, 1, j - 1)
+          s = substr(s, j)
+          continue
+        }
+        if (substr(s, k, 1) == "/") k = tail_end(s, k + 1)
+        out = out substr(s, 1, i - 1) base "<USER>/..."
+        s = substr(s, k)
       }
       return out s
     }
-    function uuids(s,   out, m, k) {
+
+    function emails(s,   out, p, l, r, n) {
       out = ""
-      while (match(s, uuid_re)) {
-        m = tolower(substr(s, RSTART, RLENGTH))
-        if (!(m in ids)) { nids++; ids[m] = nids }
-        out = out substr(s, 1, RSTART - 1) "<ID-" ids[m] ">"
-        s = substr(s, RSTART + RLENGTH)
+      while ((p = index(s, "@")) > 0) {
+        l = p - 1
+        while (l >= 1 && !isdelim(substr(s, l, 1))) l--
+        n = length(s)
+        r = p + 1
+        while (r <= n && !isdelim(substr(s, r, 1))) r++
+        if (p - 1 > l && r - 1 > p) {
+          out = out substr(s, 1, l) "<EMAIL>"
+          s = substr(s, r)
+        } else {
+          out = out substr(s, 1, p)
+          s = substr(s, p + 1)
+        }
       }
       return out s
     }
+
+    function uuids(s,   pass, re, out, st, ln, m, key, pre, post) {
+      for (pass = 1; pass <= 2; pass++) {
+        re = (pass == 1) ? uuid_re : hex32_re
+        out = ""
+        while (match(s, re)) {
+          st = RSTART; ln = RLENGTH
+          m = substr(s, st, ln)
+          pre = (st > 1) ? substr(s, st - 1, 1) : substr(out, length(out), 1)
+          post = substr(s, st + ln, 1)
+          if (pass == 2 && (pre ~ /[0-9a-fA-F]/ || post ~ /[0-9a-fA-F]/)) {
+            out = out substr(s, 1, st + ln - 1)
+          } else {
+            key = tolower(m)
+            gsub(/-/, "", key)
+            if (!(key in ids)) { nids++; ids[key] = nids }
+            out = out substr(s, 1, st - 1) "<ID-" ids[key] ">"
+          }
+          s = substr(s, st + ln)
+        }
+        s = out s
+      }
+      return s
+    }
+
     BEGIN {
       h = "[0-9a-fA-F]"
       uuid_re = rep(h, 8) "-" rep(h, 4) "-" rep(h, 4) "-" rep(h, 4) "-" rep(h, 12)
+      hex32_re = rep(h, 32)
+      TERMS = "\"\047\\<>`)]}"
+      DELIMS = TERMS "(,;[{"
       root1 = ENVIRON["SPIKE_R_ROOT1"]
       root2 = ENVIRON["SPIKE_R_ROOT2"]; sub(/\/+$/, "", root2); if (root2 != "") root2 = root2 "/harness-spike"
       home = ENVIRON["SPIKE_R_HOME"]; sub(/\/+$/, "", home)
       nids = 0
     }
     {
-      line = scratch($0, root1)
+      line = $0
+      gsub("\\\\/", "/", line)
+      line = scratch(line, root1)
       if (root2 != root1) line = scratch(line, root2)
       line = homes(line, home)
+      line = users(line, "/Users/")
+      line = users(line, "/home/")
       line = emails(line)
       line = uuids(line)
       print line
@@ -237,20 +347,44 @@ spike_resolve_path() {
   printf '%s/%s\n' "$d" "$(basename "$p")"
 }
 
+# _spike_provider_cli_name <command> -> 0 if the command (or what it resolves to) is a provider CLI binary name.
+_spike_provider_cli_name() {
+  local cmd="$1" full base p
+  full="$(command -v -- "$cmd" 2>/dev/null)" || full="$cmd"
+  for p in "$cmd" "$full" "$(spike_resolve_path "$full" 2>/dev/null)"; do
+    base="$(basename -- "$p" 2>/dev/null)"
+    base="${base%.exe}"
+    case "$base" in
+      claude|codex|grok|gemini|kimi) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 # spike_run_timeout <seconds> <outfile> <cmd> [args...]
-# Runs cmd with stdin closed, stdout+stderr appended to <outfile> (use /dev/null to discard).
+# Runs cmd with stdin closed, a scrubbed environment (PATH HOME TMPDIR LANG TERM USER LOGNAME only), in its own process group,
+# stdout+stderr appended to <outfile> (use /dev/null to discard). The whole group is killed on timeout.
 # Returns the command's exit code, or 124 if it was killed for taking too long.
+# A provider CLI may be started only for --version / auth status / login status unless SPIKE_LIVE=1.
 _spike_run_timeout_body() {
   local secs="$1" out="$2" pid ticks=0 limit rc
+  local envargs
   shift 2
   limit=$((secs * 10))
-  "$@" </dev/null >>"$out" 2>&1 &
+  # USER/LOGNAME are passed because a CLI looks up its own stored login under the account name; without them
+  # "auth status" wrongly reports signed out. They carry no credentials.
+  envargs=(PATH="${PATH:-/usr/bin:/bin}" HOME="${HOME:-/}" TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-C}" TERM="${TERM:-dumb}")
+  if [ -n "${USER:-}" ]; then envargs[${#envargs[@]}]="USER=$USER"; fi
+  if [ -n "${LOGNAME:-}" ]; then envargs[${#envargs[@]}]="LOGNAME=$LOGNAME"; fi
+  perl -e 'setpgrp(0, 0); exec @ARGV' -- env -i "${envargs[@]}" "$@" </dev/null >>"$out" 2>&1 &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$ticks" -ge "$limit" ]; then
-      kill "$pid" 2>/dev/null
-      sleep 0.2
-      kill -9 "$pid" 2>/dev/null
+      kill -s TERM -- "-$pid" 2>/dev/null
+      kill -s TERM "$pid" 2>/dev/null
+      sleep 0.3
+      kill -s KILL -- "-$pid" 2>/dev/null
+      kill -s KILL "$pid" 2>/dev/null
       { wait "$pid"; } 2>/dev/null
       return 124
     fi
@@ -259,10 +393,31 @@ _spike_run_timeout_body() {
   done
   wait "$pid"
   rc=$?
+  # Sweep anything the command left running in its group.
+  kill -s KILL -- "-$pid" 2>/dev/null
   return "$rc"
 }
 
 # The subshell keeps the shell's own "Terminated" job notice out of the caller's stderr.
 spike_run_timeout() {
+  local secs="${1:-}" out="${2:-}"
+  if [ "$#" -lt 3 ]; then
+    spike_err "usage: spike_run_timeout <seconds> <outfile> <cmd> [args...]"
+    return 2
+  fi
+  case "$secs" in ""|*[!0-9]*) spike_err "bad timeout: $secs"; return 2 ;; esac
+  if ! command -v perl >/dev/null 2>&1; then
+    spike_err "perl is required (used to put the command in its own process group)"
+    return 2
+  fi
+  if _spike_provider_cli_name "$3"; then
+    if [ "$#" -eq 4 ] && [ "$4" = "--version" ]; then
+      :
+    elif [ "$#" -eq 5 ] && { [ "$4 $5" = "auth status" ] || [ "$4 $5" = "login status" ]; }; then
+      :
+    else
+      spike_require_live
+    fi
+  fi
   ( _spike_run_timeout_body "$@" ) 2>/dev/null
 }
