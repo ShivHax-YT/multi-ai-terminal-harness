@@ -4,17 +4,21 @@
 
 SHELL := /bin/bash
 # No .ONESHELL: macOS ships GNU make 3.81, which lacks it, so multi-line recipes use backslashes.
-.PHONY: check-fast check compliance compliance-selftest stack-fast stack-full
+.PHONY: check-fast check compliance compliance-selftest spike-test stack-fast stack-full
 
 check-fast: compliance stack-fast
 
-check: compliance compliance-selftest stack-fast stack-full
+check: compliance compliance-selftest spike-test stack-fast stack-full
 
 compliance:
 	@scripts/ci/compliance-scan.sh
 
 compliance-selftest:
 	@tests/compliance/selftest.sh
+
+# Phase 0 spike suites (offline; none sets SPIKE_LIVE). Not in check-fast: together they take a few minutes.
+spike-test:
+	@set -eo pipefail; for t in spike/tests/*.sh; do echo "== $$t"; /bin/bash "$$t" 2>/dev/null | tail -1; done
 
 stack-fast:
 	@set -e; \
