@@ -105,6 +105,10 @@ registered in each CLI's own config. It never exposes CLI home directories (rule
 - Auto-approve flags only inside worktrees, never in the user's main checkout. Destructive commands always ask.
 - API keys only in Keychain (Credential Manager on Windows). Redacted from logs. Briefs scanned for secrets before
   they go to another vendor.
+- Some official installers put the CLI binary inside the CLI's own home directory (on the dev Mac, `codex` resolves to
+  a path under its packages folder there). The file-access layer still denies those directories. The binary verifier
+  (rule 6) gets one narrow exception: it may resolve, `codesign`-check and execute the CLI binary path itself, and never
+  read any other file in that directory. A test proves that a sibling file (a credential canary) stays unreadable.
 
 ## Stack
 
