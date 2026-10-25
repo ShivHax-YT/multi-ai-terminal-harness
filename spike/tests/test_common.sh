@@ -1,15 +1,32 @@
-#!/usr/bin/env bash
-# Tests for spike/lib/common.sh. Run: /bin/bash spike/tests/test_common.sh  (exit 0 = all passed)
+#!/bin/bash
+# Tests for spike/lib/common.sh and spike/lib/runner.pl. Run: /bin/bash spike/tests/test_common.sh  (exit 0 = all passed)
 # Uses a private TMPDIR so it never touches a real spike run.
 #
-# Round 6: registration (spike_mark_verified) runs the pinned-signer check, so every child shell in this file sources a
-# SANDBOX COPY of common.sh whose only change is the readonly CODESIGN_BIN line, pointed at a fake codesign. The main
-# shell sources the real file (for the capture-root and other main-shell assertions). No real codesign or provider CLI
-# is run here. Fixtures that must "run" are Mach-O-headed shell scripts: on Linux, env hands a file it cannot load to
-# /bin/sh (the execvp ENOEXEC fallback), so their bodies run; this is test-only and says nothing about real Mach-O files.
+# Round 7 SANDBOX GUARD (a round-6 fixture once overwrote a system tool through a symlink):
+#   - set -o noclobber; every fixture write goes through sbx_put, which refuses a relative path, a physical parent outside
+#     $SANDBOX, an existing symlink and a file with more than one link; symlinks are made with sbx_ln (ln -sfn) and copies
+#     with sbx_cp. A refusal is a FAIL and the suite fails.
+#   - destructive negative tests (spike_cleanup on / and on the real $HOME) run with rm shadowed by a recorder, and the
+#     decoy variants point at directories inside the sandbox.
+#   - an EXIT tripwire hashes the host tools this suite runs and fails the suite if any of them changed.
+#
+# Child shells source a SANDBOX COPY of common.sh and runner.pl whose only change is the codesign constant of runner.pl,
+# pointed at a fake codesign. The main shell sources the real file. No real codesign or provider CLI is run here.
+# Fixtures that must "run" are Mach-O-headed shell scripts: on Linux exec hands a file it cannot load to /bin/sh (the
+# execvp ENOEXEC fallback), so their bodies run; this is test-only and says nothing about real Mach-O files.
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+set -o noclobber
+
+HERE="$(CDPATH= cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 COMMON_REAL="$HERE/../lib/common.sh"
+RUNNER_REAL="$HERE/../lib/runner.pl"
+
+# Host tools are found once with the caller's PATH; then PATH is pinned so a provider CLI directory (for example one that
+# holds the real claude) is never on it.
+JQ_BIN="$(command -v jq)"
+if [ -z "$JQ_BIN" ]; then echo "jq is required to run this suite" >&2; exit 1; fi
+PATH="/usr/bin:/bin:$(dirname -- "$JQ_BIN")"
+export PATH
 
 PASS=0
 FAIL=0
@@ -29,6 +46,95 @@ has() { # has <name> <haystack> <needle>
 lacks() { # lacks <name> <haystack> <needle>
   case "$2" in *"$3"*) bad "$1 (found [$3] in [$2])" ;; *) ok "$1" ;; esac
 }
+
+# ---- sandbox and guard ------------------------------------------------------------------------------------------------
+SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/spiketest.XXXXXX")" || exit 1
+SANDBOX="$(CDPATH= cd -P -- "$SANDBOX" && pwd -P)"
+export TMPDIR="$SANDBOX"
+unset SPIKE_LIVE
+VIOLATIONS="$SANDBOX/.violations"
+TRIP_LIST=""
+
+sha_of() { /usr/bin/perl -MDigest::SHA -e 'open my $f, "<", $ARGV[0] or exit 1; binmode $f; print Digest::SHA->new(256)->addfile($f)->hexdigest' -- "$1"; }
+link_count() { /usr/bin/perl -e 'my @s = stat($ARGV[0]); print $s[3]' -- "$1"; }
+trip_add() { # trip_add <host tool name>: remember the hash of the file the name resolves to
+  local p
+  p="$(command -v "$1")" || return 0
+  case "$p" in /*) ;; *) return 0 ;; esac
+  TRIP_LIST="$TRIP_LIST$p $(sha_of "$p")
+"
+}
+trip_check() {
+  local line p h now bad_n=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    p="${line% *}"
+    h="${line##* }"
+    now="$(sha_of "$p")"
+    if [ "$now" != "$h" ]; then
+      printf 'FAIL host tool changed during the run: %s\n' "$p"
+      bad_n=$((bad_n + 1))
+    fi
+  done <<EOF
+$TRIP_LIST
+EOF
+  return "$bad_n"
+}
+for t in bash env perl git jq awk sed tr cut head od cat cp mv ln chmod mkdir rm touch printf true false sleep ls date mktemp seq wc ps grep dirname basename kill id; do trip_add "$t"; done
+
+finish() {
+  local rc=$? viol=0
+  trip_check
+  local trc=$?
+  if [ -s "$VIOLATIONS" ]; then viol=1; printf 'FAIL the sandbox guard refused a write:\n'; cat "$VIOLATIONS"; fi
+  rm -rf "$SANDBOX"
+  if [ "$trc" -ne 0 ] || [ "$viol" -ne 0 ]; then
+    [ "$rc" -ne 0 ] || exit 1
+  fi
+}
+trap finish EXIT
+
+# A refusal is recorded in a file because sbx_put usually runs in a pipeline (a subshell).
+sbx_refuse() { printf 'sandbox guard refused: %s\n' "$1" >> "$VIOLATIONS"; return 1; }
+sbx_parent_ok() { # sbx_parent_ok <path>: the PHYSICAL parent directory must be inside the sandbox
+  local f="$1" dir phys
+  case "$f" in /*) ;; *) sbx_refuse "relative path $f"; return 1 ;; esac
+  dir="${f%/*}"
+  [ -n "$dir" ] || dir="/"
+  phys="$(CDPATH= cd -P -- "$dir" 2>/dev/null && pwd -P)" || { sbx_refuse "no parent for $f"; return 1; }
+  case "$phys/" in "$SANDBOX"/*) ;; *) sbx_refuse "parent of $f is outside the sandbox ($phys)"; return 1 ;; esac
+  return 0
+}
+sbx_put() { # sbx_put <file>: stdin -> file (inside the sandbox only; never through a symlink or a hard link)
+  local f="$1"
+  sbx_parent_ok "$f" || { cat >/dev/null; return 1; }
+  if [ -L "$f" ]; then sbx_refuse "$f is a symlink"; cat >/dev/null; return 1; fi
+  if [ -e "$f" ] && [ "$(link_count "$f")" != "1" ]; then sbx_refuse "$f has more than one link"; cat >/dev/null; return 1; fi
+  cat >| "$f"
+}
+sbx_ln() { # sbx_ln <target> <link>: ln -sfn into the sandbox
+  sbx_parent_ok "$2" || return 1
+  ln -sfn -- "$1" "$2"
+}
+sbx_cp() { # sbx_cp <src> <dst>: a copy that cannot write through a link; keeps the executable bit
+  sbx_put "$2" < "$1" || return 1
+  chmod +x "$2"
+}
+sbx_mkdir() { # sbx_mkdir <dir>...: mkdir -p, but the nearest EXISTING ancestor must physically be inside the sandbox
+  local d anc phys
+  for d in "$@"; do
+    case "$d" in /*) ;; *) sbx_refuse "relative directory $d"; return 1 ;; esac
+    anc="$d"
+    while [ ! -d "$anc" ] && [ "$anc" != "/" ]; do
+      anc="${anc%/*}"
+      [ -n "$anc" ] || anc="/"
+    done
+    phys="$(CDPATH= cd -P -- "$anc" 2>/dev/null && pwd -P)" || { sbx_refuse "no ancestor for $d"; return 1; }
+    case "$phys/" in "$SANDBOX"/*) ;; *) sbx_refuse "directory $d resolves outside the sandbox ($phys)"; return 1 ;; esac
+    mkdir -p -- "$d"
+  done
+}
+
 # alive <pid>: 0 if the process is still running. kill -0 alone is not enough: a killed process whose parent is already
 # gone stays a zombie (state Z) until PID 1 reaps it, and kill -0 succeeds on a zombie. A zombie has exited and cannot
 # run code, so it counts as gone. If ps cannot report a state, the process counts as alive (fail closed).
@@ -41,8 +147,7 @@ alive() {
   return 0
 }
 
-# ours <pid> <pattern>: 0 if <pid> is alive and not a zombie AND its command line contains <pattern>. A reused pid, whose
-# command line differs, does not count.
+# ours <pid> <pattern>: 0 if <pid> is alive and not a zombie AND its command line contains <pattern>.
 ours() {
   [ -n "$1" ] || return 1
   alive "$1" || return 1
@@ -50,10 +155,8 @@ ours() {
   return 1
 }
 
-# gone_within <tenths> <pid>...: poll alive() every 0.1 s and return 0 as soon as none of the pids is alive. A zombie and
-# an empty pid count as gone. After <tenths> tenths of a second with a pid still alive, return 1 and print one ps line per
-# survivor. This replaces fixed post-signal sleeps: PID 1 can reap a re-parented zombie late on a loaded machine (about
-# 1.6 s seen here). A genuine orphan stays alive past the deadline and still fails.
+# gone_within <tenths> <pid>...: poll alive() every 0.1 s and return 0 as soon as none of the pids is alive. After <tenths>
+# tenths of a second with a pid still alive, return 1 and print one ps line per survivor.
 gone_within() {
   local limit="$1" n=0 p any
   shift
@@ -83,38 +186,35 @@ gone_within() {
 # mkmacho <path> < body: a fixture that starts with the four bytes of a 64-bit Mach-O (cf fa ed fe), then a newline, then
 # the shell body read from stdin. It is executable. It is NOT a Mach-O: it exists to pass the magic check of a test.
 mkmacho() {
-  local f="$1"
-  { printf '\317\372\355\376\n'; cat; } > "$f"
-  chmod +x "$f"
+  { printf '\317\372\355\376\n'; cat; } | sbx_put "$1"
+  chmod +x "$1"
 }
-
-# child <code>: run code in a fresh /bin/bash with common.sh sourced and SPIKE_LIVE unset unless the caller exported it.
-child() {
-  /bin/bash -c '. "$1"; eval "$2"' _ "$COMMON_REAL" "$1"
-}
-
-SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/spiketest.XXXXXX")" || exit 1
-SANDBOX="$(cd "$SANDBOX" && pwd -P)"
-export TMPDIR="$SANDBOX"
-unset SPIKE_LIVE
-trap 'rm -rf "$SANDBOX"' EXIT
 
 # ---- sandbox copy with the fake codesign (rule 6 tests) -------------------------------------------------------------
-# The fake reads its mode from $FSDIR/mode, logs its arguments to $FSDIR/log, and picks the team by the path it is given
-# (a path containing "codex" is signed by the OpenAI team, anything else by the Anthropic team).
+# The fake reads its mode from $FSDIR/mode and logs its arguments to $FSDIR/log. It picks the signing team from a
+# "signer: codex" marker in the CONTENT of the target (the last argument), else from the BASENAME of that argument
+# (names starting with codex are signed by the OpenAI team, anything else by the Anthropic team). It never looks at the rest
+# of the command line: the sandbox path contains the word claude.
 FSDIR="$SANDBOX/fakesign"
 FSCS="$FSDIR/codesign"
-mkdir -p "$FSDIR"
-printf 'good\n' > "$FSDIR/mode"
-cat > "$FSCS" <<EOF
+sbx_mkdir "$FSDIR"
+printf 'good\n' | sbx_put "$FSDIR/mode"
+fsmode() { printf '%s\n' "$1" | sbx_put "$FSDIR/mode"; }
+sbx_put "$FSCS" <<EOF
 #!/bin/sh
 echo "\$*" >> "$FSDIR/log"
 MODE="\$(cat "$FSDIR/mode" 2>/dev/null)"
+for a in "\$@"; do last="\$a"; done
+base="\${last##*/}"
 TEAM=Q6L2SF6YDW
-case "\$*" in *codex*) TEAM=2DC432GLL2 ;; esac
+case "\$base" in codex*) TEAM=2DC432GLL2 ;; esac
+if [ -f "\$last" ]; then
+  case "\$(cat "\$last" 2>/dev/null)" in *"signer: codex"*) TEAM=2DC432GLL2 ;; *"signer: claude"*) TEAM=Q6L2SF6YDW ;; esac
+fi
 case "\$MODE" in
   unsigned) echo "code object is not signed at all" >&2; exit 1 ;;
   weird) echo "weird failure" >&2; exit 3 ;;
+  slow) sleep 2 ;;
 esac
 case "\$1" in
   --verify)
@@ -122,7 +222,7 @@ case "\$1" in
     exit 0 ;;
   -dv)
     case "\$MODE" in
-      good) printf 'Authority=Developer ID Application: Fake Dev (%s)\nAuthority=Developer ID Certification Authority\nTeamIdentifier=%s\n' "\$TEAM" "\$TEAM" >&2 ;;
+      good|slow) printf 'Authority=Developer ID Application: Fake Dev (%s)\nAuthority=Developer ID Certification Authority\nTeamIdentifier=%s\n' "\$TEAM" "\$TEAM" >&2 ;;
       forged) printf 'Authority=Developer ID Application: Fake Dev (%s)\nTeamIdentifier=%s\n' "\$TEAM" "\$TEAM" >&2 ;;
       adhoc) printf 'Signature=adhoc\nTeamIdentifier=not set\n' >&2 ;;
       wrongteam) printf 'Authority=Developer ID Application: Evil Corp (WRONGTEAM1)\nTeamIdentifier=WRONGTEAM1\n' >&2 ;;
@@ -133,14 +233,44 @@ esac
 exit 1
 EOF
 chmod +x "$FSCS"
-COMMON="$SANDBOX/ut/spike/lib/common.sh"
-mkdir -p "$(dirname "$COMMON")"
-sed "s|^readonly CODESIGN_BIN=.*|readonly CODESIGN_BIN=\"$FSCS\"|" "$COMMON_REAL" > "$COMMON"
-has "sandbox copy points the codesign constant at the fake" "$(cat "$COMMON")" "readonly CODESIGN_BIN=\"$FSCS\""
-has "the shipped common.sh keeps the fixed codesign path" "$(cat "$COMMON_REAL")" 'readonly CODESIGN_BIN="/usr/bin/codesign"'
+UTLIB="$SANDBOX/ut/spike/lib"
+sbx_mkdir "$UTLIB"
+COMMON="$UTLIB/common.sh"
+RUNNER="$UTLIB/runner.pl"
+sbx_cp "$COMMON_REAL" "$COMMON"
+sed "s|^use constant CODESIGN_BIN => .*|use constant CODESIGN_BIN => \"$FSCS\";|" "$RUNNER_REAL" | sbx_put "$RUNNER"
+has "sandbox runner.pl points the codesign constant at the fake" "$(cat "$RUNNER")" "use constant CODESIGN_BIN => \"$FSCS\";"
+eq "the sandbox runner.pl differs from the shipped one only in the codesign constant (2 changed lines)" "2" "$(diff "$RUNNER_REAL" "$RUNNER" | grep -c '^[<>]')"
+has "the shipped runner.pl keeps the fixed codesign path" "$(cat "$RUNNER_REAL")" 'use constant CODESIGN_BIN => "/usr/bin/codesign";'
+lacks "the shipped common.sh defines no codesign constant" "$(cat "$COMMON_REAL")" "readonly CODESIGN_BIN"
+for f in "$COMMON_REAL" "$HERE/../preflight.sh" "$HERE/test_common.sh" "$HERE/test_preflight.sh"; do
+  case "$(head -n 1 "$f")" in
+    "#!/bin/bash") ok "shebang is /bin/bash (no PATH lookup for the interpreter): $(basename "$f")" ;;
+    *) bad "shebang is /bin/bash (no PATH lookup for the interpreter): $(basename "$f")" ;;
+  esac
+done
+eq "the helper's shebang is the constant /usr/bin/perl" "#!/usr/bin/perl" "$(head -n 1 "$RUNNER_REAL")"
+eq "no shipped script uses env to find an interpreter" "0" "$(grep -c 'usr/bin/env \(bash\|perl\|sh\)' "$COMMON_REAL" "$HERE/../preflight.sh" "$RUNNER_REAL" | awk -F: '{s += $2} END {print s + 0}')"
+eq "common.sh starts no program named perl by name (only the constant interpreter path)" "0" "$(grep -v '^[[:space:]]*#' "$COMMON_REAL" | grep -Ec '(^|[ ;(`|])perl([ ]|$)')"
 
 # shellcheck disable=SC1090
 . "$COMMON_REAL"
+
+# libp <perl expression> [args...]: run runner.pl as a LIBRARY (it only defines functions when loaded) and print the result.
+libp() {
+  local code="$1"
+  shift
+  /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/perl -e 'my $c = shift; my $f = shift; require $f; my @r = eval $c; die $@ if $@; print join("|", @r), "\n"' "$code" "$RUNNER_REAL" "$@"
+}
+libt() { # libt <perl expression> [args...]: exit status 0 when the expression is true
+  local code="$1"
+  shift
+  /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/perl -e 'my $c = shift; my $f = shift; require $f; my $r = eval $c; die $@ if $@; exit($r ? 0 : 1)' "$code" "$RUNNER_REAL" "$@"
+}
+# rawhelper <subcommand> [args...]: the sandbox helper started like common.sh starts it, with TMPDIR in the sandbox.
+rawhelper() {
+  /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C SPIKE_IN_PATH="$PATH" SPIKE_IN_TMPDIR="$SANDBOX" SPIKE_IN_HOME="${RAW_HOME:-$SANDBOX/home}" /usr/bin/perl "$RUNNER" "$@"
+}
 
 ROOT="$(spike_root)"
 eq "spike_root is under the private TMPDIR" "$SANDBOX/harness-spike" "$ROOT"
@@ -157,7 +287,7 @@ WT="$(spike_worktree_add "$REPO" alpha)"
 eq "worktree path is <repo>-wt/<name>" "$REPO-wt/alpha" "$WT"
 check "worktree dir exists" test -d "$WT"
 eq "worktree is on branch spike/alpha" "spike/alpha" "$(git -C "$WT" rev-parse --abbrev-ref HEAD)"
-check "worktree add rejects a bad name" bash -c '. "$1"; ! spike_worktree_add "$2" "../evil"' _ "$COMMON_REAL" "$REPO"
+check "worktree add rejects a bad name" /bin/bash -c '. "$1"; ! spike_worktree_add "$2" "../evil"' _ "$COMMON" "$REPO"
 
 spike_cleanup "$RUN"
 check "cleanup removed the run dir" test ! -e "$RUN"
@@ -168,7 +298,7 @@ PHYS_TMP="$(cd /tmp && pwd -P)"
 eq "empty TMPDIR falls back to /tmp" "$PHYS_TMP/harness-spike" "$(TMPDIR='' spike_root)"
 eq "unset TMPDIR falls back to /tmp" "$PHYS_TMP/harness-spike" "$(unset TMPDIR; spike_root)"
 
-mkdir -p "$SANDBOX/with space"
+sbx_mkdir "$SANDBOX/with space"
 (
   export TMPDIR="$SANDBOX/with space"
   R="$(spike_scratch_repo)" || exit 1
@@ -179,8 +309,8 @@ mkdir -p "$SANDBOX/with space"
 )
 eq "TMPDIR with spaces: repo, worktree and cleanup work" "0" "$?"
 
-mkdir -p "$SANDBOX/real-tmp"
-ln -s "$SANDBOX/real-tmp" "$SANDBOX/link-tmp"
+sbx_mkdir "$SANDBOX/real-tmp"
+sbx_ln "$SANDBOX/real-tmp" "$SANDBOX/link-tmp"
 (
   export TMPDIR="$SANDBOX/link-tmp"
   [ "$(spike_root)" = "$SANDBOX/real-tmp/harness-spike" ] || exit 1
@@ -194,8 +324,8 @@ eq "symlinked TMPDIR: root is physical, cleanup accepts the logical spelling" "0
 
 # --- cleanup refuses anything outside the spike root -----------------------------------------------------------------
 OUTSIDE="$SANDBOX/outside"
-mkdir -p "$OUTSIDE/keep"
-printf 'x\n' > "$OUTSIDE/keep/file"
+sbx_mkdir "$OUTSIDE/keep"
+printf 'x\n' | sbx_put "$OUTSIDE/keep/file"
 spike_cleanup "$OUTSIDE" 2>/dev/null
 eq "cleanup refuses a path outside the spike root (rc)" "2" "$?"
 check "outside path is untouched" test -f "$OUTSIDE/keep/file"
@@ -203,21 +333,44 @@ spike_cleanup "$ROOT" 2>/dev/null
 eq "cleanup refuses the spike root itself (rc)" "2" "$?"
 spike_cleanup "" 2>/dev/null
 eq "cleanup refuses an empty path (rc)" "2" "$?"
-spike_cleanup "/" 2>/dev/null
-eq "cleanup refuses / (rc)" "2" "$?"
-spike_cleanup "$HOME" 2>/dev/null
-eq "cleanup refuses \$HOME (rc)" "2" "$?"
-mkdir -p "$ROOT/run-x"
+# The destructive negatives run with rm shadowed by a recorder, so even a defect could not remove / or the real home.
+RMLOG="$SANDBOX/rm-called"
+(
+  rm() { printf '%s\n' "$*" >> "$RMLOG"; }
+  spike_cleanup "/" 2>/dev/null
+  rc1=$?
+  spike_cleanup "$HOME" 2>/dev/null
+  rc2=$?
+  [ "$rc1" = 2 ] && [ "$rc2" = 2 ]
+)
+eq "cleanup refuses / and the real \$HOME (rc 2 each, rm shadowed)" "0" "$?"
+check "cleanup of / and \$HOME called rm zero times" test ! -e "$RMLOG"
+# Decoy variants: the same refusals against directories whose real path is inside the sandbox.
+DECOY="$SANDBOX/decoy-home"
+sbx_mkdir "$DECOY/keep"
+printf 'x\n' | sbx_put "$DECOY/keep/file"
+(HOME="$DECOY"; spike_cleanup "$HOME" 2>/dev/null)
+eq "cleanup refuses a decoy home (rc)" "2" "$?"
+check "the decoy home is untouched" test -f "$DECOY/keep/file"
+sbx_mkdir "$ROOT/run-x"
 spike_cleanup "$ROOT/run-x/../../outside" 2>/dev/null
 eq "cleanup refuses .. traversal (rc)" "2" "$?"
 check "traversal target is untouched" test -f "$OUTSIDE/keep/file"
-ln -s "$OUTSIDE" "$ROOT/run-link"
+sbx_ln "$OUTSIDE" "$ROOT/run-link"
 spike_cleanup "$ROOT/run-link" 2>/dev/null
 eq "cleanup refuses a symlink under the root (rc)" "2" "$?"
 check "symlink target is untouched" test -f "$OUTSIDE/keep/file"
 rm -f "$ROOT/run-link"
+# Round 7, finding 3: a trailing newline must not make the cleanup act on a different path than it checked.
+sbx_mkdir "$ROOT/run-nl"
+printf 'x\n' | sbx_put "$ROOT/run-nl/file"
+spike_cleanup "$ROOT/run-nl"$'\n' 2>/dev/null
+eq "cleanup refuses a path with a trailing newline (rc)" "2" "$?"
+check "the directory named without the newline is untouched" test -f "$ROOT/run-nl/file"
+spike_cleanup "$ROOT/run-nl"
+check "cleanup removes a plain run dir under the root" test ! -e "$ROOT/run-nl"
 spike_cleanup "$ROOT/run-x"
-check "cleanup removes a plain run dir under the root" test ! -e "$ROOT/run-x"
+check "cleanup removes another plain run dir under the root" test ! -e "$ROOT/run-x"
 
 # --- spike_require_live (rule 1): must stop the whole calling script, not just its own subshell -----------------------
 out="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_require_live; echo CONTINUED' _ "$COMMON" 2>/dev/null)"
@@ -247,12 +400,12 @@ lacks "require_live in a subshell stops the caller" "$out" "CONTINUED"
 
 # spike_run_timeout refuses a provider CLI for anything but version/status unless SPIKE_LIVE=1.
 FAKE="$SANDBOX/fakecli"
-mkdir -p "$FAKE"
+sbx_mkdir "$FAKE"
 for n in claude codex; do
-  printf '#!/bin/sh\ntouch "%s/ran-$$"\nexit 0\n' "$FAKE" > "$FAKE/$n"
+  printf '#!/bin/sh\ntouch "%s/ran-$$"\nexit 0\n' "$FAKE" | sbx_put "$FAKE/$n"
   chmod +x "$FAKE/$n"
 done
-cat > "$FAKE/claude.exe" <<EOF
+sbx_put "$FAKE/claude.exe" <<EOF
 #!/bin/sh
 touch "$FAKE/ran-exe-\$\$"
 EOF
@@ -268,8 +421,8 @@ eq "run_timeout also guards a claude.exe name (rc)" "3" "$?"
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/codex" exec hi' _ "$COMMON" "$FAKE" 2>/dev/null
 eq "run_timeout refuses codex exec without SPIKE_LIVE (rc)" "3" "$?"
 eq "refused CLIs were not started" "0" "$(ran)"
-# Round 4 (decision 1d): an UNVERIFIED claude/codex is refused by spike_run_timeout even for its status shapes. Only
-# spike_run_status runs those, and only for a private copy that preflight registered (see the status tests below).
+# An UNVERIFIED claude/codex is refused by spike_run_timeout even for its status shapes. Only spike_run_status runs those,
+# and only for a private copy that registration produced (see the status tests below).
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/claude" --version' _ "$COMMON" "$FAKE" 2>/dev/null
 eq "run_timeout refuses an unverified claude --version without SPIKE_LIVE (rc)" "3" "$?"
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/claude" auth status' _ "$COMMON" "$FAKE" 2>/dev/null
@@ -277,18 +430,20 @@ eq "run_timeout refuses an unverified claude auth status without SPIKE_LIVE (rc)
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/codex" login status' _ "$COMMON" "$FAKE" 2>/dev/null
 eq "run_timeout refuses an unverified codex login status without SPIKE_LIVE (rc)" "3" "$?"
 eq "refused unverified status calls did not start the CLIs" "0" "$(ran)"
-# Round 6 (item 2): the registered copies are Mach-O-headed fixtures whose signer passes the fake pinned check.
+# The registered copies are Mach-O-headed fixtures whose signer passes the fake pinned check. Registration COPIES the source
+# into the private verify directory; spike_run_status takes the copy (SPIKE_VERIFIED_COPY), never the source.
 REG="$FAKE/reg"
-mkdir -p "$REG"
+sbx_mkdir "$REG"
 mkmacho "$REG/claude" <<EOF
 touch "$FAKE/ran-\$\$"
 exit 0
 EOF
 mkmacho "$REG/codex" <<EOF
+# signer: codex
 touch "$FAKE/ran-\$\$"
 exit 0
 EOF
-env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude && spike_mark_verified "$2/codex" codex && spike_run_status 5 /dev/null "$2/claude" --version && spike_run_status 5 /dev/null "$2/claude" auth status && spike_run_status 5 /dev/null "$2/codex" login status' _ "$COMMON" "$REG" 2>/dev/null
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude && c1="$SPIKE_VERIFIED_COPY" && spike_mark_verified "$2/codex" codex && c2="$SPIKE_VERIFIED_COPY" && spike_run_status 5 /dev/null "$c1" --version && spike_run_status 5 /dev/null "$c1" auth status && spike_run_status 5 /dev/null "$c2" login status' _ "$COMMON" "$REG" 2>/dev/null
 eq "status runner runs registered verified copies (claude --version, claude auth status, codex login status) without SPIKE_LIVE (rc)" "0" "$?"
 eq "allowed status calls did start the verified copies" "3" "$(ran)"
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/claude" --version extra' _ "$COMMON" "$FAKE" 2>/dev/null
@@ -301,8 +456,8 @@ eq "run_timeout runs a provider CLI prompt with SPIKE_LIVE=1" "0" "$?"
 eq "live provider CLI was started" "1" "$(ran)"
 
 # --- the gate is default-deny: indirect launches of a provider CLI are refused (rule 1) ------------------------------
-cp "$FAKE/claude" "$FAKE/renamed"
-cp "$FAKE/claude" "$FAKE/mytool"
+sbx_cp "$FAKE/claude" "$FAKE/renamed"
+sbx_cp "$FAKE/claude" "$FAKE/mytool"
 rm -f "$FAKE"/ran-*
 # denied <name> <code>: with SPIKE_LIVE unset and the fake claude first on PATH, <code> must exit 3, never reach the
 # line after it, and never start the fake.
@@ -332,8 +487,10 @@ for w in zsh dash ksh xargs nohup command exec time nice perl python python3 nod
   denied "launcher '$w'" "spike_run_timeout 5 /dev/null $w claude -p hi"
 done
 denied "spike_run_live without SPIKE_LIVE" "spike_run_live 5 /dev/null '$FAKE/claude' -p hi"
-denied "spike_run_status with a prompt" "spike_run_status 5 /dev/null '$REG/claude' -p hi"
-denied "spike_run_status with --version and extra args" "spike_run_status 5 /dev/null '$REG/claude' --version -p"
+denied "spike_run_status with a prompt (unregistered path)" "spike_run_status 5 /dev/null '$REG/claude' -p hi"
+denied "spike_run_status with --version and extra args (unregistered path)" "spike_run_status 5 /dev/null '$REG/claude' --version -p"
+denied "spike_run_status with a prompt on a REGISTERED copy" "spike_mark_verified '$REG/claude' claude; spike_run_status 5 /dev/null \"\$SPIKE_VERIFIED_COPY\" -p hi"
+denied "spike_run_status with --version and extra args on a REGISTERED copy" "spike_mark_verified '$REG/claude' claude; spike_run_status 5 /dev/null \"\$SPIKE_VERIFIED_COPY\" --version -p"
 
 # ...while the harmless shapes still work without SPIKE_LIVE.
 okrun() { # okrun <name> <code>: must not be stopped by the gate
@@ -344,25 +501,24 @@ okrun() { # okrun <name> <code>: must not be stopped by the gate
 okrun "true" 'spike_run_timeout 5 /dev/null true'
 okrun "echo hello" 'spike_run_timeout 5 /dev/null echo hello'
 okrun "sleep" 'spike_run_timeout 5 /dev/null sleep 0'
-# Round 4 (decision 1a): jq is no longer a harmless identity; it is called directly by preflight, never through the runner.
-denied "jq --version needs the gate (jq left the ungated list, rule 1)" "spike_run_timeout 5 /dev/null jq --version"
+# jq is not a harmless identity; it is probed through spike_run_timed, never through the runner.
+denied "jq --version needs the gate (jq is not on the ungated list, rule 1)" "spike_run_timeout 5 /dev/null jq --version"
 okrun "git --version" 'spike_run_timeout 5 /dev/null git --version'
-# Round 4 (decision 1c) and round 6 (item 3): codesign is ungated only for the read-only shapes, from a system directory,
-# and only on a path that resolves inside the private verify directory. Without a system codesign (Linux) the identity
-# check fails, so the shapes need the gate there.
+# codesign is ungated only for the read-only shapes, from a system directory, and only on a path that resolves inside the
+# private verify directory the helper made. Without a system codesign (Linux) the identity check fails, so the shapes need
+# the gate there.
 if [ -x /usr/bin/codesign ]; then
-  okrun "codesign --verify --strict <path inside the verify dir> (system codesign)" "spike_set_verify_dir '$FAKE'; spike_run_timeout 5 /dev/null codesign --verify --strict '$FAKE/claude'"
-  okrun "codesign -dv --verbose=2 <path inside the verify dir> (system codesign)" "spike_set_verify_dir '$FAKE'; spike_run_timeout 5 /dev/null codesign -dv --verbose=2 '$FAKE/claude'"
+  okrun "codesign --verify --strict <path inside the verify dir> (system codesign)" 'spike_verify_init; : > "$(spike_verify_dir)/claude"; spike_run_timeout 5 /dev/null codesign --verify --strict "$(spike_verify_dir)/claude"'
+  okrun "codesign -dv --verbose=2 <path inside the verify dir> (system codesign)" 'spike_verify_init; : > "$(spike_verify_dir)/claude"; spike_run_timeout 5 /dev/null codesign -dv --verbose=2 "$(spike_verify_dir)/claude"'
 else
-  denied "codesign verify needs the gate when there is no system codesign (identity, rule 6)" "spike_set_verify_dir '$FAKE'; spike_run_timeout 5 /dev/null codesign --verify --strict '$FAKE/claude'"
+  denied "codesign verify needs the gate when there is no system codesign (identity, rule 6)" 'spike_verify_init; spike_run_timeout 5 /dev/null codesign --verify --strict "$(spike_verify_dir)/claude"'
 fi
 mkmacho "$REG/renamed" <<EOF
 exit 0
 EOF
-okrun "spike_run_status of a renamed binary with --version (registered as a verified copy first)" "spike_mark_verified '$REG/renamed' claude; spike_run_status 5 /dev/null '$REG/renamed' --version"
-okrun "spike_run_status of a renamed binary with login status (registered as a verified copy first)" "spike_mark_verified '$REG/renamed' claude; spike_run_status 5 /dev/null '$REG/renamed' login status"
+okrun "spike_run_status of a renamed binary with --version (registered as a verified copy first)" "spike_mark_verified '$REG/renamed' claude; spike_run_status 5 /dev/null \"\$SPIKE_VERIFIED_COPY\" --version"
+okrun "spike_run_status of a renamed binary with login status (registered as a verified copy first)" "spike_mark_verified '$REG/renamed' claude; spike_run_status 5 /dev/null \"\$SPIKE_VERIFIED_COPY\" login status"
 rm -f "$FAKE"/ran-*
-# Round 4 (decision 1d): the upper-case CLAUDE name no longer gets the status-shape exception in spike_run_timeout.
 denied "upper-case CLAUDE --version through spike_run_timeout (unverified provider CLI, rule 6)" "spike_run_timeout 5 /dev/null '$FAKE/CLAUDE' --version"
 rm -f "$FAKE"/ran-*
 SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live 5 /dev/null "$2/renamed" -p hi' _ "$COMMON" "$FAKE" 2>/dev/null
@@ -370,11 +526,11 @@ eq "spike_run_live runs when SPIKE_LIVE=1 (rc)" "0" "$?"
 eq "spike_run_live started the command" "1" "$(ran)"
 rm -f "$FAKE"/ran-*
 
-# --- identity, not name (rule 1, decision 1a/1b): copies of harmless programs are refused outside a system directory ---
+# --- identity, not name (rule 1): copies of harmless programs are refused outside a system directory ---
 SHADOW="$SANDBOX/shadow"
-mkdir -p "$SHADOW/marks"
+sbx_mkdir "$SHADOW/marks"
 for n in cat printf echo true codesign jq; do
-  printf '#!/bin/sh\ntouch "%s/marks/%s-$$"\nexit 0\n' "$SHADOW" "$n" > "$SHADOW/$n"
+  printf '#!/bin/sh\ntouch "%s/marks/%s-$$"\nexit 0\n' "$SHADOW" "$n" | sbx_put "$SHADOW/$n"
   chmod +x "$SHADOW/$n"
 done
 marks() { ls "$SHADOW/marks" | grep -c . ; }
@@ -405,11 +561,9 @@ okrun "absolute /usr/bin/true is a system binary and runs" 'spike_run_timeout 5 
 
 # cs_shape <label> <1 = allowed | 0 = refused> <args...>: the codesign shape check on its own (platform independent).
 cs_shape() {
-  local name="$1" want="$2" rc got
+  local name="$1" want="$2" got
   shift 2
-  /bin/bash -c '. "$1"; shift; _spike_codesign_shape "$@"' _ "$COMMON" "$@" >/dev/null 2>&1
-  rc=$?
-  if [ "$rc" -eq 0 ]; then got=1; else got=0; fi
+  if libt 'codesign_shape(@ARGV)' "$@" >/dev/null 2>&1; then got=1; else got=0; fi
   eq "codesign shape: $name" "$want" "$got"
 }
 cs_shape "--verify --strict <path> is a read-only shape" 1 --verify --strict /x/claude
@@ -421,22 +575,19 @@ cs_shape "--verify --strict --remove-signature is refused" 0 --verify --strict -
 cs_shape "--verify --strict <path> --remove-signature is refused" 0 --verify --strict /x --remove-signature
 cs_shape "-dv --verbose=2 with an option where the path goes is refused" 0 -dv --verbose=2 --remove-signature
 
-# --- round 6, item 3 (rule 4): the codesign path must resolve inside the private verify directory --------------------
+# --- rule 4: the codesign path must resolve inside the private verify directory the HELPER made -----------------------
 # A canary stands in for a credential file under a fake home. Its text must never be read by the codesign checks.
-VD="$SANDBOX/verifydir"
-mkdir -p "$VD"
+VD="$(rawhelper vdir-create $$)"
+check "the helper made a verify directory inside the sandbox" test -d "$VD"
+case "$VD" in "$SANDBOX"/spike-verify.*) ok "the verify directory is named spike-verify.<id> under TMPDIR" ;; *) bad "the verify directory is named spike-verify.<id> under TMPDIR ($VD)" ;; esac
+eq "the verify directory is mode 700" "drwx------" "$(ls -ld "$VD" | cut -c1-10)"
 FH="$SANDBOX/fakehome"
-mkdir -p "$FH/.claude"
-printf 'CANARY-ROOT-9d1e\n' > "$FH/.claude/canary"
-ln -s "$FH/.claude/canary" "$VD/link-to-canary"
-rooted() { # rooted <label> <1|0> <verify-dir or -> <path>: _spike_codesign_rooted on its own
+sbx_mkdir "$FH/.claude"
+printf 'CANARY-ROOT-9d1e\n' | sbx_put "$FH/.claude/canary"
+sbx_ln "$FH/.claude/canary" "$VD/link-to-canary"
+rooted() { # rooted <label> <1|0> <verify-dir or -> <path>: codesign_rooted on its own
   local label="$1" want="$2" vd="$3" p="$4" got
-  if [ "$vd" = "-" ]; then
-    /bin/bash -c '. "$1"; _spike_codesign_rooted "$2"' _ "$COMMON" "$p" >/dev/null 2>&1
-  else
-    /bin/bash -c '. "$1"; spike_set_verify_dir "$2"; _spike_codesign_rooted "$3"' _ "$COMMON" "$vd" "$p" >/dev/null 2>&1
-  fi
-  if [ $? -eq 0 ]; then got=1; else got=0; fi
+  if libt 'codesign_rooted($ARGV[0], $ARGV[1])' "$p" "$vd" >/dev/null 2>&1; then got=1; else got=0; fi
   eq "codesign rooted: $label" "$want" "$got"
 }
 rooted "a path inside the verify directory" 1 "$VD" "$VD/inside"
@@ -445,11 +596,13 @@ rooted "a canary path under a fake home" 0 "$VD" "$FH/.claude/canary"
 rooted "a symlink in the verify directory that leads to the canary" 0 "$VD" "$VD/link-to-canary"
 rooted "a .. escape out of the verify directory" 0 "$VD" "$VD/../fakehome/.claude/canary"
 rooted "no verify directory set: nothing is rooted" 0 - "$VD/inside"
-denied "codesign --verify on a canary under a fake home is not ungated (rc 3)" "spike_set_verify_dir '$VD'; spike_run_timeout 5 /dev/null codesign --verify --strict '$FH/.claude/canary'"
-denied "codesign --verify through a symlink into the fake home is not ungated (rc 3)" "spike_set_verify_dir '$VD'; spike_run_timeout 5 /dev/null codesign --verify --strict '$VD/link-to-canary'"
-check "the canary was never copied or read into a verify output" bash -c '! grep -rq CANARY-ROOT "$1"' _ "$VD"
+rooted "a directory that merely looks like a verify directory is not one" 0 "$FH/.claude" "$FH/.claude/canary"
+denied "codesign --verify on a canary under a fake home is not ungated (rc 3)" "_SPIKE_VERIFY_DIR='$VD'; spike_run_timeout 5 /dev/null codesign --verify --strict '$FH/.claude/canary'"
+denied "codesign --verify through a symlink into the fake home is not ungated (rc 3)" "_SPIKE_VERIFY_DIR='$VD'; spike_run_timeout 5 /dev/null codesign --verify --strict '$VD/link-to-canary'"
+check "the canary was never copied or read into a verify output" /bin/bash -c '! grep -rq CANARY-ROOT "$1"' _ "$VD"
+check "spike_set_verify_dir no longer exists (the caller cannot choose the verify directory)" /bin/bash -c '. "$1"; ! declare -F spike_set_verify_dir >/dev/null' _ "$COMMON"
 
-# --- spike_run_status (decision 2): only a registered verified copy, and only the three status shapes ----------------
+# --- spike_run_status: only a registered, unchanged verified copy, and only the three status shapes -----------------
 SRS="$SANDBOX/srs.out"
 o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_status 5 "$2" /bin/sh auth status; echo CONTINUED' _ "$COMMON" "$SRS" 2>/dev/null)"
 eq "spike_run_status with /bin/sh auth status is refused (rc 3)" "3" "$?"
@@ -461,19 +614,20 @@ lacks "spike_run_status with /bin/sh and SPIKE_LIVE=1 stops the caller" "$o" "CO
 denied "spike_run_status with the original (unregistered) claude --version" "spike_run_status 5 /dev/null '$FAKE/claude' --version"
 denied "spike_run_status with the original (unregistered) claude auth status" "spike_run_status 5 /dev/null '$FAKE/claude' auth status"
 denied "spike_run_status of an unregistered renamed copy with --version" "spike_run_status 5 /dev/null '$FAKE/renamed' --version"
-mkdir -p "$SANDBOX/launch"
+sbx_mkdir "$SANDBOX/launch"
 mkmacho "$SANDBOX/launch/sh" <<EOF
 touch "$FAKE/ran-\$\$"
 exit 0
 EOF
-ln -s "$FAKE/claude" "$SANDBOX/launch/linked"
+sbx_ln "$FAKE/claude" "$SANDBOX/launch/linked"
 rm -f "$FAKE"/ran-*
+# A source NAMED like a launcher registers as a copy named after the CLI; the original path itself is never accepted.
 o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/sh" claude && spike_run_status 5 /dev/null "$2/sh" --version; echo CONTINUED' _ "$COMMON" "$SANDBOX/launch" 2>/dev/null)"
-eq "spike_run_status refuses a registered copy whose name is a launcher (rc 3)" "3" "$?"
-lacks "spike_run_status refuses a registered launcher-named copy: caller stopped" "$o" "CONTINUED"
-eq "spike_run_status refused the launcher-named copy: nothing started" "0" "$(ran)"
+eq "spike_run_status refuses the launcher-named ORIGINAL even after it was registered (rc 3)" "3" "$?"
+lacks "spike_run_status refuses the launcher-named original: caller stopped" "$o" "CONTINUED"
+eq "spike_run_status refused the launcher-named original: nothing started" "0" "$(ran)"
 rm -f "$FAKE"/ran-*
-o="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude && spike_run_status 5 /dev/null "$2/claude" -p hi; echo CONTINUED' _ "$COMMON" "$REG" 2>/dev/null)"
+o="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude && spike_run_status 5 /dev/null "$SPIKE_VERIFIED_COPY" -p hi; echo CONTINUED' _ "$COMMON" "$REG" 2>/dev/null)"
 eq "spike_run_status with a prompt is refused even for a registered copy and SPIKE_LIVE=1 (rc 3)" "3" "$?"
 lacks "spike_run_status with a prompt stops the caller" "$o" "CONTINUED"
 eq "spike_run_status with a prompt started nothing" "0" "$(ran)"
@@ -484,18 +638,19 @@ eq "spike_mark_verified refuses a symlink (rc 2)" "2" "$?"
 /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$SANDBOX/launch" >/dev/null 2>&1
 eq "spike_mark_verified refuses a directory (rc 2)" "2" "$?"
 
-# --- round 6, item 2 (rule 6): registration runs the pinned-signer check and the Mach-O magic check itself -------------
+# --- registration (rule 6): the helper checks the magic and the pinned signer on the COPY ----------------------------
 RG="$SANDBOX/regtest"
-mkdir -p "$RG"
+sbx_mkdir "$RG"
 mkmacho "$RG/claude" <<EOF
+# signer: claude
 touch "$FAKE/ran-\$\$"
 exit 0
 EOF
-# regcase <label> <fake codesign mode> <cli> <path> <fixture-maker-or-empty>: registration must refuse (rc 2), and the
-# status runner must then refuse the same path (rc 3) without running it.
+# regcase <label> <fake codesign mode> <cli> <path>: registration must refuse (rc 2), and the status runner must then refuse
+# the same path (rc 3) without running it.
 regcase() {
   local label="$1" mode="$2" name="$3" p="$4" rc
-  printf '%s\n' "$mode" > "$FSDIR/mode"
+  fsmode "$mode"
   env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" "$3"' _ "$COMMON" "$p" "$name" >/dev/null 2>&1
   rc=$?
   eq "registration refused: $label (rc 2)" "2" "$rc"
@@ -504,46 +659,34 @@ regcase() {
   eq "registration refused: $label, so spike_run_status refuses it (rc 3)" "3" "$?"
   eq "registration refused: $label, and nothing ran" "0" "$(ran)"
 }
-mkmacho "$RG/unsigned" <<EOF
+for n in unsigned wrong-claude adhoc-claude forged-claude notdev-claude weird-claude; do
+  mkmacho "$RG/$n" <<EOF
 touch "$FAKE/ran-\$\$"
 EOF
-mkmacho "$RG/wrong-claude" <<EOF
-touch "$FAKE/ran-\$\$"
-EOF
-mkmacho "$RG/adhoc-claude" <<EOF
-touch "$FAKE/ran-\$\$"
-EOF
-mkmacho "$RG/forged-claude" <<EOF
-touch "$FAKE/ran-\$\$"
-EOF
-mkmacho "$RG/notdev-claude" <<EOF
-touch "$FAKE/ran-\$\$"
-EOF
-mkmacho "$RG/weird-claude" <<EOF
-touch "$FAKE/ran-\$\$"
-EOF
+done
 regcase "unsigned Mach-O (not signed at all)" unsigned claude "$RG/unsigned"
 regcase "wrong team (Developer ID, other team)" wrongteam claude "$RG/wrong-claude"
 regcase "ad-hoc signature" adhoc claude "$RG/adhoc-claude"
 regcase "forged text, chain requirement fails" forged claude "$RG/forged-claude"
 regcase "Apple Development authority, not Developer ID" notdev claude "$RG/notdev-claude"
 regcase "codesign fails with rc 3" weird claude "$RG/weird-claude"
-printf 'good\n' > "$FSDIR/mode"
+fsmode good
 # A Claude-team copy registered under the codex name is refused by the pinned team of that name.
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" codex' _ "$COMMON" "$RG/claude" >/dev/null 2>&1
 eq "registration refused: a copy signed by the Anthropic team registered as codex (rc 2)" "2" "$?"
 # Magic: an ELF header and a script with a Mach-O name are refused before any signer runs.
-printf '\177ELF\002\001\001\000 not a mach-o\n' > "$RG/elf-claude"
+printf '\177ELF\002\001\001\000 not a mach-o\n' | sbx_put "$RG/elf-claude"
 chmod +x "$RG/elf-claude"
-printf '#!/bin/sh\necho "%s"\n' "script with a Mach-O name" > "$RG/script-claude"
+printf '#!/bin/sh\necho "%s"\n' "script with a Mach-O name" | sbx_put "$RG/script-claude"
 chmod +x "$RG/script-claude"
-printf 'good\n' > "$FSDIR/mode"
+: >| "$FSDIR/log"
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$RG/elf-claude" >/dev/null 2>&1
 eq "registration refused: an ELF header named claude (rc 2)" "2" "$?"
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$RG/script-claude" >/dev/null 2>&1
 eq "registration refused: a shell script with a Mach-O name (rc 2)" "2" "$?"
+eq "no signer was consulted for the non-Mach-O files" "" "$(cat "$FSDIR/log")"
 if [ "$(head -c 4 /bin/sh | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
-  cp /bin/sh "$RG/dash-claude"
+  sbx_cp /bin/sh "$RG/dash-claude"
   env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$RG/dash-claude" >/dev/null 2>&1
   eq "registration refused: a copy of dash named claude (ELF on Linux, rc 2)" "2" "$?"
   rm -f "$FAKE"/ran-*
@@ -551,34 +694,127 @@ if [ "$(head -c 4 /bin/sh | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
   eq "a dash copy named claude is never run through spike_run_status (rc 3)" "3" "$?"
 fi
 # Positive: a Mach-O-headed copy that passes the fake pinned signer for claude registers (rc 0). The fake codesign was asked
-# about this exact copy path with the chain requirement. The status run passes the identity check and reaches exec.
-printf 'good\n' > "$FSDIR/mode"
-: > "$FSDIR/log"
-env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$RG/claude" >/dev/null 2>&1
+# about the COPY (inside the private verify directory) with the chain requirement. The status run reaches exec.
+fsmode good
+: >| "$FSDIR/log"
+COPY="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude && printf "%s" "$SPIKE_VERIFIED_COPY"' _ "$COMMON" "$RG/claude" 2>/dev/null)"
 eq "registration accepts a Mach-O copy that passes the pinned signer (rc 0)" "0" "$?"
-has "registration asked codesign about the copy path (verify)" "$(cat "$FSDIR/log")" "--verify --strict $RG/claude"
+case "$COPY" in "$SANDBOX"/spike-verify.*/claude) ok "the registered copy lives in the private verify directory" ;; *) bad "the registered copy lives in the private verify directory ($COPY)" ;; esac
+has "registration asked codesign about the COPY path (verify)" "$(cat "$FSDIR/log")" "--verify --strict $COPY"
+lacks "registration never asked codesign about the original path" "$(cat "$FSDIR/log")" "$RG/claude"
 has "registration checked the chain-to-Apple requirement for the pinned team" "$(cat "$FSDIR/log")" 'anchor apple generic and certificate leaf[subject.OU] = "Q6L2SF6YDW"'
 rm -f "$FAKE"/ran-*
-env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude && spike_run_status 5 /dev/null "$2" --version' _ "$COMMON" "$RG/claude" >/dev/null 2>&1
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude && spike_run_status 5 /dev/null "$SPIKE_VERIFIED_COPY" --version' _ "$COMMON" "$RG/claude" >/dev/null 2>&1
 eq "registered binary passes the identity check and runs through spike_run_status (rc 0)" "0" "$?"
 eq "registered binary ran once" "1" "$(ran)"
 
-# --- round 6, item 1: resolve once, physically, and execute the resolved path --------------------------------------
+# Sonnet audit: the registry binds CONTENT, not only a path. A copy changed after registration is refused before exec.
+rm -f "$FAKE"/ran-*
+o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude || exit 9; printf "%s\n" "#!/bin/sh" "touch \"$3/ran-swapped\"" >| "$SPIKE_VERIFIED_COPY"; spike_run_status 5 /dev/null "$SPIKE_VERIFIED_COPY" --version; echo CONTINUED' _ "$COMMON" "$RG/claude" "$FAKE" 2>/dev/null)"
+eq "a registered copy swapped after registration is refused (rc 3)" "3" "$?"
+lacks "a swapped copy stops the caller" "$o" "CONTINUED"
+check "the swapped copy never ran" test ! -e "$FAKE/ran-swapped"
+eq "no registered fixture ran either" "0" "$(ran)"
+o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude || exit 9; rm -f "$SPIKE_VERIFIED_COPY"; ln -s "$2" "$SPIKE_VERIFIED_COPY"; spike_run_status 5 /dev/null "$SPIKE_VERIFIED_COPY" --version; echo CONTINUED' _ "$COMMON" "$RG/claude" 2>/dev/null)"
+eq "a registered copy replaced by a symlink to the (once verified) original is refused (rc 3)" "3" "$?"
+eq "the symlinked original never ran" "0" "$(ran)"
+
+# --- Opus finding 1: a fake perl first on PATH has no effect ---------------------------------------------------------------
+FP="$SANDBOX/fakeperl"
+sbx_mkdir "$FP"
+for t in perl env bash codesign; do
+  sbx_put "$FP/$t" <<EOF
+#!/bin/sh
+touch "$FP/fake-$t-ran"
+exit 0
+EOF
+  chmod +x "$FP/$t"
+done
+fsmode unsigned
+: >| "$FSDIR/log"
+o="$(env -u SPIKE_LIVE PATH="$FP:$PATH" /bin/bash -c '. "$1"; spike_mark_verified "$2" claude; rc=$?; echo "RC=$rc TEXT=$SPIKE_SIG_TEXT"' _ "$COMMON" "$RG/unsigned" 2>/dev/null)"
+has "fake perl on PATH: an unsigned Mach-O is still refused (rc 2)" "$o" "RC=2"
+has "fake perl on PATH: the signature text is the real verdict (NOT SIGNED), not a forged valid team" "$o" "TEXT=NOT SIGNED"
+lacks "fake perl on PATH: never reports a valid team" "$o" "valid"
+o="$(env -u SPIKE_LIVE PATH="$FP:$PATH" /bin/bash -c '. "$1"; spike_mark_verified "$2" claude; echo "RC=$?"' _ "$COMMON" "$RG/script-claude" 2>/dev/null)"
+has "fake perl on PATH: an unsigned non-Mach-O is refused (rc 2)" "$o" "RC=2"
+fsmode good
+o="$(env -u SPIKE_LIVE PATH="$FP:$PATH" /bin/bash -c '. "$1"; spike_mark_verified "$2" claude && spike_run_status 5 /dev/null "$SPIKE_VERIFIED_COPY" --version; echo "RC=$?"' _ "$COMMON" "$RG/claude" 2>/dev/null)"
+has "fake perl on PATH: a good registration and status run still work (rc 0)" "$o" "RC=0"
+rm -f "$FAKE"/ran-*
+SPIKE_LIVE=1 PATH="$FP:$PATH" /bin/bash -c '. "$1"; spike_run_live 5 /dev/null "$2/claude" -p hi; spike_run_timed 5 /dev/null jq --version' _ "$COMMON" "$FAKE" >/dev/null 2>&1
+eq "fake perl on PATH: a live run starts the command" "1" "$(ran)"
+check "fake perl on PATH: neither the fake perl, env, bash nor codesign was ever started" /bin/bash -c 'test ! -e "$1/fake-perl-ran" -a ! -e "$1/fake-env-ran" -a ! -e "$1/fake-bash-ran" -a ! -e "$1/fake-codesign-ran"' _ "$FP"
+
+# --- Opus finding 2: SIGKILL to the caller's whole process group must not orphan the command -------------------------------
+sbx_put "$SANDBOX/pglauncher.sh" <<EOF
+#!/bin/sh
+sleep 33 &
+echo "\$\$ \$!" > "$SANDBOX/pg.pids.tmp"
+mv "$SANDBOX/pg.pids.tmp" "$SANDBOX/pg.pids"
+wait
+EOF
+chmod +x "$SANDBOX/pglauncher.sh"
+rm -f "$SANDBOX/pg.pids"
+# The caller leads its own session and group (setsid), as a terminal job would.
+SPIKE_LIVE=1 /usr/bin/perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' /bin/bash -c '. "$1"; spike_run_live 60 /dev/null "$2"; echo AFTER' _ "$COMMON" "$SANDBOX/pglauncher.sh" > "$SANDBOX/pg.out" 2>/dev/null &
+PGCALLER=$!
+n=0
+while [ ! -s "$SANDBOX/pg.pids" ] && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+PLPID=""
+PGPID=""
+read -r PLPID PGPID < "$SANDBOX/pg.pids" 2>/dev/null
+CALLER_PGID="$(ps -o pgid= -p "$PGCALLER" 2>/dev/null | tr -d ' ')"
+CMD_PGID="$(ps -o pgid= -p "$PLPID" 2>/dev/null | tr -d ' ')"
+if [ -n "$PLPID" ] && [ -n "$PGPID" ] && alive "$PLPID" && alive "$PGPID"; then ok "process group: the launcher and its grandchild run before the group is killed"; else bad "process group: the launcher and its grandchild run before the group is killed"; fi
+if [ -n "$CALLER_PGID" ] && [ -n "$CMD_PGID" ] && [ "$CALLER_PGID" != "$CMD_PGID" ]; then ok "process group: the command is NOT in the caller's group (the watchdog is not killed with the caller)"; else bad "process group: the command is NOT in the caller's group (caller $CALLER_PGID, command $CMD_PGID)"; fi
+MYPGID="$(ps -o pgid= -p $$ | tr -d ' ')"
+if [ -n "$CALLER_PGID" ] && [ "$CALLER_PGID" != "$MYPGID" ] && [ "$CALLER_PGID" != "1" ] && [ "$CALLER_PGID" = "$PGCALLER" ]; then
+  kill -9 -- "-$CALLER_PGID" 2>/dev/null
+else
+  bad "process group: the caller leads its own group (refusing to signal group [$CALLER_PGID], mine is [$MYPGID])"
+  kill -9 "$PGCALLER" 2>/dev/null
+fi
+if gone_within 30 "$PLPID"; then ok "process group: SIGKILL to the caller's whole group, the launcher is gone within 3 s"; else bad "process group: SIGKILL to the caller's whole group, the launcher is gone within 3 s"; kill -9 "$PLPID" 2>/dev/null; fi
+if gone_within 30 "$PGPID"; then ok "process group: SIGKILL to the caller's whole group, the grandchild is gone within 3 s"; else bad "process group: SIGKILL to the caller's whole group, the grandchild is gone within 3 s"; kill -9 "$PGPID" 2>/dev/null; fi
+{ wait "$PGCALLER"; } 2>/dev/null
+lacks "process group: the killed caller ran no further statement" "$(cat "$SANDBOX/pg.out")" "AFTER"
+
+# ...and a SIGKILL to the HELPER's group (which holds the helper, the command and its grandchild) kills the command too.
+rm -f "$SANDBOX/pg.pids"
+SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live 60 /dev/null "$2"; echo "AFTER rc=$?"' _ "$COMMON" "$SANDBOX/pglauncher.sh" > "$SANDBOX/pg2.out" 2>/dev/null &
+PGCALLER2=$!
+n=0
+while [ ! -s "$SANDBOX/pg.pids" ] && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+read -r PLPID PGPID < "$SANDBOX/pg.pids" 2>/dev/null
+HGRP="$(ps -o pgid= -p "$PLPID" 2>/dev/null | tr -d ' ')"
+if [ -n "$HGRP" ] && [ "$HGRP" != "$MYPGID" ] && [ "$HGRP" != "$PGCALLER2" ] && [ "$HGRP" != "1" ]; then
+  kill -9 -- "-$HGRP" 2>/dev/null
+else
+  bad "process group: the helper leads its own group (refusing to signal group [$HGRP])"
+  kill -9 "$PLPID" 2>/dev/null
+fi
+if gone_within 30 "$PLPID"; then ok "process group: SIGKILL to the helper's group kills the launcher"; else bad "process group: SIGKILL to the helper's group kills the launcher"; kill -9 "$PLPID" 2>/dev/null; fi
+if gone_within 30 "$PGPID"; then ok "process group: SIGKILL to the helper's group kills the grandchild"; else bad "process group: SIGKILL to the helper's group kills the grandchild"; kill -9 "$PGPID" 2>/dev/null; fi
+{ wait "$PGCALLER2"; } 2>/dev/null
+has "process group: the caller of a killed helper sees a signal status and survives" "$(cat "$SANDBOX/pg2.out")" "AFTER rc=137"
+
+# --- resolve once, physically, and execute the resolved path --------------------------------------------------------------
 # Reviewer's repro: S is a symlink to an 11-level directory, and the command is S + 14 x "/.." + "/usr/bin/printf". The
 # kernel applies each '..' to the real directory, so the command is a file under the physical target. A fake printf sits
-# there. The old lexical resolution saw /usr/bin/printf; the fixed resolver must see the physical file and refuse.
+# there. A lexical resolver sees /usr/bin/printf; the helper must see the physical file and refuse.
 RR="$SANDBOX/rr"
 RQ="$RR/q1/q2/q3"
 RT="$RQ/c1/c2/c3/c4/c5/c6/c7/c8/c9/c10/c11"
-mkdir -p "$RT" "$RR/usr/bin"
-ln -s "$RT" "$RQ/S"
-printf '#!/bin/sh\ntouch "%s/rr-marker"\necho FAKE-PRINTF\n' "$RR" > "$RR/usr/bin/printf"
+sbx_mkdir "$RT" "$RR/usr/bin"
+sbx_ln "$RT" "$RQ/S"
+printf '#!/bin/sh\ntouch "%s/rr-marker"\necho FAKE-PRINTF\n' "$RR" | sbx_put "$RR/usr/bin/printf"
 chmod +x "$RR/usr/bin/printf"
 RUPS=""
 i=0
 while [ "$i" -lt 14 ]; do RUPS="$RUPS/.."; i=$((i + 1)); done
 RCMD="$RQ/S$RUPS/usr/bin/printf"
-eq "reviewer repro resolves to the physical target, not /usr/bin/printf" "$(cd -P "$RR" && pwd -P)/usr/bin/printf" "$(spike_resolve_path "$RCMD")"
+eq "reviewer repro resolves to the physical target, not /usr/bin/printf" "$(CDPATH= cd -P -- "$RR" && pwd -P)/usr/bin/printf" "$(spike_resolve_path "$RCMD")"
 rm -f "$RR"/rr-marker
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2" hi' _ "$COMMON" "$RCMD" >/dev/null 2>&1
 eq "reviewer repro with a prompt is refused (rc 3)" "3" "$?"
@@ -588,27 +824,27 @@ eq "reviewer repro without a prompt is refused too (rc 3)" "3" "$?"
 check "reviewer repro (no prompt): the fake printf never ran" test ! -e "$RR/rr-marker"
 # Double slashes are normalised, so //usr//bin/printf runs the REAL printf (no false refusal).
 PFOUT="$SANDBOX/pf.out"
-: > "$PFOUT"
+: >| "$PFOUT"
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 "$2" //usr//bin/printf hello' _ "$COMMON" "$PFOUT" >/dev/null 2>&1
 eq "//usr//bin/printf runs the real printf (rc 0)" "0" "$?"
 has "//usr//bin/printf wrote its output" "$(cat "$PFOUT")" "hello"
 eq "//usr//bin/printf resolves to /usr/bin/printf" "/usr/bin/printf" "$(spike_resolve_path //usr//bin/printf)"
 # A symlink named like a harmless tool, pointing at a non-system file, is refused (the resolved target decides).
-ln -s "$FAKE/claude" "$SANDBOX/alias-true"
+sbx_ln "$FAKE/claude" "$SANDBOX/alias-true"
 rm -f "$FAKE"/ran-*
 denied "a symlink named alias-true to a provider copy is not ungated (rc 3)" "spike_run_timeout 5 /dev/null '$SANDBOX/alias-true' --version"
 # PATH TOCTOU: a directory first on PATH holds printf as a symlink to the real binary, and a fake regular file that the
 # swapper puts in its place. Each run resolves printf once. The fake must never run; a run is either the real printf
 # (rc 0) or a refusal (rc 3) when the fake was resolved.
 TOC="$SANDBOX/toc"
-mkdir -p "$TOC/first"
+sbx_mkdir "$TOC/first"
 REALP="$(type -P printf)"
-printf '#!/bin/sh\ntouch "%s/toc-marker-$$"\nexit 0\n' "$TOC" > "$TOC/fake"
+printf '#!/bin/sh\ntouch "%s/toc-marker-$$"\nexit 0\n' "$TOC" | sbx_put "$TOC/fake"
 chmod +x "$TOC/fake"
-ln -sf "$REALP" "$TOC/first/printf"
+sbx_ln "$REALP" "$TOC/first/printf"
 (
   while :; do
-    ln -sf "$REALP" "$TOC/first/.p.tmp" && mv -f "$TOC/first/.p.tmp" "$TOC/first/printf"
+    ln -sfn "$REALP" "$TOC/first/.p.tmp" && mv -f "$TOC/first/.p.tmp" "$TOC/first/printf"
     cp "$TOC/fake" "$TOC/first/.f.tmp" && mv -f "$TOC/first/.f.tmp" "$TOC/first/printf"
   done
 ) >/dev/null 2>&1 &
@@ -629,33 +865,198 @@ wait "$SWAP" 2>/dev/null
 eq "PATH TOCTOU: the swapped printf never ran in 25 trials (bad runs)" "0" "$TOC_BAD"
 eq "PATH TOCTOU: every trial ran the resolved printf or refused (rc 0 or 3)" "0" "$TOC_BADRC"
 
-# --- round 6, item 6: the runner body replaces the inherited traps as its FIRST statement -------------------------------
-BODY_SRC="$(/bin/bash -c '. "$1"; declare -f _spike_run_timeout_body' _ "$COMMON" 2>/dev/null)"
-FIRST_STMT="$(printf '%s\n' "$BODY_SRC" | sed -n '3p' | sed 's/^[[:space:]]*//')"
-case "$FIRST_STMT" in
-  "trap '_spike_signal 143' TERM"*) ok "item 6: the runner body's first statement replaces the TERM trap" ;;
-  *) bad "item 6: the runner body's first statement replaces the TERM trap (first statement: [$FIRST_STMT])" ;;
-esac
+# --- Opus finding 3: control characters (a trailing newline) are refused, not stripped ----------------------------------------
+sbx_mkdir "$SANDBOX/nl"
+sbx_put "$SANDBOX/nl/tool" <<EOF
+#!/bin/sh
+touch "$SANDBOX/nl/tool-ran"
+exit 0
+EOF
+chmod +x "$SANDBOX/nl/tool"
+spike_resolve_path "$SANDBOX/nl/tool"$'\n' >/dev/null 2>&1
+check "a path with a trailing newline does not resolve (the resolver never returns a different path than it was given)" test "$?" -ne 0
+spike_resolve_path "$SANDBOX/nl/to"$'\n'"ol" >/dev/null 2>&1
+check "a path with an embedded newline does not resolve" test "$?" -ne 0
+SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live 5 /dev/null "$2"' _ "$COMMON" "$SANDBOX/nl/tool"$'\n' >/dev/null 2>&1
+eq "spike_run_live refuses a command path with a trailing newline (rc 2)" "2" "$?"
+check "the tool was not run through the newline path" test ! -e "$SANDBOX/nl/tool-ran"
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$RG/claude"$'\n' >/dev/null 2>&1
+eq "spike_mark_verified refuses a path with a trailing newline (rc 2)" "2" "$?"
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$RG/claude"$'\nforged-line' >/dev/null 2>&1
+eq "spike_mark_verified refuses a path that would inject a registry line (rc 2)" "2" "$?"
+check "no registry in this sandbox contains an injected line" /bin/bash -c '! grep -rq forged-line "$1"/spike-verify.*/.registry' _ "$SANDBOX"
 
-# --- round 6, item 4 (rule 4): the CLI-home test on a resolved path (the names are not written in spike/) -------------
+# --- Opus finding 4: a path containing '=' runs that file, never a PATH program ----------------------------------------------
+sbx_mkdir "$SANDBOX/e=q" "$SANDBOX/pwbin"
+sbx_put "$SANDBOX/e=q/tool" <<EOF
+#!/bin/sh
+touch "$SANDBOX/e=q/tool-ran"
+exit 0
+EOF
+chmod +x "$SANDBOX/e=q/tool"
+sbx_put "$SANDBOX/pwbin/pwn" <<EOF
+#!/bin/sh
+touch "$SANDBOX/pwbin/pwned"
+exit 0
+EOF
+chmod +x "$SANDBOX/pwbin/pwn"
+SPIKE_LIVE=1 PATH="$SANDBOX/pwbin:$PATH" /bin/bash -c '. "$1"; spike_run_live 5 /dev/null "$2" pwn' _ "$COMMON" "$SANDBOX/e=q/tool" >/dev/null 2>&1
+eq "a command path containing = runs (rc 0)" "0" "$?"
+check "a command path containing = ran that file" test -e "$SANDBOX/e=q/tool-ran"
+check "a command path containing = never ran a PATH program named by its next argument" test ! -e "$SANDBOX/pwbin/pwned"
+# The same for the helper's own arguments: a path with = in the interpreter-side positions cannot reach env's parser.
+mkmacho "$SANDBOX/e=q/claude" <<EOF
+exit 0
+EOF
+env -u SPIKE_LIVE PATH="$SANDBOX/pwbin:$PATH" /bin/bash -c '. "$1"; spike_mark_verified "$2" claude && spike_run_status 5 /dev/null "$SPIKE_VERIFIED_COPY" --version' _ "$COMMON" "$SANDBOX/e=q/claude" >/dev/null 2>&1
+eq "registering and running a binary whose original path contains = works (rc 0)" "0" "$?"
+check "no PATH program ran during that registration" test ! -e "$SANDBOX/pwbin/pwned"
+
+# --- CLI homes by (device, inode) (rule 4); the names are built from parts so the repository scan stays clean ------------
 UH="$SANDBOX/uhome"
-mkdir -p "$UH/.claude" "$UH/plain/bin" "$UH/.hidden-tool" "$SANDBOX/outside-real"
-ln -s "$SANDBOX/outside-real" "$UH/.linked"
+NAMES=".claude .cod""ex .gr""ok .ki""mi""-code .ki""mi .gem""ini"
+sbx_mkdir "$UH/plain/bin" "$UH/.hidden-tool" "$SANDBOX/outside-real"
+for nm in $NAMES; do
+  sbx_mkdir "$UH/$nm"
+  printf 'x\n' | sbx_put "$UH/$nm/canary"
+done
+chmod +x "$UH/.claude/canary"
+printf 'x\n' | sbx_put "$UH/.cl""aude.json"
+sbx_ln "$SANDBOX/outside-real" "$UH/.linked"
 uhome() { # uhome <path>: 0 if spike_under_cli_home refuses it, with HOME set to the fake home
   /bin/bash -c 'export HOME="$1"; . "$2"; spike_under_cli_home "$3"' _ "$UH" "$COMMON" "$1" >/dev/null 2>&1
 }
-if uhome "$UH/.claude/canary"; then ok "CLI home: a file under a dot-directory of HOME is refused"; else bad "CLI home: a file under a dot-directory of HOME is refused"; fi
-if uhome "$UH/.hidden-tool/x"; then ok "CLI home: any other dot-directory of HOME is refused too (superset of the list)"; else bad "CLI home: any other dot-directory of HOME is refused too (superset of the list)"; fi
+for nm in $NAMES; do
+  if uhome "$UH/$nm/canary"; then ok "CLI home: a file under $nm in HOME is refused"; else bad "CLI home: a file under $nm in HOME is refused"; fi
+done
+if uhome "$UH/.cl""aude.json"; then ok "CLI home: the single-file home entry is refused"; else bad "CLI home: the single-file home entry is refused"; fi
 if uhome "$UH/plain/bin/claude"; then bad "CLI home: an ordinary path under HOME is not refused"; else ok "CLI home: an ordinary path under HOME is not refused"; fi
-if uhome "$SANDBOX/outside-real/x"; then ok "CLI home: a dot-entry symlinked to an outside directory refuses that directory"; else bad "CLI home: a dot-entry symlinked to an outside directory refuses that directory"; fi
+# CHANGED in round 7: the list is exact, so an unrelated dot-directory is no longer refused (it was a superset in round 6).
+if uhome "$UH/.hidden-tool/x"; then bad "CLI home: an unrelated dot-directory of HOME is not refused (exact list, round 7)"; else ok "CLI home: an unrelated dot-directory of HOME is not refused (exact list, round 7)"; fi
+if uhome "$UH/.linked/x"; then bad "CLI home: an unrelated dot-entry symlink is not refused"; else ok "CLI home: an unrelated dot-entry symlink is not refused"; fi
+sbx_mkdir "$SANDBOX/other"
 if uhome "$SANDBOX/other/x"; then bad "CLI home: an outside path is not refused"; else ok "CLI home: an outside path is not refused"; fi
-if /bin/bash -c 'unset HOME; . "$1"; spike_under_cli_home "$2"' _ "$COMMON" "$UH/plain/bin/claude" >/dev/null 2>&1; then ok "CLI home: HOME unset fails closed (refused)"; else bad "CLI home: HOME unset fails closed (refused)"; fi
+if uhome "$SANDBOX/no-such-dir/x"; then ok "CLI home: a path that cannot be resolved fails closed (refused)"; else bad "CLI home: a path that cannot be resolved fails closed (refused)"; fi
+# Identity, not spelling: a symlink to the home, a '..' spelling, and a CLI home entry that is itself a symlink.
+sbx_ln "$UH" "$SANDBOX/uhome-link"
+if uhome "$SANDBOX/uhome-link/.claude/canary"; then ok "CLI home: a path through a symlink to HOME is refused (identity)"; else bad "CLI home: a path through a symlink to HOME is refused (identity)"; fi
+if uhome "$UH/plain/../.claude/canary"; then ok "CLI home: a '..' spelling is refused (physical)"; else bad "CLI home: a '..' spelling is refused (physical)"; fi
+UH2="$SANDBOX/uhome2"
+sbx_mkdir "$UH2" "$SANDBOX/moved-home/deep"
+printf 'x\n' | sbx_put "$SANDBOX/moved-home/deep/canary"
+sbx_ln "$SANDBOX/moved-home" "$UH2/.claude"
+uhome2() { /bin/bash -c 'export HOME="$1"; . "$2"; spike_under_cli_home "$3"' _ "$UH2" "$COMMON" "$1" >/dev/null 2>&1; }
+if uhome2 "$SANDBOX/moved-home/deep/canary"; then ok "CLI home: a home entry that is a symlink refuses the directory it points at"; else bad "CLI home: a home entry that is a symlink refuses the directory it points at"; fi
+# Opus finding 5: a hard link to a canary outside every home is refused (the link count cannot show where it leads).
+sbx_mkdir "$SANDBOX/hl"
+ln "$UH/.claude/canary" "$SANDBOX/hl/claude"
+if uhome "$SANDBOX/hl/claude"; then ok "CLI home: a hard link to a canary is refused (identity, link count)"; else bad "CLI home: a hard link to a canary is refused (identity, link count)"; fi
+env -u SPIKE_LIVE HOME="$UH" /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$SANDBOX/hl/claude" >/dev/null 2>&1
+eq "registration refuses a hard link to a canary (rc 2)" "2" "$?"
+reg_hl="$(env -u SPIKE_LIVE HOME="$UH" PATH="$SANDBOX/hl:$PATH" /bin/bash -c '. "$1"; spike_register_cli claude; echo "RC=$? STATUS=$SPIKE_REG_STATUS COPY=$SPIKE_VERIFIED_COPY"' _ "$COMMON" 2>/dev/null)"
+has "spike_register_cli reports the hard link as refused" "$reg_hl" "STATUS=hardlink"
+# The display probes (spike_run_timed, which can run file(1)) never read a CLI home or a hard link that may lead into one.
+: >| "$SANDBOX/probe-file.out"
+HOME="$FH" spike_run_timed 5 "$SANDBOX/probe-file.out" file "$FH/.claude/canary" >/dev/null 2>&1
+eq "spike_run_timed refuses file(1) on a canary inside a CLI home (rc 2)" "2" "$?"
+HOME="$UH" spike_run_timed 5 "$SANDBOX/probe-file.out" file "$SANDBOX/hl/claude" >/dev/null 2>&1
+eq "spike_run_timed refuses file(1) on a hard link to a canary (rc 2)" "2" "$?"
+lacks "spike_run_timed never ran file(1) on the canary (nothing in the output file)" "$(cat "$SANDBOX/probe-file.out")" "text"
+HOME="$UH" spike_run_timed 5 "$SANDBOX/probe-file.out" file "$SANDBOX/rp/real/target" >/dev/null 2>&1
+eq "spike_run_timed still runs file(1) on an ordinary file (rc 0)" "0" "$?"
+check "the hard-linked canary was never copied anywhere" /bin/bash -c '! grep -rq "^x$" "$1"/spike-verify.*/claude 2>/dev/null' _ "$SANDBOX"
+# Sonnet audit: HOME unset, relative or pointed away must not lift the refusal of the account's own home.
+if /bin/bash -c 'unset HOME; . "$1"; spike_under_cli_home "$2"' _ "$COMMON" "$UH/plain/bin/claude" >/dev/null 2>&1; then bad "CLI home: HOME unset: an unrelated path is judged by the account home, not refused blindly"; else ok "CLI home: HOME unset: an unrelated path is judged by the account home, not refused blindly"; fi
+PWHOME="$(/usr/bin/perl -e 'print((getpwuid($<))[7])')"
+eq "candidate homes include the password-database home when HOME is unset" "$PWHOME" "$(libp 'candidate_homes($ARGV[0], undef)' "$PWHOME")"
+eq "candidate homes include the password-database home when HOME points away" "$PWHOME|$SANDBOX/elsewhere" "$(libp 'candidate_homes($ARGV[0], $ARGV[1])' "$PWHOME" "$SANDBOX/elsewhere")"
+eq "candidate homes ignore a relative HOME and keep the password-database home" "$PWHOME" "$(libp 'candidate_homes($ARGV[0], $ARGV[1])' "$PWHOME" "relative/home")"
+eq "candidate homes ignore a HOME of /" "$PWHOME" "$(libp 'candidate_homes($ARGV[0], "/")' "$PWHOME")"
+eq "candidate homes ignore a HOME with a control character" "$PWHOME" "$(libp 'candidate_homes($ARGV[0], "/x\ny")' "$PWHOME")"
+eq "the helper's current homes (no HOME given) are the password-database home" "$PWHOME" "$(libp 'current_homes()')"
+# Opus finding 6: the verify directory cannot be a CLI home, nor live inside one.
+denied "spike_run_status with the verify directory variable pointed at a CLI home (rc 3)" "export HOME='$FH'; _SPIKE_VERIFY_DIR='$FH/.claude'; spike_run_status 5 /dev/null '$FH/.claude/claude' --version"
+sbx_mkdir "$FH/.claude/spike-verify.abcdef12"
+chmod 700 "$FH/.claude/spike-verify.abcdef12"
+: >| "$FH/.claude/spike-verify.abcdef12/.registry"
+denied "spike_run_status with a look-alike verify directory inside a CLI home (rc 3)" "export HOME='$FH'; _SPIKE_VERIFY_DIR='$FH/.claude/spike-verify.abcdef12'; spike_run_status 5 /dev/null '$FH/.claude/spike-verify.abcdef12/claude' --version"
+env -u SPIKE_LIVE HOME="$FH" TMPDIR="$FH/.claude" /bin/bash -c '. "$1"; spike_verify_init' _ "$COMMON" >/dev/null 2>&1
+eq "the helper refuses to create the verify directory inside a CLI home (rc 5)" "5" "$?"
+eq "no verify directory was created inside the CLI home (only the look-alike made by this test is there)" "1" "$(ls "$FH/.claude" | grep -c '^spike-verify\.')"
+sbx_mkdir "$SANDBOX/loose-tmp"
+chmod 777 "$SANDBOX/loose-tmp"
+env -u SPIKE_LIVE TMPDIR="$SANDBOX/loose-tmp" /bin/bash -c '. "$1"; spike_verify_init' _ "$COMMON" >/dev/null 2>&1
+eq "the helper refuses to create the verify directory in a world-writable non-sticky directory (rc 5)" "5" "$?"
+
+# --- Opus finding 8: timeouts are decimal, leading zeros are not octal -----------------------------------------------------
+tsec() { /bin/bash -c '. "$1"; _spike_secs "$2"' _ "$COMMON" "$1" 2>/dev/null; }
+eq "timeout 08 is decimal 8" "8" "$(tsec 08)"
+eq "timeout 010 is decimal 10 (not octal 8)" "10" "$(tsec 010)"
+eq "timeout 0005 is decimal 5" "5" "$(tsec 0005)"
+eq "timeout 3600 is accepted" "3600" "$(tsec 3600)"
+eq "timeout 0 is refused" "" "$(tsec 0)"
+eq "timeout 000 is refused" "" "$(tsec 000)"
+eq "timeout 3601 is refused" "" "$(tsec 3601)"
+eq "timeout 99999999999999999999 is refused" "" "$(tsec 99999999999999999999)"
+eq "timeout 1e3 is refused" "" "$(tsec 1e3)"
+eq "timeout -5 is refused" "" "$(tsec -5)"
+eq "timeout with a space is refused" "" "$(tsec '5 ')"
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 08 /dev/null true' _ "$COMMON" >/dev/null 2>&1
+eq "spike_run_timeout 08 runs (decimal, rc 0)" "0" "$?"
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 010 /dev/null true' _ "$COMMON" >/dev/null 2>&1
+eq "spike_run_timeout 010 runs (decimal, rc 0)" "0" "$?"
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 0 /dev/null true' _ "$COMMON" >/dev/null 2>&1
+eq "spike_run_timeout 0 is a usage error (rc 2)" "2" "$?"
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 7200 /dev/null true' _ "$COMMON" >/dev/null 2>&1
+eq "spike_run_timeout 7200 is a usage error (rc 2)" "2" "$?"
+
+# --- Opus finding 9: no spike-verify.* temporary file outside the private directory, and none left after a TERM ------------
+fsmode slow
+rm -f "$SANDBOX"/leak.ready
+/bin/bash -c '. "$1"; : >| "$3"; spike_mark_verified "$2" claude' _ "$COMMON" "$RG/claude" "$SANDBOX/leak.ready" >/dev/null 2>&1 &
+LEAKPID=$!
+n=0
+while [ ! -e "$SANDBOX/leak.ready" ] && [ "$n" -lt 30 ]; do sleep 0.1; n=$((n + 1)); done
+sleep 0.5
+kill -s TERM "$LEAKPID" 2>/dev/null
+{ wait "$LEAKPID"; } 2>/dev/null
+fsmode good
+leaked=0
+for f in "$SANDBOX"/spike-verify.* "$SANDBOX"/spike-preflight.*; do
+  [ -e "$f" ] || [ -L "$f" ] || continue
+  if [ ! -d "$f" ] || [ -L "$f" ]; then leaked=$((leaked + 1)); echo "leaked non-directory: $f"; fi
+done
+eq "TERM during a registration leaves no temporary file outside a private verify directory" "0" "$leaked"
+eq "common.sh never makes a spike-verify.* scratch file itself (the signer text is read from a pipe inside the helper)" "0" "$(grep -c 'spike-verify\.X' "$COMMON_REAL")"
+
+# --- Opus finding 10 and the closed set: jq/git probes run with the closed environment ------------------------------------
+sbx_mkdir "$SANDBOX/probebin"
+sbx_put "$SANDBOX/probebin/jq" <<EOF
+#!/bin/sh
+/usr/bin/env > "$SANDBOX/probe.env"
+echo "jq-fake 1.0"
+EOF
+chmod +x "$SANDBOX/probebin/jq"
+: >| "$SANDBOX/probe.out"
+FOO_API_KEY=k1 FOO_HOME=/h BAR_TOKEN=t2 PERL5OPT=-MFoo PERL5LIB=/nonexistent PATH="$SANDBOX/probebin:$PATH" spike_run_timed 5 "$SANDBOX/probe.out" jq --version
+eq "spike_run_timed runs the PATH jq (rc 0)" "0" "$?"
+has "spike_run_timed captured the jq output" "$(cat "$SANDBOX/probe.out")" "jq-fake 1.0"
+lacks "spike_run_timed: jq saw no API key variable" "$(cat "$SANDBOX/probe.env")" "FOO_API_KEY"
+lacks "spike_run_timed: jq saw no home-like variable" "$(cat "$SANDBOX/probe.env")" "FOO_HOME"
+lacks "spike_run_timed: jq saw no token variable" "$(cat "$SANDBOX/probe.env")" "BAR_TOKEN"
+lacks "spike_run_timed: jq saw no PERL5OPT" "$(cat "$SANDBOX/probe.env")" "PERL5OPT"
+spike_run_timed 5 /dev/null claude --version >/dev/null 2>&1
+eq "spike_run_timed refuses a provider CLI name (rc 2)" "2" "$?"
+spike_run_timed 5 /dev/null jq --version claude >/dev/null 2>&1
+eq "spike_run_timed refuses a provider name in the arguments (rc 2)" "2" "$?"
+spike_run_timed 5 /dev/null sh -c true >/dev/null 2>&1
+eq "spike_run_timed refuses a shell (rc 2)" "2" "$?"
 
 # --- spike_resolve_path / spike_run_timeout --------------------------------------------------------------------------
-mkdir -p "$SANDBOX/rp/real"
-printf 'x\n' > "$SANDBOX/rp/real/target"
-ln -s real/target "$SANDBOX/rp/link1"
-ln -s "$SANDBOX/rp/link1" "$SANDBOX/rp/link2"
+sbx_mkdir "$SANDBOX/rp/real"
+printf 'x\n' | sbx_put "$SANDBOX/rp/real/target"
+sbx_ln real/target "$SANDBOX/rp/link1"
+sbx_ln "$SANDBOX/rp/link1" "$SANDBOX/rp/link2"
 eq "resolve_path follows a symlink chain" "$SANDBOX/rp/real/target" "$(spike_resolve_path "$SANDBOX/rp/link2")"
 
 spike_run_timeout 5 /dev/null true
@@ -667,15 +1068,16 @@ spike_run_timeout 1 /dev/null sleep 5
 eq "run_timeout returns 124 on timeout" "124" "$?"
 check "run_timeout returned promptly" test "$(($(date +%s) - START))" -lt 4
 
-# Environment is scrubbed (rules 2 and 4): only PATH HOME TMPDIR LANG TERM reach the child.
+# Environment is scrubbed (rules 2 and 4): only PATH HOME TMPDIR LANG TERM (and USER, LOGNAME) reach the child.
 ENVOUT="$SANDBOX/env.out"
-: > "$ENVOUT"
+: >| "$ENVOUT"
 SPIKE_TEST_SECRET=hunter2 SPIKE_LIVE=1 USER=tu LOGNAME=tu spike_run_live 5 "$ENVOUT" env
 has "run_timeout passes PATH" "$(cat "$ENVOUT")" "PATH="
 has "run_timeout passes HOME" "$(cat "$ENVOUT")" "HOME="
 has "run_timeout passes USER (CLIs look up their own login by account name)" "$(cat "$ENVOUT")" "USER=tu"
 lacks "run_timeout drops other variables" "$(cat "$ENVOUT")" "hunter2"
 lacks "run_timeout drops SPIKE_LIVE" "$(cat "$ENVOUT")" "SPIKE_LIVE"
+lacks "run_timeout drops the helper's own SPIKE_IN_ inputs" "$(cat "$ENVOUT")" "SPIKE_IN_"
 eq "run_timeout passes exactly 7 variables" "7" "$(wc -l < "$ENVOUT" | tr -d ' ')"
 
 # Closed set: whatever is exported in the caller (generic probes shaped like keys, homes and config dirs), the child sees
@@ -692,22 +1094,22 @@ closed_set_check() { # closed_set_check <label> <file>
   if [ -z "$stray" ]; then ok "$label: child environment is inside the closed set"; else bad "$label: stray variables:$stray"; fi
 }
 export FOO_API_KEY=k1 FOO_HOME=/h FOO_CONFIG_DIR=/c BAR_TOKEN=t2 HTTPS_PROXY=http://p SSH_AUTH_SOCK=/s XDG_CONFIG_HOME=/x
-: > "$ENVOUT"
+: >| "$ENVOUT"
 SPIKE_LIVE=1 spike_run_live 5 "$ENVOUT" env
 closed_set_check "env" "$ENVOUT"
 lacks "probe FOO_API_KEY is not passed" "$(cat "$ENVOUT")" "FOO_API_KEY"
 lacks "probe FOO_HOME is not passed" "$(cat "$ENVOUT")" "FOO_HOME"
 lacks "probe FOO_CONFIG_DIR is not passed" "$(cat "$ENVOUT")" "FOO_CONFIG_DIR"
-: > "$ENVOUT"
+: >| "$ENVOUT"
 SPIKE_LIVE=1 spike_run_live 5 "$ENVOUT" /bin/sh -c env
 closed_set_check "sh -c env" "$ENVOUT"
-: > "$ENVOUT"
+: >| "$ENVOUT"
 SPIKE_LIVE=1 spike_run_live 5 "$ENVOUT" /bin/bash -c env
 closed_set_check "bash -c env" "$ENVOUT"
 unset FOO_API_KEY FOO_HOME FOO_CONFIG_DIR BAR_TOKEN HTTPS_PROXY SSH_AUTH_SOCK XDG_CONFIG_HOME
 
 # The whole process group dies on timeout: a launcher that spawns a grandchild leaves no orphan.
-cat > "$SANDBOX/launcher.sh" <<EOF
+sbx_put "$SANDBOX/launcher.sh" <<EOF
 #!/bin/sh
 sleep 30 &
 echo \$! > "$SANDBOX/grandchild.pid"
@@ -727,7 +1129,7 @@ else
 fi
 
 # A command that exits normally but leaves a background child is swept too.
-cat > "$SANDBOX/leaver.sh" <<EOF
+sbx_put "$SANDBOX/leaver.sh" <<EOF
 #!/bin/sh
 sleep 30 </dev/null >/dev/null 2>&1 &
 echo \$! > "$SANDBOX/leftover.pid"
@@ -751,7 +1153,7 @@ check "alive: a running process is alive" alive "$RUNPID"
 kill -9 "$RUNPID" 2>/dev/null
 { wait "$RUNPID"; } 2>/dev/null
 rm -f "$SANDBOX/zombie.pid"
-perl -e 'my $p = fork; exit 0 unless $p; open my $f, ">", $ARGV[0] or exit 1; print $f "$p\n"; close $f; sleep 6' \
+/usr/bin/perl -e 'my $p = fork; exit 0 unless $p; open my $f, ">", $ARGV[0] or exit 1; print $f "$p\n"; close $f; sleep 6' \
   "$SANDBOX/zombie.pid" </dev/null >/dev/null 2>&1 &
 ZP=$!
 n=0
@@ -770,7 +1172,7 @@ kill -9 "$ZP" 2>/dev/null
 # Signals sent to the caller must not leave the command (or its grandchild) running.
 for sig in TERM HUP; do
   rm -f "$SANDBOX/sig.pids"
-  cat > "$SANDBOX/siglauncher.sh" <<EOF
+  sbx_put "$SANDBOX/siglauncher.sh" <<EOF
 #!/bin/sh
 sleep 33 &
 echo "\$\$ \$!" > "$SANDBOX/sig.pids.tmp"
@@ -778,7 +1180,7 @@ mv "$SANDBOX/sig.pids.tmp" "$SANDBOX/sig.pids"
 wait
 EOF
   chmod +x "$SANDBOX/siglauncher.sh"
-  SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live 60 /dev/null "$2"; echo AFTER' _ "$COMMON" "$SANDBOX/siglauncher.sh" > "$SANDBOX/sig.out" 2>/dev/null &
+  SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live 60 /dev/null "$2"; echo AFTER' _ "$COMMON" "$SANDBOX/siglauncher.sh" >| "$SANDBOX/sig.out" 2>/dev/null &
   CALLER=$!
   n=0
   while [ ! -s "$SANDBOX/sig.pids" ] && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
@@ -794,9 +1196,9 @@ EOF
   check "SIG$sig to the caller: exit status is a signal status" test "$RC" -gt 128
 done
 
-# Orphan sweep (decision 4): the caller is killed with SIGKILL, so no trap can run. The runner must notice that its caller
-# is gone and kill the command's group: the CLI and its grandchild must be gone within 3 s (bounded poll, gone_within).
-cat > "$SANDBOX/orphan.sh" <<EOF
+# Orphan sweep: the caller is killed with SIGKILL, so no trap can run. The helper notices that its parent changed and kills
+# the command's group: the CLI and its grandchild must be gone within 3 s (bounded poll, gone_within).
+sbx_put "$SANDBOX/orphan.sh" <<EOF
 #!/bin/sh
 sleep 33 &
 echo "\$\$ \$!" > "$SANDBOX/orphan.pids.tmp"
@@ -823,24 +1225,15 @@ if gone_within 30 "$OGPID"; then ok "orphan sweep: the grandchild is gone within
 { wait "$ORPHAN_CALLER"; } 2>/dev/null
 lacks "orphan sweep: the killed caller ran no further statement" "$(cat "$SANDBOX/orphan.out")" "AFTER"
 
-# Signal race (decision 5). The window between `&` and `$!` is a few microseconds, so the handler is tested directly:
-# a signal that arrives before the pid is known is recorded and nothing exits; once the pid is known, the group is killed
-# and the handler exits with the signal status.
-out="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; _SPIKE_CHILD_PID=""; _spike_signal 143; echo "PENDING=$_SPIKE_PENDING"; echo CONTINUED' _ "$COMMON" 2>/dev/null)"
-eq "signal before the pid is known: the handler does not exit (rc)" "0" "$?"
-has "signal before the pid is known: it is recorded for the handoff" "$out" "PENDING=143"
-has "signal before the pid is known: execution continues to the handoff" "$out" "CONTINUED"
-out="$(/bin/bash -c '. "$1"; sleep 30 & _SPIKE_CHILD_PID=$!; echo "PID=$_SPIKE_CHILD_PID"; _spike_signal 143; echo LATE' _ "$COMMON" 2>/dev/null)"
-eq "signal after the pid is known: exits with the signal status (rc)" "143" "$?"
-lacks "signal after the pid is known: nothing runs after the handler" "$out" "LATE"
-SIGPID="$(printf '%s\n' "$out" | sed -n 's/^PID=//p')"
-if gone_within 30 "$SIGPID"; then ok "signal after the pid is known: the command is gone"; else bad "signal after the pid is known: the command is gone"; kill -9 "$SIGPID" 2>/dev/null; fi
-out="$(/bin/bash -c '. "$1"; _spike_forward 143; echo "PEND=$_SPIKE_BG_PENDING"' _ "$COMMON" 2>/dev/null)"
-has "caller: a signal before the runner exists is recorded for the handoff" "$out" "PEND=143"
+# Signal race: the window between `&` and `$!` is a few microseconds, so the handler is tested directly. A signal that
+# arrives before the helper's pid is known is recorded and nothing exits.
+out="$(/bin/bash -c '. "$1"; _SPIKE_BG=""; _spike_forward 143; echo "PEND=$_SPIKE_BG_PENDING"; echo CONTINUED' _ "$COMMON" 2>/dev/null)"
+has "caller: a signal before the helper exists is recorded for the handoff" "$out" "PEND=143"
+has "caller: a signal before the helper exists does not exit" "$out" "CONTINUED"
 
-# Stress (decision 5): TERM or HUP sent right after the start of a live run leaves no command running. This exercises the
-# path; it does not prove the few-microsecond window is hit on every run.
-cat > "$SANDBOX/strl.sh" <<EOF
+# Stress: TERM or HUP sent right after the start of a live run leaves no command running. This exercises the path; it does
+# not prove the few-microsecond window is hit on every run.
+sbx_put "$SANDBOX/strl.sh" <<EOF
 #!/bin/sh
 sleep 33 &
 echo "\$\$ \$!" > "$SANDBOX/strl.pids.tmp"
@@ -894,12 +1287,13 @@ spike_capture_dir "../x" >/dev/null 2>&1
 eq "capture dir rejects a bad cli name (rc)" "2" "$?"
 
 CAPREPO="$SANDBOX/caprepo"
-mkdir -p "$CAPREPO"
+sbx_mkdir "$CAPREPO"
+check "the capture repo directory exists" test -d "$CAPREPO"
 git -C "$CAPREPO" init -q
 SPIKE_CAPTURES_ROOT="$CAPREPO/captures" spike_capture_dir demo >/dev/null 2>&1
 eq "capture dir refuses a root inside a repo that does not ignore it (rc)" "2" "$?"
 check "refused capture root was not created" test ! -e "$CAPREPO/captures"
-printf 'captures/\n' > "$CAPREPO/.gitignore"
+printf 'captures/\n' | sbx_put "$CAPREPO/.gitignore"
 CAP2="$(SPIKE_CAPTURES_ROOT="$CAPREPO/captures" spike_capture_dir demo)"
 eq "capture dir accepts a root inside a repo when git ignores it (rc)" "0" "$?"
 check "ignored capture dir exists" test -d "$CAP2"

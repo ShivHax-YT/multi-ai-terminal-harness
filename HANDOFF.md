@@ -1,190 +1,174 @@
 # HANDOFF T-001
 
-Branch T-001-round6, based on T-001 at a08a357. Round 6 fixes the four blockers from the round-4 review, as the lead decided.
+Branch T-001-round7, based on T-001 at 26cbcb4. Round 7 is the structural round the lead decided after six patch rounds (items A to F of
+the round-7 brief; lead commit 74e5bf9 added `spike/lib/runner.pl` to the owned files).
 
 ## Summary
-Round 6 closes the "checks one string, executes another" class. (1) A command is resolved ONCE, physically (`cd -P`, so a
-`..` after a symlink resolves as the kernel resolves it; runs of `/` are collapsed), and the runner executes that resolved path
-through `/usr/bin/env -i`, never a PATH re-search. (2) `spike_mark_verified <path> <cli>` runs the Mach-O magic check and the
-pinned-signer check itself, so a non-Mach-O or unsigned or wrong-team copy is never registered. (3) Ungated `codesign` read-only
-shapes accept only a path that resolves inside the private verify directory. (4) Preflight refuses paths inside the CLI home
-directories before any `file`, magic read or `cp`, with one narrow exception (the provider binary itself, magic-checked only). It
-also refuses an unsafe temporary directory, sweeps stale verify directories, and the runner's subshell replaces the inherited
-traps first. Built for macOS `/bin/bash` 3.2; only GNU bash 5.2 on Linux was run here. macOS, real codesign and real CLIs were NOT run.
-
-**HOST DAMAGE, needs a human before anything else: `/usr/bin/cp` and `/usr/bin/dd` on this machine are broken** (78-byte
-wrapper scripts that exec themselves; any command that calls them hangs). See Open risks, first item.
+Every earlier break came from bash reasoning about path strings or from a helper found on PATH. Round 7 removes both. ONE Perl
+helper, `spike/lib/runner.pl`, is started only as `/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C SPIKE_IN_x=... /usr/bin/perl
+runner.pl <subcommand> ...` (constant absolute paths; every argument follows the interpreter path, so `env` cannot read one as
+`VAR=value`; shebangs are `#!/bin/bash`). In one process it resolves a command physically (lstat walk, no control characters
+accepted or returned), compares (device, inode) of every directory and the file against the CLI homes of BOTH the
+password-database home and an absolute `$HOME`, opens the file once (`O_NOFOLLOW`), copies from that descriptor into a private
+0700 directory it creates itself, runs the fixed codesign on the copy, records the copy's sha256, re-hashes it before every
+status run, and runs commands as a process-group leader whose in-group watchdog survives a SIGKILL to the caller's group.
+`common.sh` keeps thin wrappers with the same public names and exit codes. The suites gained a structural sandbox guard.
+Built for macOS `/bin/bash` 3.2 and the macOS system perl; only GNU bash 5.2 / perl 5.38 on Linux was run here.
 
 ## Files changed
-- spike/lib/common.sh - rewritten for round 6: `readonly CODESIGN_BIN` (moved from preflight), `spike_resolve_path` (physical),
-  `_spike_resolve_cmd`, `spike_run_timed` (moved), `spike_magic_ok`, `spike_under_cli_home`, `spike_set_verify_dir`,
-  `spike_pinned_team`, `spike_verify_signer` (moved pinned-signer checks), `spike_mark_verified <path> <cli>`, `_spike_codesign_rooted`,
-  runner entry points on the resolved path, `_spike_run_timeout_body` traps first.
-- spike/preflight.sh - rewritten for round 6: parent-directory and private-directory safety, stale sweep, CLI-home refusal before
-  reads, registration through `spike_mark_verified`.
-- spike/tests/test_common.sh - round-6 assertions added; child shells use a sandbox copy of common.sh with a fake codesign.
-- spike/tests/test_preflight.sh - Mach-O-headed fixtures; scenarios 8, 8b, 9, 10, 11 added; the codesign-constant checks moved to common.sh.
-- spike/README.md - runner and verification rules, script index.
-- HANDOFF.md - this file.
+- spike/lib/runner.pl - NEW. The helper: `resolve`, `magic`, `clihome`, `tool-path`, `gate`, `run`, `register`, `vdir-create`,
+  `vdir-sweep`, `vdir-remove`. Core modules only (POSIX, Fcntl, Errno, Cwd, Digest::SHA). The codesign path and the pinned team ids
+  now live here. Loaded with `require` (by a test) it only defines its functions.
+- spike/lib/common.sh - rewritten tail: thin wrappers (`spike_resolve_path`, `spike_magic_ok`, `spike_under_cli_home`,
+  `spike_run_timeout`, `spike_run_live`, `spike_run_status`, `spike_run_timed`, `spike_mark_verified`) plus new
+  `spike_register_cli`, `spike_tool_path`, `spike_verify_init`, `spike_verify_dir`, `spike_verify_cleanup`. `spike_cleanup`
+  refuses control characters and resolves through the helper. Removed: `spike_set_verify_dir`, `spike_verify_signer`,
+  `spike_pinned_team`, `CODESIGN_BIN`, the `_spike_*` shape/identity/resolve functions, the bash watchdog.
+- spike/preflight.sh - one `spike_register_cli` call per CLI; no `file`, `cp`, `mktemp`, `perl` or `dirname` on a security path; jq and git
+  probed through the helper; TERM/INT/HUP end through `exit` so the EXIT trap removes the private directory.
+- spike/tests/test_common.sh - rewritten for the new design, plus the sandbox guard and the regressions below.
+- spike/tests/test_preflight.sh - rewritten likewise (wrapper scripts instead of symlinks, no `file` fake, new scenarios 8c, 12, 13, 14).
+- spike/README.md - helper, process-group promise (now exact), identity checks, exit codes, fixtures note.
+- HANDOFF.md - this file (stale HOST DAMAGE notes removed: the lead repaired the host with an apt reinstall; dpkg verify clean).
 - spike/.gitignore - unchanged.
 
 ## Tests run
-Environment: GNU bash 5.2.21 on Linux, root, no real provider CLI, no real codesign, no SPIKE_LIVE set by hand (the suites set it
-themselves where they test the gate). `/usr/bin/cp` and `/usr/bin/dd` are broken on this host (see Open risks), so every suite run
-here put TEST-ONLY shims on PATH (byte copy and `if=FILE bs=4 count=1`, kept in the scratchpad, not installed anywhere).
-- `bash -n` on spike/lib/common.sh, spike/preflight.sh, spike/tests/test_common.sh, spike/tests/test_preflight.sh: clean.
-- `/bin/bash spike/tests/test_common.sh`, three sequential runs: 445 passed, 0 failed in each (rc 0 each).
-- `/bin/bash spike/tests/test_preflight.sh`: 113 passed, 0 failed (final run on the committed code).
-- `make -s check-fast`: pass (compliance scan clean; no app stack yet, so no stack checks run). The spike suites are not wired into
-  `make check-fast` yet (lead follow-up).
-- NOT RUN: macOS `/bin/bash` 3.2 (human to run both suites and `spike/preflight.sh` on the Mac before merge), real codesign,
-  real claude or codex, shellcheck (not installed), the mutation checks of round 5 (not repeated this round).
+Environment: GNU bash 5.2.21, perl 5.38.2 (system), Linux, root, jq and git present, no real provider CLI, no real codesign, no
+SPIKE_LIVE set by hand (the suites set it only for fixture runs of fake commands). PATH was pinned to `/usr/bin:/bin` in every probe
+and in both suites (the real `claude` directory was never on it). The host-file hash
+(`sha256sum /usr/bin/* /bin/* | sha256sum`) was recorded before the first run and compared after every suite run: unchanged each time.
+- `bash -n` on the four shell files: clean. `/usr/bin/perl -c spike/lib/runner.pl`: syntax OK.
+- `/bin/bash spike/tests/test_common.sh`, three sequential runs on the final code: 561 passed, 0 failed each (rc 0).
+- `/bin/bash spike/tests/test_preflight.sh`: 141 passed, 0 failed (rc 0).
+- `spike/preflight.sh` under `env -i PATH=/usr/bin:/bin` with a scratch HOME/TMPDIR: table printed, rc 0, nothing left in TMPDIR.
+- `make -s check-fast`: pass (compliance scan clean; no app stack yet). The spike suites are not wired into it yet (lead follow-up).
+- NOT RUN: macOS `/bin/bash` 3.2 and the macOS system perl (human to run both suites and `spike/preflight.sh` on the Mac before
+  merge), real `codesign` on a real Mach-O, real claude or codex, shellcheck (not installed), mutation checks (an attempt to mutate
+  the shipped checks in place was refused by the auto-mode classifier, so none were run this round).
 
 ## Hard rules touched (rule numbers + the test that proves each)
-- Rule 1: the gate is unchanged for every provider CLI: `denied` cases in test_common (env, sh -c, launchers, renamed copies,
-  upper-case names, `spike_run_live` without the gate). The new resolver cannot widen it: `reviewer repro with a prompt is refused
-  (rc 3)`, `a symlink named alias-true to a provider copy is not ungated (rc 3)`.
-- Rule 2: no config-home variable is named anywhere in spike/ or this file (`make -s check-fast` compliance scan clean).
-- Rule 3: children are headless (stdin /dev/null, outfile); no PTY code. Unchanged from round 4.
-- Rule 4: `CLI home: ...` (test_common, 6 cases), `scenario 8: ...` and `scenario 8b: ...` (test_preflight), `codesign rooted: ...`
-  (6 cases), `gate: codesign --verify on a canary under a fake home ...`, `gate: codesign --verify through a symlink into the fake home ...`.
-- Rule 6: `registration refused: ...` (test_common, 13 cases incl. rc 3 from spike_run_status and nothing ran),
-  `registration accepts a Mach-O copy that passes the pinned signer (rc 0)`, `registered binary passes the identity check ...`,
-  `scenario 2 ...`, `scenario 11: ...`, `scenario 9: ...` (unsafe temporary directory), `scenario 10: ...` (stale sweep).
+- Rule 1: the gate is enforced twice (`gate` verdict, then again inside `run`): all `gate: ...` denied cases, the `identity: ...` shadow-copy
+  cases, `reviewer repro ...`, `PATH TOCTOU ...`, `spike_run_timed refuses a provider CLI name / argument / shell`.
+- Rule 2: no config-home variable is named anywhere in spike/ (`make -s check-fast`).
+- Rule 3: children are headless (stdin /dev/null, outfile); no PTY code.
+- Rule 4: `CLI home: ...` (each of the seven entries built from parts, symlink to HOME, `..` spelling, symlinked entry, hard link,
+  unresolvable fails closed), `candidate homes ...` (the password-database home is kept when HOME is unset, relative, `/`, has a control
+  character or points away), `scenario 8 / 8b / 8c` (canary through a symlink, the Mach-O exception, a hard link), `the helper refuses to create
+  the verify directory inside a CLI home`, `spike_run_timed refuses file(1) on a canary / hard link`.
+- Rule 6: `registration refused: ...` (six signer modes x three assertions, wrong CLI name, ELF, script, dash), `registered binary passes ...`,
+  `a registered copy swapped after registration is refused`, `fake perl on PATH ...`, `scenario 2 / 2b / 2c-2f / 6 / 7 / 11 / 12`.
 
-## Round 6: findings -> fix -> test
-Status: DONE = implemented and tested here on Linux bash 5.2. PARTIAL = implemented with a stated gap.
+## Round 7 (structural): decision -> implementation -> tests
+A. One perl helper, by absolute path.
+   - Implementation: `runner.pl` (above). `common.sh` calls it only through `_spike_helper` / `_spike_exec`:
+     `/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C "${_SPIKE_IN[@]}" /usr/bin/perl "$SPIKE_HELPER" <subcommand> "$@"`. The assignments all
+     precede the constant interpreter path, so no later argument is parsed by env (documented; the `=` regression proves it). The caller's
+     PATH/HOME/TMPDIR/LANG/TERM/USER/LOGNAME/SPIKE_LIVE arrive as `SPIKE_IN_*`; the helper copies them and clears %ENV. `@INC` is reduced to
+     absolute entries before any `use`. Resolve: lstat walk, `readlink`, at most 40 links, `..` pops a physical stack, only the final component
+     may be missing; a trailing slash, a final `.`/`..` or any control character (input, link target, output) is refused. Registration
+     (`register`): open once, `fstat` regular, same (dev, ino) as the lstat, link count 1, first four bytes read from that descriptor, copy from
+     that descriptor to `<vdir>/<cli>` (0700, O_EXCL), sha256, codesign on the copy (pipe capture, no temp file), re-hash, registry line
+     `sha256 TAB cli TAB copy`. `gate` / `run` apply the ungated identity rules (system dirs, exact shapes, launcher list, provider names in
+     arguments, codesign shape + rooted in the helper-made verify directory) on the resolved path.
+   - Tests: `fake perl on PATH ...` (test_common) and scenario 12 (preflight), `a command path containing = runs ...`, `shebang is /bin/bash ...`,
+     `common.sh starts no program named perl by name`, `no shipped script uses env to find an interpreter`.
+B. In-group watchdog.
+   - Implementation: `run` does `setpgid(0,0)`, blocks TERM/INT/HUP, installs handlers, forks the command into that group, then polls every 50 ms
+     for exit, timeout (POSIX::times ticks; 1..3600, decimal), TERM/INT/HUP and a changed parent pid (the caller died). Sweep: ignore the
+     signals, TERM the group, move the helper into a throwaway group (`leave_group`, so the final KILL cannot hit it), 0.3 s, KILL the group;
+     status 124 / 143 / 130 / 129, or the command's own. `_spike_exec` starts the helper as a plain background command so its parent is the
+     calling shell, forwards TERM/INT/HUP, and restores the caller's traps.
+   - Tests: `process group: ...` (setsid caller, `kill -9 -- -PGID`, launcher and grandchild gone within 3 s; the command is not in the caller's
+     group; SIGKILL to the helper's group kills the command), plus the retained SIGTERM/SIGHUP, orphan (kill -9 caller), leaver, timeout,
+     closed-set and stress blocks.
+C. Test sandbox guard.
+   - Implementation: `set -o noclobber`; `sbx_put` (refuses a relative path, a physical parent outside `$SANDBOX`, an existing symlink, a link count
+     above 1; refusals are logged to a file because writers run in pipelines, and the suite then fails), `sbx_ln` (`ln -sfn`), `sbx_cp`,
+     `sbx_mkdir`; `mkbin` writes wrapper scripts (`exec /usr/bin/X "$@"`); an EXIT tripwire hashes the host tools (test_preflight: every tool
+     mkbin wraps and the ones it runs; test_common: a fixed list of the host tools it runs); `spike_cleanup` on `/` and the real `$HOME` runs with
+     `rm` shadowed by a recorder, plus decoy-home variants inside the sandbox. Fake codesign fixtures decide the team from the basename of the LAST
+     argument (and, in test_common, a `signer:` marker in the target's content), never from the whole command line.
+D. Regressions: Opus 1 `fake perl on PATH`; 2 `process group`; 3 `trailing newline` (resolver, run_live, mark_verified, registry-line injection,
+   cleanup); 4 `containing =`; 5 `hard link` (CLI-home test, registration, preflight scenario 8c, probe arguments); 6 `verify directory` (variable
+   pointed at a CLI home, look-alike inside a home, TMPDIR inside a home, world-writable TMPDIR, `spike_set_verify_dir` gone); 7 the guard itself;
+   8 `timeout 08 / 010 / 0005 / 0 / 3601 / ...`; 9 `TERM during a registration` (test_common) and `scenario 13` (preflight TERM: no `spike-verify.*`,
+   no scratch file, the command is gone); 10 `scenario 14` and the `spike_run_timed` closed-environment tests. Sonnet: `candidate homes` tests,
+   `a registered copy swapped after registration is refused`, fake codesign basename matching.
+E. bash 3.2 / macOS perl: only syntax and builtins that 3.2 has (no `+=`, no associative arrays, no `${!x}`, arrays never expanded empty); the perl
+   code avoids post-5.18 features (`/r`, `say`, postfix deref). Not run on a Mac.
 
-1. Physical resolution, execute the resolved path (rules 1, 6; blocker). DONE.
-   - Fix: `spike_resolve_path` uses `cd -P` on each directory, follows each symlink, collapses `//`, refuses a final `.`, `..`
-     or trailing slash, max 40 links. `_spike_resolve_cmd` does the one PATH lookup (`type -P`). Every entry point executes the
-     resolved path through `/usr/bin/env -i` (no PATH search by env).
-   - Tests: `reviewer repro resolves to the physical target, not /usr/bin/printf`, `reviewer repro with a prompt is refused (rc 3)`,
-     `reviewer repro: the fake printf under the physical target never ran`, `reviewer repro without a prompt is refused too (rc 3)`,
-     `reviewer repro (no prompt): the fake printf never ran`, `//usr//bin/printf runs the real printf (rc 0)`,
-     `//usr//bin/printf resolves to /usr/bin/printf`, `PATH TOCTOU: the swapped printf never ran in 25 trials (bad runs)`,
-     `PATH TOCTOU: every trial ran the resolved printf or refused (rc 0 or 3)`.
-2. Registration verifies (rule 6; blocker). DONE.
-   - Fix: `spike_mark_verified <path> <cli>` refuses symlinks, then resolves, then requires the Mach-O magic (first four bytes, `dd`
-     + `od`: cf fa ed fe, fe ed fa cf, ce fa ed fe, fe ed fa ce, ca fe ba be, be ba fe ca), then requires a pinned team for `<cli>`,
-     then runs `spike_verify_signer` (codesign verify, Developer ID authority, pinned team, chain-to-Apple requirement). Preflight
-     calls it on the private copy. The codesign constant moved to common.sh.
-   - Tests: the thirteen `registration refused:` cases (unsigned, wrong team, ad-hoc, forged, Apple Development, codesign rc 3,
-     a Claude-team copy under the codex name, ELF header named claude, shell script with a Mach-O name, a copy of dash named claude),
-     each with `so spike_run_status refuses it (rc 3)` and `and nothing ran`; `registration accepts ... (rc 0)`;
-     `registration asked codesign about the copy path (verify)`; `registration checked the chain-to-Apple requirement`;
-     `registered binary passes the identity check and runs through spike_run_status (rc 0)`.
-   - PARTIAL (test-only): on Linux the positive run goes through execvp's ENOEXEC fallback to `/bin/sh` (see Decisions 2). Real
-     Mach-O runs are not exercised here.
-3. Codesign rooted (rule 4). DONE.
-   - Fix: the ungated codesign shapes also require `_spike_codesign_rooted`: the last argument must resolve physically inside the
-     directory `spike_set_verify_dir` recorded (preflight's private directory). With no directory set, nothing is rooted.
-   - Tests: `codesign rooted: a path inside the verify directory` (1), `...the verify directory itself...` (0), `...a canary path
-     under a fake home` (0), `...a symlink in the verify directory that leads to the canary` (0), `...a .. escape out of the verify
-     directory` (0), `...no verify directory set` (0); `gate: codesign --verify on a canary under a fake home ...`; `gate: codesign
-     --verify through a symlink into the fake home ...`; `the canary was never copied or read into a verify output`.
-   - PARTIAL: the positive ungated codesign run (identity check plus rooting) needs a system codesign, so it runs on macOS only; the
-     Linux suite proves the rooting function and the denials.
-4. Denylist before read (rule 4). DONE, with a deliberate superset (Decision 1).
-   - Fix: `spike_under_cli_home` runs before `file`, the magic read and `cp`. A path inside any dot-entry directly under the
-     physical HOME, or inside the physical target of such an entry, is refused. The one exception: the PATH-resolved provider binary
-     itself, when its first four bytes are a Mach-O magic (`dd bs=4 count=1`); nothing else is read. HOME unset, `/` or unresolvable
-     fails closed.
-   - Tests: `CLI home: a file under a dot-directory of HOME is refused`, `...any other dot-directory...`, `...an ordinary path under
-     HOME is not refused`, `...a dot-entry symlinked to an outside directory...`, `...an outside path is not refused`, `...HOME unset
-     fails closed`; `scenario 8: the canary provider path is refused by the CLI-home rule`, `...the canary text never appears in the
-     report`, `...no file(1) call names the canary`, `...no cp call names the canary`, `...the only dd call that touches the canary
-     reads four bytes`, `...the canary was not copied`; `scenario 8b: the Mach-O provider binary inside a CLI home is allowed`.
-5. Private directory safety (rule 6). DONE.
-   - Fix: the parent of the private directory must be sticky, or owned by this user and not group- or world-writable; otherwise
-     preflight prints `needs human review` and exits 1 before creating anything. The private directory itself must be owned by this
-     user with mode 700. Stale `spike-preflight-verify.*` directories owned by this user, real directories, whose `.owner` pid is dead
-     are removed at start.
-   - Tests: `scenario 9: a world-writable temporary directory without the sticky bit -> exit 1`, `...the refusal says needs human
-     review`, `...no CLI ran in the unsafe directory`, `scenario 9: a sticky temporary directory is accepted (exit 0)`;
-     `scenario 10: the stale directory (dead owner) was swept`, `...a directory whose owner is alive is left alone`, `...the run's
-     own private directory is removed on exit`.
-6. Subshell trap window (decision 6). DONE, structurally proven only.
-   - Fix: the first statement of `_spike_run_timeout_body` installs the runner's TERM, INT, HUP and EXIT traps. The caller resets
-     `_SPIKE_PENDING` before forking the subshell, so the subshell never clears a signal it recorded.
-   - Test: `item 6: the runner body's first statement replaces the TERM trap` (reads `declare -f`). A behavioural test of the
-     few-microsecond window is not deterministic; the stress block exercises the path, as in round 4.
-
-## Assertions changed in round 6 (none deleted; each change is forced by items 1 to 6)
-test_common.sh:
-- The registered copies behind `status runner runs registered verified copies ... (rc 0)`, `allowed status calls did start the
-  verified copies` (3), `spike_run_status refuses a registered copy whose name is a launcher (rc 3)`, `spike_run_status with a
-  prompt is refused even for a registered copy ... (rc 3)`, and the two `spike_run_status of a renamed binary ...` okruns are now
-  Mach-O-headed fixtures registered with `spike_mark_verified <path> <cli>` (the signature changed from `<path>` to `<path> <cli>`).
-  Same expectations, same names.
-- `codesign --verify --strict <provider path> (system codesign)` and `codesign -dv --verbose=2 <provider path> (system codesign)`
-  are now `... <path inside the verify dir> ...` and run after `spike_set_verify_dir`. They run only where /usr/bin/codesign exists.
-- `spike_mark_verified refuses a relative path / a symlink / a directory (rc 2)`: same expectations; the call now passes a `<cli>`.
-New assertions (not replacing any): the registration, rooted, reviewer-repro, TOCTOU, `//usr//bin/printf`, CLI-home and item-6 blocks.
-
-test_preflight.sh:
-- `scenario 1: version is shown` is replaced by `scenario 1: the version run reached the fixture body (its log line; ...)`.
-  Reason: on Linux the `/bin/sh` fallback that runs a Mach-O-headed fixture writes one "not found" line for the magic bytes before the
-  body, so the fixture's first output line is not its version. Real Mach-O CLIs have no such line.
-- `scenario 8b: the copy runs and reports its version` is replaced by `scenario 8b: the copy runs (its body wrote the log ...)`. Same reason.
-- `the shipped script keeps the fixed codesign path` now checks spike/lib/common.sh (the constant moved there); a new assertion checks
-  that preflight.sh defines no codesign constant of its own, and that the sandbox copy differs from the shipped common.sh only in the
-  codesign line.
-- Fixtures of scenarios 1, 2, 2b, 2c-2f, 3b, 3c, 6, 7: Mach-O-headed. Scenario 3c's bodies now `exec /nonexistent/interpreter`
-  (exit 127, `needs human review`), the same outcome as before.
+## Assertions changed or removed in round 7: 34 names gone or renamed (24 in test_common, 10 in test_preflight), none weakened without a reason
+Found by comparing assertion names with 26cbcb4. Removed because the code they probed is gone (11):
+- 6 direct tests of `_spike_signal` (`signal before/after the pid is known ...`): the bash watchdog is replaced by the helper's handler, installed
+  before the fork, so there is no pid-recording window; behavior is covered by the stress block and `process group`.
+- `item 6: the runner body's first statement replaces the TERM trap` (2 names): there is no runner body in bash any more.
+- `spike_run_status refuses a registered copy whose name is a launcher` (3 names): a copy is named after the CLI, never after the source, so a
+  launcher name cannot be registered. Replaced by `spike_run_status refuses the launcher-named ORIGINAL even after it was registered` (3 names).
+Changed meaning or renamed (23):
+- `CLI home: any other dot-directory of HOME is refused too (superset of the list)`, `a file under a dot-directory of HOME is refused`,
+  `a dot-entry symlinked to an outside directory refuses that directory` (3 names): now exact-list assertions (round 6 refused every
+  dot-directory; the list is the seven entries, so `~/.local/bin/claude` is now allowed). The symlinked-entry case is kept for a listed entry.
+- `CLI home: HOME unset fails closed (refused)`: now `HOME unset: an unrelated path is judged by the account home` plus the `candidate homes ...`
+  tests (the password-database home is always checked).
+- `cleanup refuses / (rc)` and `cleanup refuses \$HOME (rc)`: merged into one assertion run with `rm` shadowed, plus a decoy-home variant.
+- `jq --version needs the gate (jq left the ungated list, rule 1)`: renamed, same assertion.
+- `caller: a signal before the runner exists is recorded for the handoff`: renamed `... before the helper exists ...`, same assertion.
+- `gate: spike_run_status with a prompt` / `... with --version and extra args`: renamed `... (unregistered path)`; registered-copy variants added.
+- Codesign-constant assertions (`the shipped common.sh keeps the fixed codesign path`, `sandbox copy points the codesign constant at the fake`,
+  `the sandbox copy differs from the shipped common.sh only in the codesign constant`; 4 names across the two suites): now about `runner.pl`.
+- `registration asked codesign about the copy path (verify)`: now checks the helper-made copy path `<vdir>/claude`; a new assertion checks the
+  original path was never given to codesign.
+- scenario 8: `no file(1) call names the canary`, `no cp call names the canary`, `the canary was not copied into the private directory`,
+  `the only dd call that touches the canary reads four bytes` (4 names): replaced by `no file, dd or cp call was made at all` (preflight no
+  longer calls any of them; the helper reads four bytes from the descriptor).
+- scenario 1 and 8b: two log-line assertions renamed (wording only: the "round 6 note" became a header note).
+- scenario 11: `a shell script named codex is NOT VERIFIED (not a Mach-O file)` is now `... is a launcher, not executed` (the helper classifies by `#!`,
+  as scenario 3 always did; the fake `file` that said Mach-O is gone). The ELF assertion is unchanged.
+Same name, different fixture or call (not listed one by one): every `spike_run_status` call passes `$SPIKE_VERIFIED_COPY`; `codesign rooted` uses a
+verify directory made by the helper; the codesign shape tests call `codesign_shape` from the helper loaded as a library; scenario 3 no longer uses
+the real `file`; the sweep scenario uses `spike-verify.*` names; all symlinks are made with `ln -sfn`.
+Added: roughly 100 names in test_common and 28 in test_preflight (see D).
 
 ## Decisions I made myself
-1. Denylist superset, and the list is NOT in spike/. The compliance scan forbids the CLI home names in any file outside its allowlist
-   (spike/ is not allowlisted), so spike/lib and tests name none of them. The denylist is therefore: any dot-entry directly under the
-   physical HOME, and the physical target of any dot-entry symlink. This refuses every home that rule 4 lists, and more. The explicit
-   list belongs in compliance/ (follow-up for the lead, shared file). Cost: a script launcher inside a dot-directory is refused instead
-   of classified.
-2. The positive run tests use fixtures whose first four bytes are a Mach-O magic followed by a shell body. On Linux, `env` (execvp)
-   hands such a file to `/bin/sh`, which prints one "not found" line and then runs the body. This is test-only. It is the same
-   fallback on macOS, but that was not run here. Production never executes a non-Mach-O: registration refuses it first.
-3. `spike_mark_verified` takes the CLI name as its second argument, because the pinned team depends on it.
-4. `env` is invoked as the absolute `/usr/bin/env` (no PATH search by env). `perl` is still found on PATH (trusted tool, not a provider).
-5. Preflight exits 1 (`needs human review`) if the temporary directory is writable by others without the sticky bit. That is the
-   human-review route the brief asks for.
-6. The stale sweep only removes directories whose `.owner` record names a dead pid. A directory without that record is left alone.
-   A SIGKILL between `mktemp` and writing the record leaves a directory behind (rare, documented).
-7. `spike_verify_signer` is the shared pinned-signer check; `spike_mark_verified` calls it, and preflight reads the signature column
-   from `SPIKE_SIG_TEXT` set by it.
-8. `spike_under_cli_home` fails closed when HOME is unset, `/`, or cannot be resolved.
+1. The copy path is `<vdir>/<cli>` (`<cli>.N` if taken) and `spike_run_status` accepts only that path; `spike_mark_verified` therefore sets
+   `SPIKE_VERIFIED_COPY` and callers pass it on. The original path is never accepted.
+2. Two-step command start: `gate` (verdict and resolved path; rc 0 ok / 1 needs live / 2 unresolved / 3 refuse) then `run` on the exact physical
+   path, which re-enforces the policy in the executing process. A refusal at exec time returns 125, so helper-internal codes never collide with the
+   gate's rc 3 that stops the script.
+3. The CLI-home list is exact (the seven names, built from parts). A hard-linked regular file is refused wherever it lies (registration,
+   `spike_under_cli_home`, probe arguments): a link count cannot show where a link leads, and enumerating a credential directory to find the target
+   would itself touch it.
+4. `spike_run_timed` is now a probe for `jq`, `git` and `file` only (closed environment, same watchdog, no provider names, no CLI-home arguments).
+   It used to run any fixed tool by PATH name.
+5. `file(1)` is no longer used by preflight; classification is a `#!` or Mach-O magic read from the opened descriptor.
+6. A path that cannot be resolved fails closed in `spike_under_cli_home` (it used to be judged by string).
+7. `exit(main(@ARGV)) unless caller;` lets tests load `runner.pl` as a library to unit-test pure functions (`candidate_homes`, `codesign_shape`,
+   `codesign_rooted`); running it as a script is unchanged.
+8. PATH is pinned to `/usr/bin:/bin` plus jq's directory in both suites.
 
 ## Open risks / questions
-- HOST DAMAGE (highest priority, human action needed): `/usr/bin/cp` and `/usr/bin/dd` on this machine were overwritten by a
-  test-fixture bug in round 6 (scenario 8 wrote logging wrappers through symlinks that `mkbin` had created to the system binaries).
-  The fixture is fixed (it removes those links before writing). The two files are now 78-byte shell wrappers that exec themselves
-  and hang. An attempt by this agent to write the originals back was denied by the auto-mode safety check, and I did not try
-  another route. The original binaries from the package (coreutils 9.4-3ubuntu6.3) are extracted, not installed, at
-  `/tmp/claude-0/-home-user/7e5d6d3f-e3ee-5774-9d97-7557dc926aa7/scratchpad/restore/x/usr/bin/cp` and
-  `/tmp/claude-0/-home-user/7e5d6d3f-e3ee-5774-9d97-7557dc926aa7/scratchpad/restore/x/usr/bin/dd`. Human restore, for example:
-  `sudo install -m 0755 <that cp> /usr/bin/cp` and the same for dd, or `sudo apt-get install --reinstall coreutils`; then
-  `dpkg --verify coreutils` should be clean. I also ran `apt-get update` to fetch the package. The suites above passed only with
-  TEST-ONLY shims on PATH.
 - Pinned team ids Q6L2SF6YDW (claude) and 2DC432GLL2 (codex) are taken from this Mac's installed binaries and are NOT confirmed against
   vendor-published values. HUMAN ACTION before release. A vendor re-sign under another team fails closed (UNTRUSTED).
-- A CLI that finds its own resources relative to its installed location may not run from the private copy. The row then says
-  "needs human review" (never a fallback). Must be checked on the Mac with the real claude and codex.
-- Residual race in preflight: between the CLI-home check and `cp`, the provider path could be swapped by a process that already
-  has write access to the provider's install directory (the same user). Not closed here; documented.
-- The denylist is a superset and lives in code, not in compliance/ (Decision 1). The explicit list should move there.
-- The stress block and the signal tests have a timing history: a flake was seen in round 4 and not reproduced in round 5 or in
-  this round's three runs. The root cause is still open. The three-run result above is the evidence for this round only.
-- macOS `/bin/bash` 3.2 not run. Assumed behaviours to check there: `type -P`, `cd -P`, `readlink` without `-f`, `declare -f` layout
-  (used by the item-6 test), `dd bs=4 count=1`, `od -An -tx1`, `mktemp -d`, `perl stat`.
-- shellcheck not run.
-- The `file` and `codesign` checks on a real Mach-O are not exercised anywhere in this round.
+- A SIGKILL sent to the helper process ALONE (by pid) can leave the command running; a SIGKILL to the helper's group or to the caller's group
+  cannot. The README says so. A same-account process that can write the private directory, the install directory or the registry is outside the model.
+- Residual race: between the hash check and the exec of a status run there is a few-millisecond window inside a 0700 directory of the same account.
+- A CLI that finds its own resources relative to its installed location may not run from the private copy. The row then says "needs human review"
+  (never a fallback). Must be checked on the Mac with the real claude and codex.
+- Case-insensitive and firmlink spellings are handled by (dev, ino) but could not be exercised on Linux; the human should run both suites on the Mac.
+- The explicit CLI-home list still lives in code (built from parts); the list belongs in compliance/ (follow-up for the lead, shared file).
+- The stress and signal tests have a timing history; they passed in every run of this round.
+- shellcheck not run; macOS bash 3.2 and macOS system perl 5.18 not run; real codesign on a real Mach-O not exercised; no mutation checks.
 
 ## Confidence
-Medium-high for the logic on GNU bash 5.2 / Linux: every new check has a test that fails on the old behaviour (reasoned from the
-probes: default `cd` gives /usr/bin where the kernel runs the fake; `cd -P` matches the kernel). Medium-low on the Mac (3.2, real
-CLIs, real codesign): not run. The host's `cp` and `dd` must be restored before any further run of these suites.
+Medium-high for the logic on GNU bash 5.2 / perl 5.38 / Linux: each Opus finding has a regression that fails on the 26cbcb4 behavior by design (fake
+perl, group SIGKILL, newline, `=`, hard link, verify directory, octal timeout, TERM leak, env), though I did not run mutations to prove it. Medium-low on
+the Mac (bash 3.2, perl 5.18, real codesign, real CLIs): not run.
 
 ## Follow-ups for shared files (lead)
 - Makefile: add a `spike-test` target running `/bin/bash` on each `spike/tests/*.sh`, and include it in `check-fast`.
-- .github/workflows/ci.yml: extend the shellcheck step to spike/ (`shellcheck -S warning spike/lib/common.sh spike/preflight.sh spike/tests/*.sh`).
-- compliance/: add a denylist file with the explicit CLI home list (rule 4), and have spike read it instead of the superset in code.
-- Host: restore /usr/bin/cp and /usr/bin/dd (see Open risks). This is outside the repo and needs a human.
-- Later briefs (T-002, T-003, T-007) must start provider CLIs with `spike_run_live` and call `spike_require_live` first at top level.
+- .github/workflows/ci.yml: extend the shellcheck step to spike/ (`shellcheck -S warning spike/lib/common.sh spike/preflight.sh spike/tests/*.sh`);
+  `spike/lib/runner.pl` can be checked with `perl -c`.
+- compliance/: add a denylist file with the explicit CLI home list (rule 4) for the helper to read instead of the parts-built list. The scan's
+  `TEXT_EXT_RE` does not include `.pl`, so `runner.pl` is not scanned at all; add `pl`.
+- Later briefs (T-002, T-003, T-007) must start provider CLIs with `spike_run_live`, call `spike_require_live` first at top level, and (if they
+  register) pass `$SPIKE_VERIFIED_COPY` to `spike_run_status`.

@@ -2,7 +2,8 @@
 
 Throwaway bash + jq scripts that prove the harness can drive the two provider CLIs through their documented headless
 interfaces (`claude -p --output-format stream-json`, `codex exec --json`), parse every event, and resume a session. They
-are not product code. Requirements: macOS `/bin/bash` 3.2, `jq`, `git`.
+are not product code. Requirements: macOS `/bin/bash` 3.2, `jq`, `git`, and the system `perl` at `/usr/bin/perl` (macOS and
+most Linux have it; only core modules are used).
 
 ## Rules for every script here
 
@@ -18,36 +19,55 @@ are not product code. Requirements: macOS `/bin/bash` 3.2, `jq`, `git`.
   - **Every real prompt or session goes through `spike_run_live`**, which always checks the gate first. The non-live
     runner `spike_run_timeout` is default-deny by identity, not by name. Without `SPIKE_LIVE=1` it runs only
     `git --version`, the read-only `codesign` verify shapes (only on a path inside the private verify directory), `true`,
-    `false`, `sleep`, `echo` and `printf`. Each command is resolved ONCE, physically (a PATH lookup, then every symlink,
-    with `..` applied the way the kernel applies it), and the resolved path is the one that runs, through
-    `/usr/bin/env -i` with no PATH search. Ungated only when that resolved path is in `/bin`, `/usr/bin`, `/usr/sbin` or
-    `/sbin`. A copy of any of those names in another directory, a relative path such as `./x`, a launcher, and every
-    provider CLI (claude, codex, grok, gemini, kimi) needs the gate, whatever its name.
-    `jq`, `file` and `cat` are not on the list: scripts call them directly, never through the runner.
-  - **`spike_run_status` runs only a private copy that `preflight.sh` verified and registered** with
-    `spike_mark_verified`, and only `--version`, `auth status` or `login status`. Any other path, any other shape,
-    and any launcher-named copy is refused (rc 3, nothing started). `SPIKE_LIVE=1` does not lift that refusal.
+    `false`, `sleep`, `echo` and `printf`. Each command is resolved ONCE, physically (a PATH lookup inside the helper,
+    then every symlink, with `..` applied the way the kernel applies it), and the resolved path is the one that runs.
+    Ungated only when that resolved path is in `/bin`, `/usr/bin`, `/usr/sbin` or `/sbin`. A copy of any of those names in
+    another directory, a relative path such as `./x`, a launcher, and every provider CLI (claude, codex, grok, gemini,
+    kimi) needs the gate, whatever its name.
+    `jq`, `file` and `cat` are not on the list. `spike_run_timed` probes `jq`, `git` and `file` (display only, never with a
+    provider name in the arguments) with the same closed environment and watchdog.
+  - **`spike_run_status` runs only the private copy that registration produced** (`$SPIKE_VERIFIED_COPY`), only while its
+    content still has the sha256 recorded at registration, and only `--version`, `auth status` or `login status`. Any other
+    path, a changed copy, and any other shape is refused (rc 3, nothing started). `SPIKE_LIVE=1` does not lift that refusal.
+- **One helper makes every security decision: `lib/runner.pl`.** `lib/common.sh` starts it only as
+  `/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C SPIKE_IN_*=... /usr/bin/perl lib/runner.pl <subcommand> ...`: the
+  interpreter, `env` and the helper are constant absolute paths, so no `perl`, `env` or `bash` found on `PATH` can stand in
+  for them, and the caller's `PERL*` variables are dropped. Every argument comes after the interpreter path, so `env` can
+  never read an argument (a command path that contains `=`, for example) as a `VAR=value` assignment. The caller's `PATH`,
+  `HOME`, `TMPDIR`, `LANG`, `TERM`, `USER`, `LOGNAME` and `SPIKE_LIVE` reach the helper as `SPIKE_IN_*` values. The helper
+  refuses any control character (newline included) in a path it is given, reads or returns, so a `$(...)` in the caller can
+  never strip or add bytes. Shebangs are `#!/bin/bash`.
 - **Children run with a scrubbed environment** (`PATH HOME TMPDIR LANG TERM`, plus `USER`/`LOGNAME` because a CLI looks up
-  its own stored login under the account name), in their own process group. The group is killed on timeout, when the
-  caller receives TERM, INT or HUP, and when the runner exits; a command that exits but leaves children behind is swept.
-  The runner also watches its caller and kills the group about 0.5 s after the caller disappears, even after SIGKILL.
-  A TERM, INT or HUP that lands between starting a command and recording its pid is recorded and handled right after.
-  Children get stdin from `/dev/null` and write to the outfile. They are not in a new session, so a CLI that opens the
-  terminal device is out of scope: the spikes are headless only (rule 3).
-- **Binaries are verified before they are executed, and registration verifies them itself.** `preflight.sh` first checks
-  whether the resolved binary lies inside a CLI home directory (rule 4). Such a path is never read, except the provider
-  binary itself when its first four bytes are a Mach-O magic. Otherwise `file` classifies it, and a Mach-O is copied into
-  a private directory (mode 700, removed on exit). A stale one left by a killed run is swept at start, and a temporary
-  directory that others can write without the sticky bit stops preflight for human review. The copy is registered with
-  `spike_mark_verified <copy> <cli>`, which checks the Mach-O magic (first four bytes) and then the pinned signer:
-  `codesign --verify --strict`, a `Developer ID Application` authority, the pinned team identifier for that CLI, and an
-  `anchor apple generic` requirement for that team. Only the registered copy is executed. Ad-hoc, unsigned, wrong-team,
-  forged, non-Mach-O and script files are reported (`skipped (unverified)`) and never executed. A script launcher is
-  never executed either: its SIGNATURE cell says `launcher only, not executed (needs human approval)`. A copy that cannot
-  run is reported `needs human review`; the original path is never used as a fallback. The codesign path is the fixed
-  constant `CODESIGN_BIN` (`/usr/bin/codesign`) in `lib/common.sh`; no environment variable or flag changes it. Without
-  that tool every CLI is `skipped (unverified)`. The pinned team ids sit in one labeled block in `lib/common.sh`;
-  **the human must confirm them against vendor-published values before release.**
+  its own stored login under the account name), built inside the helper, in their own process group. The helper leads that
+  new group, forks the command into it, and watches it: it kills the whole group (TERM, 0.3 s, KILL) on timeout, on
+  TERM/INT/HUP to the helper, and when the caller disappears (the helper's parent pid changes; polled every 50 ms). Because
+  the watchdog is in the command's group and not in the caller's, **a SIGKILL to the caller, or to the caller's whole process
+  group, cannot orphan the command**, and a SIGKILL to the helper's own group kills the command with it. The one case that
+  can leave a command running is a SIGKILL sent to the helper process alone, by its pid (nothing is left to sweep): do not
+  do that. A command that exits but leaves children behind is swept. Timeouts are digits only, read as decimal (`08` and
+  `010` are 8 and 10, never octal), 1 to 3600. Children get stdin from `/dev/null` and write to the outfile. They are not
+  in a new session, so a CLI that opens the terminal device is out of scope: the spikes are headless only (rule 3).
+- **Binaries are verified before they are executed; registration checks identity, not strings.** `preflight.sh` asks the
+  helper to look the CLI up on `PATH` and resolve it once, physically. The helper compares the **device and inode** of every
+  directory on the path and of the file against the CLI homes (the seven rule-4 entries) of both the account's
+  password-database home and an absolute `$HOME`, so a symlink, a `..` spelling, a hard link, a case-insensitive spelling or a
+  firmlink cannot hide a home, and an `HOME` pointed away never lifts the check. A path inside a CLI home is never read,
+  except the provider binary itself, whose first four bytes are checked for a Mach-O magic (the ratified narrow exception).
+  A hard-linked file is refused before any read. The file is opened **once** (`O_NOFOLLOW`), checked with `fstat`, and a
+  Mach-O is copied **from that descriptor** into a private directory (mode 700, `spike-verify.<id>` under the temporary
+  directory, removed on exit) that the helper itself creates; `spike_verify_dir` only reads its name, nothing can point it
+  elsewhere, and the helper re-validates it (owner, mode, name, not inside a CLI home) on every use. A stale one left by a
+  killed run is swept at start. A temporary directory that others can write without the sticky bit, or that lies inside a CLI
+  home, stops preflight (exit 1, needs human review). The COPY is checked with the fixed `codesign` (`--verify --strict`,
+  a `Developer ID Application` authority, the pinned team identifier for that CLI, and an `anchor apple generic` requirement
+  for that team); its sha256 is recorded, and `spike_run_status` re-hashes it before it executes it. Ad-hoc, unsigned,
+  wrong-team, forged, non-Mach-O and script files are reported (`skipped (unverified)`) and never executed. A script
+  launcher is never executed either: its SIGNATURE cell says `launcher only, not executed (needs human approval)`. A copy that
+  cannot run is reported `needs human review`; the original path is never used as a fallback. The codesign path is the fixed
+  constant `CODESIGN_BIN` (`/usr/bin/codesign`) inside `lib/runner.pl`; no environment variable or flag changes it. Without
+  that tool every CLI is `skipped (unverified)`. The pinned team ids sit in one labeled block in `lib/runner.pl`;
+  **the human must confirm them against vendor-published values before release.** A process of the same account that can
+  write the private directory or the install directory is outside this threat model.
 - **Scratch repos live outside this repo**, under `${TMPDIR:-/tmp}/harness-spike/<run-id>/`, so this repo's CLAUDE.md,
   hooks and settings never load into a spiked CLI session. `spike_cleanup` refuses to delete anything outside that root.
 - **Captures are gitignored** (`spike/captures/<cli>/<UTC timestamp>/`). Run captured output through `spike_redact`
@@ -72,9 +92,10 @@ are not product code. Requirements: macOS `/bin/bash` 3.2, `jq`, `git`.
 
 | Path | Status | Purpose |
 |---|---|---|
-| `lib/common.sh` | done (T-001) | sourced helpers: `spike_scratch_repo`, `spike_worktree_add`, `spike_cleanup`, `spike_require_live`, `spike_capture_dir`, `spike_redact`, `spike_resolve_path`, `spike_run_timeout`, `spike_run_live`, `spike_run_status`, `spike_mark_verified <path> <cli>` (runs the pinned-signer and magic checks itself), `spike_verify_signer`, `spike_magic_ok`, `spike_under_cli_home`, `spike_set_verify_dir` |
+| `lib/common.sh` | done (T-001) | sourced helpers: `spike_scratch_repo`, `spike_worktree_add`, `spike_cleanup`, `spike_require_live`, `spike_capture_dir`, `spike_redact`, `spike_resolve_path`, `spike_run_timeout`, `spike_run_live`, `spike_run_status <seconds> <out> "$SPIKE_VERIFIED_COPY" ...`, `spike_run_timed`, `spike_mark_verified <path> <cli>`, `spike_register_cli <name>`, `spike_magic_ok`, `spike_under_cli_home`, `spike_verify_init`, `spike_verify_dir`, `spike_verify_cleanup`, `spike_tool_path` |
+| `lib/runner.pl` | done (T-001) | the one Perl helper behind `common.sh` (resolve, CLI-home identity check, registration, gate, run with an in-group watchdog); not called directly |
 | `preflight.sh` | done (T-001) | table of install path, version, code-signature result and sign-in state for each CLI; verifies and runs only a private copy |
-| `tests/test_common.sh` | done (T-001) | offline tests for `lib/common.sh` |
+| `tests/test_common.sh` | done (T-001) | offline tests for `lib/common.sh` and `lib/runner.pl` |
 | `tests/test_preflight.sh` | done (T-001) | offline tests for `preflight.sh` using fake CLIs on a private PATH |
 | `plan/hash.sh`, `plan/check.jq`, `tests/test_plan.sh` | planned (T-005) | plan hash and approval-binding checker |
 | `handoff/parse.sh`, `tests/test_handoff.sh` | planned (T-006) | HANDOFF.md parser |
@@ -91,8 +112,18 @@ are not product code. Requirements: macOS `/bin/bash` 3.2, `jq`, `git`.
 spike/preflight.sh
 ```
 
-`preflight.sh` exits 0 when it printed a report (a missing or signed-out CLI is reported, not an error) and 1 only when
-`jq` or `git` is missing. Its `SIGNATURE` column comes from `codesign --verify --strict` on the private copy of the
-resolved binary, plus the signer (first Authority line) and team id from `codesign -dv` on that same copy. In the PATH column the home directory is shown as `~` and
-any at-sign in a path is shown as `%` (scoped package directories contain one); this is display only, and the report
-footer says so. Version text is filtered to printable characters so a CLI cannot inject terminal escape sequences.
+The suites run in a sandbox directory under `$TMPDIR`. They create **fake CLI-home directories** (named like the real ones,
+with canary files in them) **inside that sandbox only**, point `HOME` at the sandbox when they need one, and never read or
+write the real ones. Their fixtures are written through a guard that refuses a relative path, a physical parent outside the
+sandbox, a symlink and a multiply linked file; tool wrappers are small scripts, not symlinks to host tools; and an exit check
+compares the hashes of the host tools they ran. They never set `SPIKE_LIVE=1` outside a fixture run of a fake command, and
+they never run a real provider CLI or the real `codesign` (a fake is substituted by rewriting one constant in a sandbox copy
+of `lib/runner.pl`).
+
+`preflight.sh` exits 0 when it printed a report (a missing or signed-out CLI is reported, not an error) and 1 when `jq` or
+`git` is missing, or when the temporary directory is unsafe for the private verify directory (writable by others without the
+sticky bit, or inside a CLI home): that is a "needs human review" stop. Its `SIGNATURE` column comes from
+`codesign --verify --strict` on the private copy of the resolved binary, plus the signer (first Authority line) and team id
+from `codesign -dv` on that same copy. In the PATH column the home directory is shown as `~` and any at-sign in a path is
+shown as `%` (scoped package directories contain one); this is display only, and the report footer says so. Version text is
+filtered to printable characters so a CLI cannot inject terminal escape sequences.
