@@ -17,10 +17,12 @@ are not product code. Requirements: macOS `/bin/bash` 3.2, `jq`, `git`.
     never from an interactive shell.
   - **Every real prompt or session goes through `spike_run_live`**, which always checks the gate first. The non-live
     runner `spike_run_timeout` is default-deny by identity, not by name. Without `SPIKE_LIVE=1` it runs only
-    `git --version`, the read-only `codesign` verify shapes, `true`, `false`, `sleep`, `echo` and `printf`, and only when
-    argv[0] is a bare name or an absolute path whose fully resolved real path (PATH lookup, then every symlink) is in
-    `/bin`, `/usr/bin`, `/usr/sbin` or `/sbin`. A copy of any of those names in another directory, a relative path such
-    as `./x`, a launcher, and every provider CLI (claude, codex, grok, gemini, kimi) needs the gate, whatever its name.
+    `git --version`, the read-only `codesign` verify shapes (only on a path inside the private verify directory), `true`,
+    `false`, `sleep`, `echo` and `printf`. Each command is resolved ONCE, physically (a PATH lookup, then every symlink,
+    with `..` applied the way the kernel applies it), and the resolved path is the one that runs, through
+    `/usr/bin/env -i` with no PATH search. Ungated only when that resolved path is in `/bin`, `/usr/bin`, `/usr/sbin` or
+    `/sbin`. A copy of any of those names in another directory, a relative path such as `./x`, a launcher, and every
+    provider CLI (claude, codex, grok, gemini, kimi) needs the gate, whatever its name.
     `jq`, `file` and `cat` are not on the list: scripts call them directly, never through the runner.
   - **`spike_run_status` runs only a private copy that `preflight.sh` verified and registered** with
     `spike_mark_verified`, and only `--version`, `auth status` or `login status`. Any other path, any other shape,
@@ -32,15 +34,19 @@ are not product code. Requirements: macOS `/bin/bash` 3.2, `jq`, `git`.
   A TERM, INT or HUP that lands between starting a command and recording its pid is recorded and handled right after.
   Children get stdin from `/dev/null` and write to the outfile. They are not in a new session, so a CLI that opens the
   terminal device is out of scope: the spikes are headless only (rule 3).
-- **Binaries are verified before they are executed.** `preflight.sh` copies a Mach-O CLI into a private directory
-  (mode 700, removed on exit), verifies that copy, and executes only the verified copy. The verification is
+- **Binaries are verified before they are executed, and registration verifies them itself.** `preflight.sh` first checks
+  whether the resolved binary lies inside a CLI home directory (rule 4). Such a path is never read, except the provider
+  binary itself when its first four bytes are a Mach-O magic. Otherwise `file` classifies it, and a Mach-O is copied into
+  a private directory (mode 700, removed on exit). A stale one left by a killed run is swept at start, and a temporary
+  directory that others can write without the sticky bit stops preflight for human review. The copy is registered with
+  `spike_mark_verified <copy> <cli>`, which checks the Mach-O magic (first four bytes) and then the pinned signer:
   `codesign --verify --strict`, a `Developer ID Application` authority, the pinned team identifier for that CLI, and an
-  `anchor apple generic` requirement for that team. Ad-hoc, unsigned, wrong-team, forged and non-Mach-O files are
-  reported (`skipped (unverified)`) and never executed. A script launcher is never executed either: its SIGNATURE cell
-  says `launcher only, not executed (needs human approval)`. A copy that cannot run is reported
-  `needs human review`; the original path is never used as a fallback. The codesign path is the fixed constant
-  `/usr/bin/codesign` in `preflight.sh`; no environment variable or flag changes it. Without that tool every CLI is
-  `skipped (unverified)`. The pinned team ids sit in one labeled block at the top of `preflight.sh`;
+  `anchor apple generic` requirement for that team. Only the registered copy is executed. Ad-hoc, unsigned, wrong-team,
+  forged, non-Mach-O and script files are reported (`skipped (unverified)`) and never executed. A script launcher is
+  never executed either: its SIGNATURE cell says `launcher only, not executed (needs human approval)`. A copy that cannot
+  run is reported `needs human review`; the original path is never used as a fallback. The codesign path is the fixed
+  constant `CODESIGN_BIN` (`/usr/bin/codesign`) in `lib/common.sh`; no environment variable or flag changes it. Without
+  that tool every CLI is `skipped (unverified)`. The pinned team ids sit in one labeled block in `lib/common.sh`;
   **the human must confirm them against vendor-published values before release.**
 - **Scratch repos live outside this repo**, under `${TMPDIR:-/tmp}/harness-spike/<run-id>/`, so this repo's CLAUDE.md,
   hooks and settings never load into a spiked CLI session. `spike_cleanup` refuses to delete anything outside that root.
@@ -66,7 +72,7 @@ are not product code. Requirements: macOS `/bin/bash` 3.2, `jq`, `git`.
 
 | Path | Status | Purpose |
 |---|---|---|
-| `lib/common.sh` | done (T-001) | sourced helpers: `spike_scratch_repo`, `spike_worktree_add`, `spike_cleanup`, `spike_require_live`, `spike_capture_dir`, `spike_redact`, `spike_resolve_path`, `spike_run_timeout`, `spike_run_live`, `spike_run_status`, `spike_mark_verified` |
+| `lib/common.sh` | done (T-001) | sourced helpers: `spike_scratch_repo`, `spike_worktree_add`, `spike_cleanup`, `spike_require_live`, `spike_capture_dir`, `spike_redact`, `spike_resolve_path`, `spike_run_timeout`, `spike_run_live`, `spike_run_status`, `spike_mark_verified <path> <cli>` (runs the pinned-signer and magic checks itself), `spike_verify_signer`, `spike_magic_ok`, `spike_under_cli_home`, `spike_set_verify_dir` |
 | `preflight.sh` | done (T-001) | table of install path, version, code-signature result and sign-in state for each CLI; verifies and runs only a private copy |
 | `tests/test_common.sh` | done (T-001) | offline tests for `lib/common.sh` |
 | `tests/test_preflight.sh` | done (T-001) | offline tests for `preflight.sh` using fake CLIs on a private PATH |

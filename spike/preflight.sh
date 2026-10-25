@@ -4,45 +4,84 @@
 #
 #   spike/preflight.sh
 #
-# Order matters (rule 6). For each CLI: resolve the binary. If it is a Mach-O file, copy it into a private directory
-# (mode 700, removed on exit) and verify THAT COPY: codesign --verify --strict, the first Authority is a "Developer ID
-# Application" signature, the TeamIdentifier is the pinned team (see the pinned block below), and the chain-to-Apple
-# requirement for that team passes. Only the verified copy is ever executed, for --version and for the status command.
-# The original path is never executed. If the copy cannot run, the row says "needs human review"; there is no fallback.
-# Anything else (ad-hoc, unsigned, no authority, wrong team, script launcher, unknown file type) is never executed.
+# Order matters (rules 4 and 6). For each CLI: resolve the binary ONCE, physically. If it lies inside a CLI home directory
+# (rule 4), it is not read at all, except the provider binary itself when its first four bytes are a Mach-O magic (the
+# ratified narrow exception). Otherwise `file` classifies it. A Mach-O is copied into a private directory (mode 700, removed
+# on exit) and the COPY is registered with spike_mark_verified, which runs the magic check and the pinned-signer check
+# (codesign --verify --strict, the first Authority is a "Developer ID Application" signature, the TeamIdentifier is the
+# pinned team in common.sh, and the chain-to-Apple requirement for that team passes). Only the registered copy is ever
+# executed, for --version and for the status command. The original path is never executed. If the copy cannot run, the
+# row says "needs human review"; there is no fallback. Anything else (ad-hoc, unsigned, no authority, wrong team, script
+# launcher, unknown file type) is never executed.
 # Sign-in state comes from the CLI's own status command and ONLY from its exit code: the output is discarded and never
 # printed or stored (it can contain account details). Children get a scrubbed environment (spike_run_status).
-# Exit 0 = report printed; exit 1 = jq or git missing.
+# Exit 0 = report printed; exit 1 = jq or git missing, or the temporary directory is unsafe (needs human review).
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck disable=SC1091
 . "$HERE/lib/common.sh"
 
-# ---- FIXED CODESIGN PATH (rule 6) -----------------------------------------------------------------------------------
-# Every signature check calls this absolute path. It is a readonly constant: no environment variable, flag or PATH entry
-# changes it. The tests make a sandbox copy with only this line rewritten; the shipped script has no override hook.
-readonly CODESIGN_BIN="/usr/bin/codesign"
-
-# ---- PINNED SIGNER IDENTITIES (rule 6) ------------------------------------------------------------------------------
-# Apple Developer Team IDs that the official CLI binaries must be signed by. Taken from the binaries installed on the
-# developer's Mac on 2026-10-25 (claude: Anthropic PBC, codex: OpenAI). THE HUMAN MUST CONFIRM THESE AGAINST
-# VENDOR-PUBLISHED VALUES BEFORE ANY RELEASE; until then they only prove "same signer as the binary I installed".
-PINNED_AUTHORITY_PREFIX="Developer ID Application"
-pinned_team() {
-  case "$1" in
-    claude) printf 'Q6L2SF6YDW' ;;  # Anthropic PBC
-    codex) printf '2DC432GLL2' ;;   # OpenAI
-    *) printf '' ;;
-  esac
-}
-# ---------------------------------------------------------------------------------------------------------------------
-
+ME="$(id -u)"
+TMPROOT="${TMPDIR:-/tmp}"
+TMPROOT="${TMPROOT%/}"
+[ -n "$TMPROOT" ] || TMPROOT="/tmp"
 PRIV=""
-TMPOUT="$(mktemp "${TMPDIR:-/tmp}/spike-preflight.XXXXXX")" || exit 1
-PRIV="$(mktemp -d "${TMPDIR:-/tmp}/spike-preflight-verify.XXXXXX")" || { rm -f "$TMPOUT"; exit 1; }
+TMPOUT=""
 trap 'rm -f "$TMPOUT"; if [ -n "$PRIV" ]; then rm -rf "$PRIV"; fi' EXIT
+
+# dir_stat <path> -> "<uid> <octal mode>" (perl stat, portable between macOS and Linux). Fails if it cannot stat.
+dir_stat() {
+  perl -e 'my @s = stat($ARGV[0]) or exit 1; printf "%d %o\n", $s[4], $s[2] & 07777' -- "$1"
+}
+
+# parent_ok <dir> (round 6, item 5): 0 if the directory is sticky (shared temporary directories are), or is owned by the
+# current user and is not group- or world-writable. Anything else needs a human to look at it.
+parent_ok() {
+  local st uid mode
+  st="$(dir_stat "$1")" || return 1
+  uid="${st%% *}"
+  mode="${st#* }"
+  if [ $(( 0$mode & 01000 )) -ne 0 ]; then return 0; fi
+  [ "$uid" = "$ME" ] || return 1
+  [ $(( 0$mode & 022 )) -eq 0 ] || return 1
+  return 0
+}
+
+# sweep_stale (round 6, item 5): remove spike-preflight-verify.* directories left behind by a killed run (SIGKILL cannot
+# run the EXIT trap). Only directories this user owns, that are real directories (not symlinks), and whose recorded owner
+# pid is no longer alive. A directory without a readable owner record is left alone.
+sweep_stale() {
+  local d st uid pid
+  for d in "$TMPROOT"/spike-preflight-verify.*; do
+    [ -d "$d" ] && [ ! -L "$d" ] || continue
+    st="$(dir_stat "$d")" || continue
+    uid="${st%% *}"
+    [ "$uid" = "$ME" ] || continue
+    [ -f "$d/.owner" ] && [ ! -L "$d/.owner" ] || continue
+    pid="$(head -n 1 "$d/.owner" | tr -cd '0-9')"
+    [ -n "$pid" ] || continue
+    if kill -0 "$pid" 2>/dev/null; then continue; fi
+    rm -rf "$d"
+  done
+}
+
+# ---- temporary files and the private verify directory ----------------------------------------------------------------
+if ! parent_ok "$TMPROOT"; then
+  spike_err "needs human review: $TMPROOT is writable by others and is not sticky; preflight will not create its verify directory there"
+  exit 1
+fi
+sweep_stale
+TMPOUT="$(mktemp "$TMPROOT/spike-preflight.XXXXXX")" || exit 1
+PRIV="$(mktemp -d "$TMPROOT/spike-preflight-verify.XXXXXX")" || { rm -f "$TMPOUT"; exit 1; }
+st="$(dir_stat "$PRIV")" || exit 1
+if [ "${st%% *}" != "$ME" ] || [ "${st#* }" != "700" ]; then
+  spike_err "needs human review: the private verify directory $PRIV is not owned by this user with mode 700"
+  exit 1
+fi
+printf '%s\n' "$$" > "$PRIV/.owner" || exit 1
 chmod 700 "$PRIV" || exit 1
+spike_set_verify_dir "$PRIV" || exit 1
 
 # Keep only printable characters, so output from a CLI cannot inject terminal escape sequences into the report.
 clean() { tr -cd '[:print:]'; }
@@ -64,22 +103,12 @@ add_note() { NOTES="$NOTES# $1
 # first_line <file> <width> -> first line, printable only, redacted, cut.
 first_line() { head -n 1 "$1" | clean | spike_redact | cut -c1-"$2"; }
 
-# run_timed <seconds> <outfile> <cmd> [args...]: a direct call for the fixed tools only (perl, file, git, jq, codesign),
-# never for a provider CLI. stdin is /dev/null and output is appended to <outfile>. Returns 124 on timeout.
-run_timed() {
-  local secs="$1" out="$2" rc
-  shift 2
-  perl -e 'alarm shift; exec @ARGV' -- "$secs" "$@" </dev/null >>"$out" 2>&1
-  rc=$?
-  if [ "$rc" -eq 142 ]; then return 124; fi
-  return "$rc"
-}
-
-# file_kind <path> -> prints mach-o | script | other. file(1) reads only the start of the file.
+# file_kind <path> -> prints mach-o | script | other. file(1) reads only the start of the file. Never called on a path
+# inside a CLI home directory (rule 4): check_cli refuses those first.
 file_kind() {
   local ftype
   : > "$TMPOUT"
-  run_timed 10 "$TMPOUT" file -b "$1"
+  spike_run_timed 10 "$TMPOUT" file -b "$1"
   ftype="$(head -n 1 "$TMPOUT" | clean)"
   case "$ftype" in
     *Mach-O*) printf 'mach-o' ;;
@@ -98,70 +127,10 @@ check_tool() {
     return 1
   fi
   : > "$TMPOUT"
-  run_timed 10 "$TMPOUT" "$path" "$@"
+  spike_run_timed 10 "$TMPOUT" "$path" "$@"
   ver="$(first_line "$TMPOUT" 26)"
   printf "$ROW_FMT" "$name" "yes" "${ver:--}" "-" "-" "-" "$(show_path "$path")"
   return 0
-}
-
-# verify_binary <copy> <cli-name>: sets SIG (column text) and VERIFIED (1 = the copy may be executed). It is only ever
-# called with the private copy, never with the original path.
-verify_binary() {
-  local bin="$1" name="$2" rc auth team want sigkind firstauth
-  VERIFIED=0
-  SIG=""
-  if [ ! -x "$CODESIGN_BIN" ]; then
-    SIG="NOT VERIFIED (codesign unavailable)"
-    return
-  fi
-  : > "$TMPOUT"
-  run_timed 20 "$TMPOUT" "$CODESIGN_BIN" --verify --strict "$bin"
-  rc=$?
-  if [ "$rc" -eq 124 ]; then
-    SIG="NOT VERIFIED (codesign timed out)"
-    return
-  fi
-  if [ "$rc" -ne 0 ]; then
-    if grep -qi 'not signed at all' "$TMPOUT"; then
-      SIG="NOT SIGNED"
-    else
-      SIG="NOT VERIFIED (codesign rc=$rc)"
-    fi
-    return
-  fi
-
-  # The signature is intact. Now identify the signer.
-  : > "$TMPOUT"
-  run_timed 20 "$TMPOUT" "$CODESIGN_BIN" -dv --verbose=2 "$bin"
-  firstauth="$(grep -m1 '^Authority=' "$TMPOUT" | cut -d= -f2-)"
-  team="$(grep -m1 '^TeamIdentifier=' "$TMPOUT" | cut -d= -f2-)"
-  auth="$(printf '%s' "$firstauth" | clean | sed 's/ ([A-Z0-9]*)$//' | spike_redact | cut -c1-46)"
-  team="$(printf '%s' "$team" | clean | cut -c1-12)"
-  sigkind=""
-  if grep -q '^Signature=adhoc' "$TMPOUT"; then sigkind="ad-hoc, "; fi
-  want="$(pinned_team "$name")"
-
-  case "$firstauth" in
-    "$PINNED_AUTHORITY_PREFIX"*) ;;
-    *)
-      SIG="UNTRUSTED (valid but ${sigkind}${auth:-no authority}; not Developer ID)"
-      return
-      ;;
-  esac
-  if [ -z "$want" ] || [ "$team" != "$want" ]; then
-    SIG="UNTRUSTED (valid but team ${team:-not set} is not the pinned team)"
-    return
-  fi
-  # The text above can be forged by a self-made certificate; this asks codesign to check the chain to Apple's root.
-  : > "$TMPOUT"
-  run_timed 20 "$TMPOUT" "$CODESIGN_BIN" --verify --strict -R="anchor apple generic and certificate leaf[subject.OU] = \"$want\"" "$bin"
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    SIG="UNTRUSTED (signer text matches but the certificate chain does not satisfy the pinned team)"
-    return
-  fi
-  SIG="valid; ${auth}; team ${team}"
-  VERIFIED=1
 }
 
 check_cli() { # check_cli <name> <signin-args...>
@@ -172,9 +141,29 @@ check_cli() { # check_cli <name> <signin-args...>
     printf "$ROW_FMT" "$name" "no" "-" "-" "-" "-" "not installed"
     return 0
   fi
-  bin="$(spike_resolve_path "$path")" || bin="$path"
+  # Resolve ONCE, physically (round 6, item 1). Everything below uses this one path: the rule 4 check, file, cp, and the
+  # registration of the copy.
+  bin="$(spike_resolve_path "$path" 2>/dev/null)" || bin=""
+  if [ -z "$bin" ]; then
+    printf "$ROW_FMT" "$name" "yes" "skipped (unverified)" "-" "NOT VERIFIED (unresolvable path)" "skipped (unverified)" "$(show_path "$path")"
+    add_note "$name could not be resolved and was NOT executed (rule 6)."
+    return 0
+  fi
 
-  kind="$(file_kind "$bin")"
+  # Rule 4, before anything reads the file: a path inside a CLI home directory is never read, except the provider binary
+  # itself when its first four bytes are a Mach-O magic (the ratified narrow exception; nothing else is read).
+  if spike_under_cli_home "$bin"; then
+    if ! spike_magic_ok "$bin"; then
+      SIG="REFUSED (inside a CLI home directory; not read)"
+      printf "$ROW_FMT" "$name" "yes" "skipped (unverified)" "refused" "$SIG" "skipped (unverified)" "$(show_path "$bin")"
+      add_note "$name resolves inside a CLI home directory and was NOT read (rule 4). Only the provider binary itself may be read, and only when its first four bytes are a Mach-O magic."
+      return 0
+    fi
+    kind="mach-o"
+  else
+    kind="$(file_kind "$bin")"
+  fi
+
   if [ "$kind" != "mach-o" ]; then
     if [ "$kind" = "script" ]; then
       SIG="launcher only, not executed (needs human approval)"
@@ -187,7 +176,8 @@ check_cli() { # check_cli <name> <signin-args...>
     return 0
   fi
 
-  # 1. Copy the Mach-O into the private directory and verify the COPY. 2. Execute only that verified copy.
+  # 1. Copy the Mach-O into the private directory. 2. Register THE COPY (magic and pinned-signer checks run inside
+  # spike_mark_verified). 3. Execute only that registered copy.
   copy="$PRIV/$name"
   if ! cp "$bin" "$copy" 2>/dev/null || ! chmod 700 "$copy" 2>/dev/null; then
     SIG="NOT VERIFIED (private copy failed)"
@@ -201,18 +191,13 @@ check_cli() { # check_cli <name> <signin-args...>
     add_note "$name was NOT executed: the private copy is not a Mach-O binary (rule 6)."
     return 0
   fi
-  verify_binary "$copy" "$name"
-  if [ "$VERIFIED" -ne 1 ]; then
+  if ! spike_mark_verified "$copy" "$name" 2>/dev/null; then
+    SIG="$SPIKE_SIG_TEXT"
     printf "$ROW_FMT" "$name" "yes" "skipped (unverified)" "$kind" "$SIG" "skipped (unverified)" "$(show_path "$bin")"
     add_note "$name was NOT executed because its code signature did not verify as the pinned vendor signer (rule 6)."
     return 0
   fi
-  if ! spike_mark_verified "$copy"; then
-    SIG="NOT VERIFIED (private copy rejected)"
-    printf "$ROW_FMT" "$name" "yes" "skipped (unverified)" "$kind" "$SIG" "skipped (unverified)" "$(show_path "$bin")"
-    add_note "$name was NOT executed: the verified copy was rejected by the runner (rule 6)."
-    return 0
-  fi
+  SIG="$SPIKE_SIG_TEXT"
 
   : > "$TMPOUT"
   spike_run_status 20 "$TMPOUT" "$copy" --version

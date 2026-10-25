@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # Tests for spike/preflight.sh using fake claude/codex/file on a private PATH. Offline; never runs a real CLI.
 # Run: /bin/bash spike/tests/test_preflight.sh  (exit 0 = all passed)
+#
+# Round 6: the fake provider binaries are Mach-O-headed fixtures (four magic bytes, then a shell body). Preflight registers
+# only a Mach-O copy that passes the pinned-signer check, so every "registered" fixture needs the header. On Linux env hands
+# a file it cannot load to /bin/sh (execvp's ENOEXEC fallback), so the bodies run; this is test-only.
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PREFLIGHT="$HERE/../preflight.sh"
+COMMON_REAL="$HERE/../lib/common.sh"
 
 PASS=0
 FAIL=0
@@ -16,13 +21,20 @@ lacks() { case "$2" in *"$3"*) bad "$1 (found [$3] in:
 $2)" ;; *) ok "$1" ;; esac; }
 row() { printf '%s\n' "$1" | grep "^$2 " | head -n 1; }
 
+# mkmacho <path> < body: a Mach-O-headed fixture (cf fa ed fe, a newline, then the shell body from stdin). Executable.
+mkmacho() {
+  local f="$1"
+  { printf '\317\372\355\376\n'; cat; } > "$f"
+  chmod +x "$f"
+}
+
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/spikepre.XXXXXX")" || exit 1
 SANDBOX="$(cd "$SANDBOX" && pwd -P)"
 trap 'rm -rf "$SANDBOX"' EXIT
 
 # Real tools that preflight and common.sh need, linked into each private bin dir. file, jq, git and codesign are NOT
 # linked: each test supplies its own fake (or deliberately omits it).
-TOOLS="dirname basename mktemp rm head tr cut sed awk grep cat date mkdir readlink sleep env perl wc cp chmod ls ps"
+TOOLS="dirname basename mktemp rm head tr cut sed awk grep cat date mkdir readlink sleep env perl wc cp chmod ls ps dd od id"
 
 # mkbin <dir> [with-jq] [with-git]: private bin dir with the real helper tools linked in.
 mkbin() {
@@ -37,23 +49,25 @@ mkbin() {
 
 mkdir -p "$SANDBOX/home"
 
-# The codesign constant lives in one readonly line of the shipped script. These tests run a SANDBOX COPY of the script with
-# only that line rewritten to a fake, so the shipped script has no override hook and the tests never depend on a codesign
-# shim on PATH (rule 6). The shipped script is checked below to keep the real absolute path.
+# The codesign constant lives in one readonly line of common.sh. These tests run a SANDBOX COPY of common.sh and preflight.sh
+# with only that line rewritten to a fake, so the shipped scripts have no override hook and the tests never depend on a
+# codesign shim on PATH (rule 6). The shipped common.sh is checked below to keep the real absolute path.
 CS="$SANDBOX/fakebin/codesign"
 mkdir -p "$SANDBOX/fakebin" "$SANDBOX/spike/lib"
-cp "$HERE/../lib/common.sh" "$SANDBOX/spike/lib/common.sh"
-sed "s|^readonly CODESIGN_BIN=.*|readonly CODESIGN_BIN=\"$CS\"|" "$PREFLIGHT" > "$SANDBOX/spike/preflight.sh"
+sed "s|^readonly CODESIGN_BIN=.*|readonly CODESIGN_BIN=\"$CS\"|" "$COMMON_REAL" > "$SANDBOX/spike/lib/common.sh"
+cp "$PREFLIGHT" "$SANDBOX/spike/preflight.sh"
 PREFLIGHT_UT="$SANDBOX/spike/preflight.sh"
-has "the shipped script keeps the fixed codesign path" "$(cat "$PREFLIGHT")" 'readonly CODESIGN_BIN="/usr/bin/codesign"'
-has "the sandbox copy points the codesign constant at the fake" "$(cat "$PREFLIGHT_UT")" "readonly CODESIGN_BIN=\"$CS\""
+has "the shipped common.sh keeps the fixed codesign path" "$(cat "$COMMON_REAL")" 'readonly CODESIGN_BIN="/usr/bin/codesign"'
+lacks "the shipped preflight.sh defines no codesign constant of its own" "$(cat "$PREFLIGHT")" "readonly CODESIGN_BIN"
+has "the sandbox copy points the codesign constant at the fake" "$(cat "$SANDBOX/spike/lib/common.sh")" "readonly CODESIGN_BIN=\"$CS\""
+eq "the sandbox copy differs from the shipped common.sh only in the codesign constant (2 changed lines)" "2" "$(diff "$COMMON_REAL" "$SANDBOX/spike/lib/common.sh" | grep -c '^[<>]')"
 
 # run_preflight <bindir>: runs the sandbox copy with PATH = that dir only.
 run_preflight() {
   env -i PATH="$1" HOME="$SANDBOX/home" TMPDIR="$SANDBOX" USER=tester LOGNAME=tester /bin/bash "$PREFLIGHT_UT" 2>&1
 }
 
-# mkcodesign <file> <mode> [logfile]: a fake codesign. Pinned team ids are the ones in preflight.sh.
+# mkcodesign <file> <mode> [logfile]: a fake codesign. Pinned team ids are the ones in common.sh.
 #   good      Developer ID Application, pinned team, chain check passes
 #   unsigned  verify fails: not signed at all
 #   adhoc     verify passes, ad-hoc signature, no authority, team not set
@@ -93,7 +107,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Scenario 1: both CLIs are "Mach-O" with a valid signature. Their status commands print secrets: none may leak.
+# Scenario 1: both CLIs are Mach-O (fake file) with a valid signature. Their status commands print secrets: none may leak.
 B1="$SANDBOX/b1"
 mkbin "$B1"
 LOG1="$SANDBOX/log1"
@@ -103,8 +117,7 @@ echo "Mach-O 64-bit executable arm64"
 EOF
 mkcodesign "$CS" good "$SANDBOX/codesign1.log"
 for n in claude codex; do
-  cat > "$B1/$n" <<EOF
-#!/bin/sh
+  mkmacho "$B1/$n" <<EOF
 echo "\$0 \$*" >> "$LOG1"
 case "\$1" in
   --version) printf 'v9.9.9 (Fake)\033[31mRED\033]0;title\007\n'; exit 0 ;;
@@ -113,7 +126,7 @@ esac
 exit 9
 EOF
 done
-chmod +x "$B1/file" "$B1/claude" "$B1/codex"
+chmod +x "$B1/file"
 OUT1="$(run_preflight "$B1")"
 RC1=$?
 eq "scenario 1: preflight exits 0" "0" "$RC1"
@@ -121,7 +134,7 @@ has "scenario 1: header has a SIGNATURE column" "$OUT1" "SIGNATURE"
 has "scenario 1: claude row is valid and shows the signer and team" "$(row "$OUT1" claude)" "valid; Developer ID Application: Fake Dev; team Q6L2SF6YDW"
 has "scenario 1: claude is signed in (exit code 0)" "$(row "$OUT1" claude)" "signed in"
 has "scenario 1: codex is not signed in (exit code 1)" "$(row "$OUT1" codex)" "not signed in (rc=1)"
-has "scenario 1: version is shown" "$(row "$OUT1" claude)" "v9.9.9 (Fake)"
+has "scenario 1: the version run reached the fixture body (its log line; the version column cannot show a fixture's first line, see round 6 note)" "$(cat "$LOG1")" "claude --version"
 lacks "scenario 1: status output text does not leak (SECRET)" "$OUT1" "SECRET"
 lacks "scenario 1: status output email does not leak" "$OUT1" "jane"
 lacks "scenario 1: status output token does not leak" "$OUT1" "abc123"
@@ -149,14 +162,13 @@ cat > "$B2/file" <<'EOF'
 echo "Mach-O 64-bit executable arm64"
 EOF
 for n in claude codex; do
-  cat > "$B2/$n" <<EOF
-#!/bin/sh
+  mkmacho "$B2/$n" <<EOF
 touch "$MARK2"
 echo "SECRET jane@example.com"
 exit 0
 EOF
 done
-chmod +x "$B2/file" "$B2/claude" "$B2/codex"
+chmod +x "$B2/file"
 mkcodesign "$CS" unsigned
 OUT2="$(run_preflight "$B2")"
 RC2=$?
@@ -227,7 +239,7 @@ has "scenario 3: version is skipped" "$(row "$OUT3" claude)" "skipped (unverifie
 has "scenario 3: note says the launcher was NOT executed" "$OUT3" "script launcher and was NOT executed"
 if [ -s "$LOG3" ]; then bad "scenario 3: no launcher was executed"; else ok "scenario 3: no launcher was executed"; fi
 
-# Scenario 3b: a symlinked CLI is resolved. The RESOLVED file is copied, the COPY is verified, and only the copy runs.
+# Scenario 3b: a symlinked CLI is resolved ONCE. The RESOLVED file is copied, the COPY is verified, and only the copy runs.
 B3B="$SANDBOX/b3b"
 mkbin "$B3B"
 cp "$B1/file" "$B3B/file"
@@ -236,13 +248,11 @@ mkcodesign "$CS" good "$CS3B"
 mkdir -p "$SANDBOX/real3b"
 LOG3B="$SANDBOX/log3b"
 DIR3B="$SANDBOX/dir3b"
-cat > "$SANDBOX/real3b/claude-real" <<EOF
-#!/bin/sh
+mkmacho "$SANDBOX/real3b/claude-real" <<EOF
 echo "RAN \$0 \$*" >> "$LOG3B"
 ls -ld "\$(dirname "\$0")" > "$DIR3B"
 exit 0
 EOF
-chmod +x "$SANDBOX/real3b/claude-real"
 ln -s "$SANDBOX/real3b/claude-real" "$B3B/claude"
 OUT3B="$(run_preflight "$B3B")"
 has "scenario 3b: codesign was asked about the private copy (verify the copy, not the original)" "$(cat "$CS3B")" "--verify --strict $SANDBOX/spike-preflight-verify."
@@ -263,15 +273,16 @@ case "$(cat "$DIR3B")" in
 esac
 has "scenario 3b: the resolved path is shown" "$(row "$OUT3B" claude)" "claude-real"
 
-# Scenario 3c: a copy that cannot run (its interpreter is missing) is reported "needs human review". The original path
-# is never used as a fallback.
+# Scenario 3c: a copy that cannot run (its interpreter is missing) is reported "needs human review". The original path is
+# never used as a fallback.
 B3C="$SANDBOX/b3c"
 mkbin "$B3C"
 cp "$B1/file" "$B3C/file"
 mkcodesign "$CS" good
 for n in claude codex; do
-  printf '#!/nonexistent/interpreter\n' > "$B3C/$n"
-  chmod +x "$B3C/$n"
+  mkmacho "$B3C/$n" <<EOF
+exec /nonexistent/interpreter
+EOF
 done
 OUT3C="$(run_preflight "$B3C")"
 has "scenario 3c: a copy that cannot run is 'needs human review' for the version" "$(row "$OUT3C" claude)" "needs human review"
@@ -308,13 +319,11 @@ mkbin "$B7"
 cp "$B1/file" "$B7/file"
 MARK7="$SANDBOX/marker7"
 for n in claude codex; do
-  cat > "$B7/$n" <<EOF
-#!/bin/sh
+  mkmacho "$B7/$n" <<EOF
 touch "$MARK7"
 exit 0
 EOF
 done
-chmod +x "$B7/file" "$B7/claude" "$B7/codex"
 OUT7="$(env -i PATH="$B7" HOME="$SANDBOX/home" TMPDIR="$SANDBOX" USER=tester LOGNAME=tester /bin/bash "$PREFLIGHT" 2>&1)"
 has "scenario 6: the shipped script reports claude as skipped (unverified)" "$(row "$OUT7" claude)" "skipped (unverified)"
 has "scenario 6: the shipped script reports codex as skipped (unverified)" "$(row "$OUT7" codex)" "skipped (unverified)"
@@ -331,13 +340,11 @@ mkbin "$B8"
 cp "$B1/file" "$B8/file"
 MARK8="$SANDBOX/marker8"
 for n in claude codex; do
-  cat > "$B8/$n" <<EOF
-#!/bin/sh
+  mkmacho "$B8/$n" <<EOF
 touch "$MARK8"
 exit 0
 EOF
 done
-chmod +x "$B8/file" "$B8/claude" "$B8/codex"
 ENVCS="$SANDBOX/envcs"
 mkdir -p "$ENVCS"
 mkcodesign "$ENVCS/codesign" good "$SANDBOX/envcs.log"
@@ -345,6 +352,134 @@ OUT8="$(env -i PATH="$ENVCS:$B8" CODESIGN="$ENVCS/codesign" CODESIGN_BIN="$ENVCS
 if [ -s "$SANDBOX/envcs.log" ]; then bad "scenario 7: an exported codesign (PATH and env) is never called"; else ok "scenario 7: an exported codesign (PATH and env) is never called"; fi
 has "scenario 7: with the exported fake, claude is still skipped (unverified)" "$(row "$OUT8" claude)" "skipped (unverified)"
 if [ -e "$MARK8" ]; then bad "scenario 7: no CLI was executed"; else ok "scenario 7: no CLI was executed"; fi
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Scenario 8 (round 6, item 4; rule 4): a canary under a fake home, reached through a provider-named symlink. The canary is
+# never read, copied or printed. The logging wrappers record every file, dd and cp call: none names the canary, and the
+# only dd call that touches it reads four bytes (the exact-binary magic check, which never happens for a non-Mach-O).
+B9="$SANDBOX/b9"
+mkbin "$B9"
+mkdir -p "$SANDBOX/home/.claude"
+printf 'CANARY-SECRET-7f3a\n' > "$SANDBOX/home/.claude/canary"
+ln -s "$SANDBOX/home/.claude/canary" "$B9/claude"
+LOG9F="$SANDBOX/log9-file"
+LOG9D="$SANDBOX/log9-dd"
+LOG9C="$SANDBOX/log9-cp"
+REALCP="$(type -P cp)"
+REALDD="$(type -P dd)"
+# mkbin linked cp and dd into this bin dir as SYMLINKS to the system tools. Remove those links before writing the logging
+# wrappers, so a write can never land in the system binary (round 6 test fix: a write through the link replaced /usr/bin/cp
+# and /usr/bin/dd on the development machine).
+rm -f "$B9/cp" "$B9/dd" "$B9/file"
+cat > "$B9/file" <<EOF
+#!/bin/sh
+echo "\$*" >> "$LOG9F"
+echo "Mach-O 64-bit executable arm64"
+EOF
+cat > "$B9/dd" <<EOF
+#!/bin/sh
+echo "\$*" >> "$LOG9D"
+exec "$REALDD" "\$@"
+EOF
+cat > "$B9/cp" <<EOF
+#!/bin/sh
+echo "\$*" >> "$LOG9C"
+exec "$REALCP" "\$@"
+EOF
+chmod +x "$B9/file" "$B9/dd" "$B9/cp"
+mkcodesign "$CS" good
+OUT9="$(run_preflight "$B9")"
+has "scenario 8: the canary provider path is refused by the CLI-home rule" "$(row "$OUT9" claude)" "REFUSED (inside a CLI home directory; not read)"
+lacks "scenario 8: the canary text never appears in the report" "$OUT9" "CANARY-SECRET"
+lacks "scenario 8: no file(1) call names the canary" "$(cat "$LOG9F" 2>/dev/null)" "canary"
+lacks "scenario 8: no cp call names the canary" "$(cat "$LOG9C" 2>/dev/null)" "canary"
+if [ -n "$(grep canary "$LOG9D" 2>/dev/null | grep -v 'bs=4 count=1')" ]; then
+  bad "scenario 8: the only dd call that touches the canary reads four bytes"
+else
+  ok "scenario 8: the only dd call that touches the canary reads four bytes"
+fi
+lacks "scenario 8: the canary was not copied into the private directory (no copy call)" "$(cat "$LOG9C" 2>/dev/null)" "spike-preflight-verify"
+
+# Scenario 8b: the ratified exception. The PATH-resolved provider binary itself lies inside a CLI home directory and is a
+# Mach-O: it is allowed (kind mach-o) and registered like any other copy. Nothing else under that home is read.
+B9B="$SANDBOX/b9b"
+mkbin "$B9B"
+mkdir -p "$SANDBOX/home/.claude/bin"
+LOG9B="$SANDBOX/log9b"
+mkmacho "$SANDBOX/home/.claude/bin/claude-real" <<EOF
+echo "RAN9B \$0 \$*" >> "$LOG9B"
+case "\$1" in --version) echo "v8.8.8"; exit 0 ;; esac
+exit 0
+EOF
+ln -s "$SANDBOX/home/.claude/bin/claude-real" "$B9B/claude"
+cp "$B1/file" "$B9B/file"
+OUT9B="$(run_preflight "$B9B")"
+has "scenario 8b: the Mach-O provider binary inside a CLI home is allowed (kind mach-o)" "$(row "$OUT9B" claude)" "mach-o"
+has "scenario 8b: it is then verified like any copy (valid signer)" "$(row "$OUT9B" claude)" "valid; Developer ID Application"
+has "scenario 8b: the copy runs (its body wrote the log; the version column cannot show a fixture's first line, see round 6 note)" "$(cat "$LOG9B")" "RAN9B"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Scenario 9 (round 6, item 5): a temporary directory that others can write (not sticky) is refused: rc 1, "needs human
+# review", and no CLI runs. A sticky one is accepted.
+B10="$SANDBOX/b10"
+mkbin "$B10"
+MARK10="$SANDBOX/marker10"
+mkmacho "$B10/claude" <<EOF
+touch "$MARK10"
+exit 0
+EOF
+LOOSE="$SANDBOX/loose"
+mkdir -p "$LOOSE"
+chmod 777 "$LOOSE"
+OUT10="$(env -i PATH="$B10" HOME="$SANDBOX/home" TMPDIR="$LOOSE" USER=tester LOGNAME=tester /bin/bash "$PREFLIGHT_UT" 2>&1)"
+eq "scenario 9: a world-writable temporary directory without the sticky bit -> exit 1" "1" "$?"
+has "scenario 9: the refusal says needs human review" "$OUT10" "needs human review"
+if [ -e "$MARK10" ]; then bad "scenario 9: no CLI ran in the unsafe directory"; else ok "scenario 9: no CLI ran in the unsafe directory"; fi
+STICKY="$SANDBOX/sticky"
+mkdir -p "$STICKY"
+chmod 1777 "$STICKY"
+OUT10S="$(env -i PATH="$B10" HOME="$SANDBOX/home" TMPDIR="$STICKY" USER=tester LOGNAME=tester /bin/bash "$PREFLIGHT_UT" 2>&1)"
+eq "scenario 9: a sticky temporary directory is accepted (exit 0)" "0" "$?"
+has "scenario 9: the sticky run prints the report" "$OUT10S" "SIGNATURE"
+
+# Scenario 10 (round 6, item 5): stale spike-preflight-verify.* directories left by a SIGKILLed run are swept at start.
+# A directory whose recorded owner is dead goes; one whose owner is alive stays.
+SW="$SANDBOX/sweep"
+mkdir -p "$SW"
+chmod 700 "$SW"
+STALE="$SW/spike-preflight-verify.stale"
+mkdir -p "$STALE"
+DEADPID="$(sh -c 'echo $$')"
+printf '%s\n' "$DEADPID" > "$STALE/.owner"
+LIVE="$SW/spike-preflight-verify.live"
+mkdir -p "$LIVE"
+sleep 60 &
+LIVEPID=$!
+printf '%s\n' "$LIVEPID" > "$LIVE/.owner"
+OUT11="$(env -i PATH="$B4" HOME="$SANDBOX/home" TMPDIR="$SW" USER=tester LOGNAME=tester /bin/bash "$PREFLIGHT_UT" 2>&1)"
+eq "scenario 10: preflight exits 0 in the sweep directory" "0" "$?"
+check_gone() { [ ! -e "$1" ]; }
+if check_gone "$STALE"; then ok "scenario 10: the stale directory (dead owner) was swept"; else bad "scenario 10: the stale directory (dead owner) was swept"; fi
+if [ -d "$LIVE" ]; then ok "scenario 10: a directory whose owner is alive is left alone"; else bad "scenario 10: a directory whose owner is alive is left alone"; fi
+kill "$LIVEPID" 2>/dev/null
+wait "$LIVEPID" 2>/dev/null
+leftovers="$(ls -d "$SW"/spike-preflight-verify.* 2>/dev/null | grep -v "$LIVE" )"
+eq "scenario 10: the run's own private directory is removed on exit" "" "$leftovers"
+
+# Scenario 11 (round 6, item 2): a non-Mach-O file classified as a Mach-O (fake file) is refused by the magic check on the
+# copy and is never executed: an ELF header, and a shell script with a CLI name.
+B11="$SANDBOX/b11"
+mkbin "$B11"
+cp "$B1/file" "$B11/file"
+MARK11="$SANDBOX/marker11"
+printf '\177ELF\002\001\001\000 fake elf\n' > "$B11/claude"
+printf '#!/bin/sh\ntouch "%s"\nexit 0\n' "$MARK11" > "$B11/codex"
+chmod +x "$B11/claude" "$B11/codex"
+mkcodesign "$CS" good
+OUT12="$(run_preflight "$B11")"
+has "scenario 11: an ELF header named claude is NOT VERIFIED (not a Mach-O file)" "$(row "$OUT12" claude)" "NOT VERIFIED (not a Mach-O file)"
+has "scenario 11: a shell script named codex is NOT VERIFIED (not a Mach-O file)" "$(row "$OUT12" codex)" "NOT VERIFIED (not a Mach-O file)"
+if [ -e "$MARK11" ]; then bad "scenario 11: neither non-Mach-O file was executed"; else ok "scenario 11: neither non-Mach-O file was executed"; fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

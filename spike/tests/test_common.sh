@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # Tests for spike/lib/common.sh. Run: /bin/bash spike/tests/test_common.sh  (exit 0 = all passed)
 # Uses a private TMPDIR so it never touches a real spike run.
+#
+# Round 6: registration (spike_mark_verified) runs the pinned-signer check, so every child shell in this file sources a
+# SANDBOX COPY of common.sh whose only change is the readonly CODESIGN_BIN line, pointed at a fake codesign. The main
+# shell sources the real file (for the capture-root and other main-shell assertions). No real codesign or provider CLI
+# is run here. Fixtures that must "run" are Mach-O-headed shell scripts: on Linux, env hands a file it cannot load to
+# /bin/sh (the execvp ENOEXEC fallback), so their bodies run; this is test-only and says nothing about real Mach-O files.
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-COMMON="$HERE/../lib/common.sh"
+COMMON_REAL="$HERE/../lib/common.sh"
 
 PASS=0
 FAIL=0
@@ -74,9 +80,17 @@ gone_within() {
   done
 }
 
+# mkmacho <path> < body: a fixture that starts with the four bytes of a 64-bit Mach-O (cf fa ed fe), then a newline, then
+# the shell body read from stdin. It is executable. It is NOT a Mach-O: it exists to pass the magic check of a test.
+mkmacho() {
+  local f="$1"
+  { printf '\317\372\355\376\n'; cat; } > "$f"
+  chmod +x "$f"
+}
+
 # child <code>: run code in a fresh /bin/bash with common.sh sourced and SPIKE_LIVE unset unless the caller exported it.
 child() {
-  /bin/bash -c '. "$1"; eval "$2"' _ "$COMMON" "$1"
+  /bin/bash -c '. "$1"; eval "$2"' _ "$COMMON_REAL" "$1"
 }
 
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/spiketest.XXXXXX")" || exit 1
@@ -85,8 +99,48 @@ export TMPDIR="$SANDBOX"
 unset SPIKE_LIVE
 trap 'rm -rf "$SANDBOX"' EXIT
 
+# ---- sandbox copy with the fake codesign (rule 6 tests) -------------------------------------------------------------
+# The fake reads its mode from $FSDIR/mode, logs its arguments to $FSDIR/log, and picks the team by the path it is given
+# (a path containing "codex" is signed by the OpenAI team, anything else by the Anthropic team).
+FSDIR="$SANDBOX/fakesign"
+FSCS="$FSDIR/codesign"
+mkdir -p "$FSDIR"
+printf 'good\n' > "$FSDIR/mode"
+cat > "$FSCS" <<EOF
+#!/bin/sh
+echo "\$*" >> "$FSDIR/log"
+MODE="\$(cat "$FSDIR/mode" 2>/dev/null)"
+TEAM=Q6L2SF6YDW
+case "\$*" in *codex*) TEAM=2DC432GLL2 ;; esac
+case "\$MODE" in
+  unsigned) echo "code object is not signed at all" >&2; exit 1 ;;
+  weird) echo "weird failure" >&2; exit 3 ;;
+esac
+case "\$1" in
+  --verify)
+    case "\$3" in -R=*) [ "\$MODE" = forged ] && { echo "failed to satisfy requirement" >&2; exit 3; } ;; esac
+    exit 0 ;;
+  -dv)
+    case "\$MODE" in
+      good) printf 'Authority=Developer ID Application: Fake Dev (%s)\nAuthority=Developer ID Certification Authority\nTeamIdentifier=%s\n' "\$TEAM" "\$TEAM" >&2 ;;
+      forged) printf 'Authority=Developer ID Application: Fake Dev (%s)\nTeamIdentifier=%s\n' "\$TEAM" "\$TEAM" >&2 ;;
+      adhoc) printf 'Signature=adhoc\nTeamIdentifier=not set\n' >&2 ;;
+      wrongteam) printf 'Authority=Developer ID Application: Evil Corp (WRONGTEAM1)\nTeamIdentifier=WRONGTEAM1\n' >&2 ;;
+      notdev) printf 'Authority=Apple Development: someone (%s)\nTeamIdentifier=%s\n' "\$TEAM" "\$TEAM" >&2 ;;
+    esac
+    exit 0 ;;
+esac
+exit 1
+EOF
+chmod +x "$FSCS"
+COMMON="$SANDBOX/ut/spike/lib/common.sh"
+mkdir -p "$(dirname "$COMMON")"
+sed "s|^readonly CODESIGN_BIN=.*|readonly CODESIGN_BIN=\"$FSCS\"|" "$COMMON_REAL" > "$COMMON"
+has "sandbox copy points the codesign constant at the fake" "$(cat "$COMMON")" "readonly CODESIGN_BIN=\"$FSCS\""
+has "the shipped common.sh keeps the fixed codesign path" "$(cat "$COMMON_REAL")" 'readonly CODESIGN_BIN="/usr/bin/codesign"'
+
 # shellcheck disable=SC1090
-. "$COMMON"
+. "$COMMON_REAL"
 
 ROOT="$(spike_root)"
 eq "spike_root is under the private TMPDIR" "$SANDBOX/harness-spike" "$ROOT"
@@ -103,7 +157,7 @@ WT="$(spike_worktree_add "$REPO" alpha)"
 eq "worktree path is <repo>-wt/<name>" "$REPO-wt/alpha" "$WT"
 check "worktree dir exists" test -d "$WT"
 eq "worktree is on branch spike/alpha" "spike/alpha" "$(git -C "$WT" rev-parse --abbrev-ref HEAD)"
-check "worktree add rejects a bad name" bash -c '. "$1"; ! spike_worktree_add "$2" "../evil"' _ "$COMMON" "$REPO"
+check "worktree add rejects a bad name" bash -c '. "$1"; ! spike_worktree_add "$2" "../evil"' _ "$COMMON_REAL" "$REPO"
 
 spike_cleanup "$RUN"
 check "cleanup removed the run dir" test ! -e "$RUN"
@@ -223,7 +277,18 @@ eq "run_timeout refuses an unverified claude auth status without SPIKE_LIVE (rc)
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/codex" login status' _ "$COMMON" "$FAKE" 2>/dev/null
 eq "run_timeout refuses an unverified codex login status without SPIKE_LIVE (rc)" "3" "$?"
 eq "refused unverified status calls did not start the CLIs" "0" "$(ran)"
-env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" && spike_mark_verified "$2/codex" && spike_run_status 5 /dev/null "$2/claude" --version && spike_run_status 5 /dev/null "$2/claude" auth status && spike_run_status 5 /dev/null "$2/codex" login status' _ "$COMMON" "$FAKE" 2>/dev/null
+# Round 6 (item 2): the registered copies are Mach-O-headed fixtures whose signer passes the fake pinned check.
+REG="$FAKE/reg"
+mkdir -p "$REG"
+mkmacho "$REG/claude" <<EOF
+touch "$FAKE/ran-\$\$"
+exit 0
+EOF
+mkmacho "$REG/codex" <<EOF
+touch "$FAKE/ran-\$\$"
+exit 0
+EOF
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude && spike_mark_verified "$2/codex" codex && spike_run_status 5 /dev/null "$2/claude" --version && spike_run_status 5 /dev/null "$2/claude" auth status && spike_run_status 5 /dev/null "$2/codex" login status' _ "$COMMON" "$REG" 2>/dev/null
 eq "status runner runs registered verified copies (claude --version, claude auth status, codex login status) without SPIKE_LIVE (rc)" "0" "$?"
 eq "allowed status calls did start the verified copies" "3" "$(ran)"
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/claude" --version extra' _ "$COMMON" "$FAKE" 2>/dev/null
@@ -267,8 +332,8 @@ for w in zsh dash ksh xargs nohup command exec time nice perl python python3 nod
   denied "launcher '$w'" "spike_run_timeout 5 /dev/null $w claude -p hi"
 done
 denied "spike_run_live without SPIKE_LIVE" "spike_run_live 5 /dev/null '$FAKE/claude' -p hi"
-denied "spike_run_status with a prompt" "spike_run_status 5 /dev/null '$FAKE/renamed' -p hi"
-denied "spike_run_status with --version and extra args" "spike_run_status 5 /dev/null '$FAKE/renamed' --version -p"
+denied "spike_run_status with a prompt" "spike_run_status 5 /dev/null '$REG/claude' -p hi"
+denied "spike_run_status with --version and extra args" "spike_run_status 5 /dev/null '$REG/claude' --version -p"
 
 # ...while the harmless shapes still work without SPIKE_LIVE.
 okrun() { # okrun <name> <code>: must not be stopped by the gate
@@ -282,18 +347,22 @@ okrun "sleep" 'spike_run_timeout 5 /dev/null sleep 0'
 # Round 4 (decision 1a): jq is no longer a harmless identity; it is called directly by preflight, never through the runner.
 denied "jq --version needs the gate (jq left the ungated list, rule 1)" "spike_run_timeout 5 /dev/null jq --version"
 okrun "git --version" 'spike_run_timeout 5 /dev/null git --version'
-# Round 4 (decision 1c): codesign is ungated only for the exact read-only shapes and only from a system directory.
-# Without a system codesign (Linux) the identity check fails, so the shapes need the gate there.
+# Round 4 (decision 1c) and round 6 (item 3): codesign is ungated only for the read-only shapes, from a system directory,
+# and only on a path that resolves inside the private verify directory. Without a system codesign (Linux) the identity
+# check fails, so the shapes need the gate there.
 if [ -x /usr/bin/codesign ]; then
-  okrun "codesign --verify --strict <provider path> (system codesign)" "spike_run_timeout 5 /dev/null codesign --verify --strict '$FAKE/claude'"
-  okrun "codesign -dv --verbose=2 <provider path> (system codesign)" "spike_run_timeout 5 /dev/null codesign -dv --verbose=2 '$FAKE/claude'"
+  okrun "codesign --verify --strict <path inside the verify dir> (system codesign)" "spike_set_verify_dir '$FAKE'; spike_run_timeout 5 /dev/null codesign --verify --strict '$FAKE/claude'"
+  okrun "codesign -dv --verbose=2 <path inside the verify dir> (system codesign)" "spike_set_verify_dir '$FAKE'; spike_run_timeout 5 /dev/null codesign -dv --verbose=2 '$FAKE/claude'"
 else
-  denied "codesign verify needs the gate when there is no system codesign (identity, rule 6)" "spike_run_timeout 5 /dev/null codesign --verify --strict '$FAKE/claude'"
+  denied "codesign verify needs the gate when there is no system codesign (identity, rule 6)" "spike_set_verify_dir '$FAKE'; spike_run_timeout 5 /dev/null codesign --verify --strict '$FAKE/claude'"
 fi
-okrun "spike_run_status of a renamed binary with --version (registered as a verified copy first)" "spike_mark_verified '$FAKE/renamed'; spike_run_status 5 /dev/null '$FAKE/renamed' --version"
-okrun "spike_run_status of a renamed binary with login status (registered as a verified copy first)" "spike_mark_verified '$FAKE/renamed'; spike_run_status 5 /dev/null '$FAKE/renamed' login status"
-# Round 4 (decision 1d): the upper-case CLAUDE name no longer gets the status-shape exception in spike_run_timeout.
+mkmacho "$REG/renamed" <<EOF
+exit 0
+EOF
+okrun "spike_run_status of a renamed binary with --version (registered as a verified copy first)" "spike_mark_verified '$REG/renamed' claude; spike_run_status 5 /dev/null '$REG/renamed' --version"
+okrun "spike_run_status of a renamed binary with login status (registered as a verified copy first)" "spike_mark_verified '$REG/renamed' claude; spike_run_status 5 /dev/null '$REG/renamed' login status"
 rm -f "$FAKE"/ran-*
+# Round 4 (decision 1d): the upper-case CLAUDE name no longer gets the status-shape exception in spike_run_timeout.
 denied "upper-case CLAUDE --version through spike_run_timeout (unverified provider CLI, rule 6)" "spike_run_timeout 5 /dev/null '$FAKE/CLAUDE' --version"
 rm -f "$FAKE"/ran-*
 SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live 5 /dev/null "$2/renamed" -p hi' _ "$COMMON" "$FAKE" 2>/dev/null
@@ -352,7 +421,35 @@ cs_shape "--verify --strict --remove-signature is refused" 0 --verify --strict -
 cs_shape "--verify --strict <path> --remove-signature is refused" 0 --verify --strict /x --remove-signature
 cs_shape "-dv --verbose=2 with an option where the path goes is refused" 0 -dv --verbose=2 --remove-signature
 
-# --- spike_run_status (decision 2): only a registered verified copy, and only the three status shapes -------------------
+# --- round 6, item 3 (rule 4): the codesign path must resolve inside the private verify directory --------------------
+# A canary stands in for a credential file under a fake home. Its text must never be read by the codesign checks.
+VD="$SANDBOX/verifydir"
+mkdir -p "$VD"
+FH="$SANDBOX/fakehome"
+mkdir -p "$FH/.claude"
+printf 'CANARY-ROOT-9d1e\n' > "$FH/.claude/canary"
+ln -s "$FH/.claude/canary" "$VD/link-to-canary"
+rooted() { # rooted <label> <1|0> <verify-dir or -> <path>: _spike_codesign_rooted on its own
+  local label="$1" want="$2" vd="$3" p="$4" got
+  if [ "$vd" = "-" ]; then
+    /bin/bash -c '. "$1"; _spike_codesign_rooted "$2"' _ "$COMMON" "$p" >/dev/null 2>&1
+  else
+    /bin/bash -c '. "$1"; spike_set_verify_dir "$2"; _spike_codesign_rooted "$3"' _ "$COMMON" "$vd" "$p" >/dev/null 2>&1
+  fi
+  if [ $? -eq 0 ]; then got=1; else got=0; fi
+  eq "codesign rooted: $label" "$want" "$got"
+}
+rooted "a path inside the verify directory" 1 "$VD" "$VD/inside"
+rooted "the verify directory itself is not a file inside it" 0 "$VD" "$VD"
+rooted "a canary path under a fake home" 0 "$VD" "$FH/.claude/canary"
+rooted "a symlink in the verify directory that leads to the canary" 0 "$VD" "$VD/link-to-canary"
+rooted "a .. escape out of the verify directory" 0 "$VD" "$VD/../fakehome/.claude/canary"
+rooted "no verify directory set: nothing is rooted" 0 - "$VD/inside"
+denied "codesign --verify on a canary under a fake home is not ungated (rc 3)" "spike_set_verify_dir '$VD'; spike_run_timeout 5 /dev/null codesign --verify --strict '$FH/.claude/canary'"
+denied "codesign --verify through a symlink into the fake home is not ungated (rc 3)" "spike_set_verify_dir '$VD'; spike_run_timeout 5 /dev/null codesign --verify --strict '$VD/link-to-canary'"
+check "the canary was never copied or read into a verify output" bash -c '! grep -rq CANARY-ROOT "$1"' _ "$VD"
+
+# --- spike_run_status (decision 2): only a registered verified copy, and only the three status shapes ----------------
 SRS="$SANDBOX/srs.out"
 o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_status 5 "$2" /bin/sh auth status; echo CONTINUED' _ "$COMMON" "$SRS" 2>/dev/null)"
 eq "spike_run_status with /bin/sh auth status is refused (rc 3)" "3" "$?"
@@ -365,126 +462,194 @@ denied "spike_run_status with the original (unregistered) claude --version" "spi
 denied "spike_run_status with the original (unregistered) claude auth status" "spike_run_status 5 /dev/null '$FAKE/claude' auth status"
 denied "spike_run_status of an unregistered renamed copy with --version" "spike_run_status 5 /dev/null '$FAKE/renamed' --version"
 mkdir -p "$SANDBOX/launch"
-cp "$FAKE/claude" "$SANDBOX/launch/sh"
+mkmacho "$SANDBOX/launch/sh" <<EOF
+touch "$FAKE/ran-\$\$"
+exit 0
+EOF
 ln -s "$FAKE/claude" "$SANDBOX/launch/linked"
 rm -f "$FAKE"/ran-*
-o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/sh"; spike_run_status 5 /dev/null "$2/sh" --version; echo CONTINUED' _ "$COMMON" "$SANDBOX/launch" 2>/dev/null)"
+o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/sh" claude && spike_run_status 5 /dev/null "$2/sh" --version; echo CONTINUED' _ "$COMMON" "$SANDBOX/launch" 2>/dev/null)"
 eq "spike_run_status refuses a registered copy whose name is a launcher (rc 3)" "3" "$?"
 lacks "spike_run_status refuses a registered launcher-named copy: caller stopped" "$o" "CONTINUED"
 eq "spike_run_status refused the launcher-named copy: nothing started" "0" "$(ran)"
 rm -f "$FAKE"/ran-*
-o="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_mark_verified "$2/claude"; spike_run_status 5 /dev/null "$2/claude" -p hi; echo CONTINUED' _ "$COMMON" "$FAKE" 2>/dev/null)"
+o="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude && spike_run_status 5 /dev/null "$2/claude" -p hi; echo CONTINUED' _ "$COMMON" "$REG" 2>/dev/null)"
 eq "spike_run_status with a prompt is refused even for a registered copy and SPIKE_LIVE=1 (rc 3)" "3" "$?"
 lacks "spike_run_status with a prompt stops the caller" "$o" "CONTINUED"
 eq "spike_run_status with a prompt started nothing" "0" "$(ran)"
-/bin/bash -c '. "$1"; spike_mark_verified relative/claude' _ "$COMMON" >/dev/null 2>&1
+/bin/bash -c '. "$1"; spike_mark_verified relative/claude claude' _ "$COMMON" >/dev/null 2>&1
 eq "spike_mark_verified refuses a relative path (rc 2)" "2" "$?"
-/bin/bash -c '. "$1"; spike_mark_verified "$2/linked"' _ "$COMMON" "$SANDBOX/launch" >/dev/null 2>&1
+/bin/bash -c '. "$1"; spike_mark_verified "$2/linked" claude' _ "$COMMON" "$SANDBOX/launch" >/dev/null 2>&1
 eq "spike_mark_verified refuses a symlink (rc 2)" "2" "$?"
-/bin/bash -c '. "$1"; spike_mark_verified "$2"' _ "$COMMON" "$SANDBOX/launch" >/dev/null 2>&1
+/bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$SANDBOX/launch" >/dev/null 2>&1
 eq "spike_mark_verified refuses a directory (rc 2)" "2" "$?"
 
-# --- require_live: documented top-level use, and the fail-safe for a caller that overrode TERM ---------------------
-cat > "$SANDBOX/toplevel.sh" <<EOF
-#!/bin/bash
-. "$COMMON"
-spike_require_live
-echo RAN
+# --- round 6, item 2 (rule 6): registration runs the pinned-signer check and the Mach-O magic check itself -------------
+RG="$SANDBOX/regtest"
+mkdir -p "$RG"
+mkmacho "$RG/claude" <<EOF
+touch "$FAKE/ran-\$\$"
+exit 0
 EOF
-out="$(env -u SPIKE_LIVE /bin/bash "$SANDBOX/toplevel.sh" 2>/dev/null)"
-eq "documented top-level use stops with rc 3" "3" "$?"
-lacks "documented top-level use prints nothing after the gate" "$out" "RAN"
-out="$(SPIKE_LIVE=1 /bin/bash "$SANDBOX/toplevel.sh" 2>/dev/null)"
-has "documented top-level use continues when SPIKE_LIVE=1" "$out" "RAN"
-# A caller that ignores TERM is still stopped shortly after (watchdog sends KILL), even from inside $(...).
-out="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; trap "" TERM; x="$(spike_require_live)"; sleep 1; echo LATE' _ "$COMMON" 2>/dev/null)"
-lacks "a caller that ignores TERM is killed by the fail-safe" "$out" "LATE"
-out="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; trap "echo CAUGHT" TERM; ( spike_require_live ); sleep 1; echo LATE' _ "$COMMON" 2>/dev/null)"
-lacks "a caller with its own TERM trap is killed by the fail-safe" "$out" "LATE"
-
-# --- spike_capture_dir -----------------------------------------------------------------------------------------------
-export SPIKE_CAPTURES_ROOT="$SANDBOX/captures"
-CAP="$(spike_capture_dir demo)"
-check "capture dir exists" test -d "$CAP"
-case "$CAP" in
-  "$SANDBOX/captures/demo/"2*Z/) ok "capture dir is <root>/<cli>/<UTC timestamp>/" ;;
-  *) bad "capture dir shape: $CAP" ;;
-esac
-spike_capture_dir "../x" >/dev/null 2>&1
-eq "capture dir rejects a bad cli name (rc)" "2" "$?"
-
-CAPREPO="$SANDBOX/caprepo"
-mkdir -p "$CAPREPO"
-git -C "$CAPREPO" init -q
-SPIKE_CAPTURES_ROOT="$CAPREPO/captures" spike_capture_dir demo >/dev/null 2>&1
-eq "capture dir refuses a root inside a repo that does not ignore it (rc)" "2" "$?"
-check "refused capture root was not created" test ! -e "$CAPREPO/captures"
-printf 'captures/\n' > "$CAPREPO/.gitignore"
-CAP2="$(SPIKE_CAPTURES_ROOT="$CAPREPO/captures" spike_capture_dir demo)"
-eq "capture dir accepts a root inside a repo when git ignores it (rc)" "0" "$?"
-check "ignored capture dir exists" test -d "$CAP2"
-# This test uses the shared default root spike/captures, so the suite must not run concurrently in one worktree.
-CAP3="$(unset SPIKE_CAPTURES_ROOT; spike_capture_dir selftest)"
-eq "default capture root (spike/captures) is accepted (ignored by spike/.gitignore)" "0" "$?"
-case "$CAP3" in "$HERE/../captures/selftest/"*|"$(cd "$HERE/.." && pwd -P)/captures/selftest/"*) rm -rf "$CAP3" ;; esac
-rmdir "$(cd "$HERE/.." && pwd -P)/captures/selftest" 2>/dev/null
-rmdir "$(cd "$HERE/.." && pwd -P)/captures" 2>/dev/null
-unset SPIKE_CAPTURES_ROOT
-
-# --- spike_redact ----------------------------------------------------------------------------------------------------
-U1="3f2b8c1e-9a4d-4e7b-8c55-0123456789ab"
-U2="AAAAAAAA-bbbb-4ccc-8ddd-eeeeeeeeeeee"
-LINE="session $U1 and $U2 and $U1 again at $HOME/projects/secret/file.txt, mail jane.doe+x@example.com; wt $ROOT/run-1/repo-wt/a/file"
-OUT="$(printf '%s\n' "$LINE" | spike_redact)"
-lacks "redact removes UUID 1" "$OUT" "$U1"
-lacks "redact removes UUID 2" "$OUT" "$U2"
-has "redact numbers ids stably (same id, same number)" "$OUT" "session <ID-1> and <ID-2> and <ID-1> again"
-has 'redact rewrites a $HOME path to $HOME/...' "$OUT" 'at $HOME/...,'
-lacks "redact hides the home path tail" "$OUT" "projects/secret"
-has "redact rewrites an email to <EMAIL>" "$OUT" "mail <EMAIL>;"
-has "redact rewrites the scratch run dir to <WORKTREE>" "$OUT" "wt <WORKTREE>/repo-wt/a/file"
-lacks "redacted output has no @" "$OUT" "@"
-OUT2="$(printf '%s\n' "id $U2 only" | spike_redact)"
-eq "redact numbering restarts per invocation" "id <ID-1> only" "$OUT2"
-
-# Cases below use a fixed fake home so they behave the same on every machine.
-red() { printf '%s\n' "$1" | HOME=/Users/tester spike_redact; }
-redcase() { # redcase <name> <input> <leaked-substring>
-  local o
-  o="$(red "$2")"
-  lacks "redact: $1" "$o" "$3"
+# regcase <label> <fake codesign mode> <cli> <path> <fixture-maker-or-empty>: registration must refuse (rc 2), and the
+# status runner must then refuse the same path (rc 3) without running it.
+regcase() {
+  local label="$1" mode="$2" name="$3" p="$4" rc
+  printf '%s\n' "$mode" > "$FSDIR/mode"
+  env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" "$3"' _ "$COMMON" "$p" "$name" >/dev/null 2>&1
+  rc=$?
+  eq "registration refused: $label (rc 2)" "2" "$rc"
+  rm -f "$FAKE"/ran-*
+  env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_status 5 /dev/null "$2" --version' _ "$COMMON" "$p" >/dev/null 2>&1
+  eq "registration refused: $label, so spike_run_status refuses it (rc 3)" "3" "$?"
+  eq "registration refused: $label, and nothing ran" "0" "$(ran)"
 }
-redcase "file:// URL" 'see file:///Users/tester/a.txt now' 'a.txt'
-has "redact: file:// URL keeps the scheme" "$(red 'see file:///Users/tester/a.txt now')" 'file://$HOME/... now'
-redcase "JSON-escaped newline before the path" 'x\n/Users/tester/secret\nnext' 'secret'
-has "redact: JSON-escaped newline keeps the escapes" "$(red 'x\n/Users/tester/secret\nnext')" 'x\n$HOME/...\nnext'
-redcase "JSON-escaped slashes" '{"cwd":"\/Users\/tester\/secret"}' 'secret'
-redcase "stream-json line" '{"type":"system","cwd":"/Users/tester/work/proj","session_id":"x"}' 'work/proj'
-has "redact: stream-json line stays parseable JSON" "$(red '{"type":"system","cwd":"/Users/tester/work/proj","k":1}' | jq -c .cwd)" '"$HOME/..."'
-eq "redact: home at end of sentence" 'cwd is $HOME/....' "$(red 'cwd is /Users/tester.')"
-eq "redact: single-quoted home" "q '\$HOME/...' end" "$(red "q '/Users/tester' end")"
-eq "redact: bracketed home" 'in [$HOME/...] end' "$(red 'in [/Users/tester] end')"
-eq "redact: paren home path" 'at ($HOME/...) end' "$(red 'at (/Users/tester/a/b) end')"
-redcase "path with a space" 'open /Users/tester/My Docs/secret now' 'secret'
-redcase "path with two spaces" 'open /Users/tester/My Big Docs/secret.txt, then' 'secret'
-has "redact: path with a space keeps the rest of the line" "$(red 'open /Users/tester/My Docs/secret now')" 'open $HOME/... now'
-redcase "another user's home" 'see /Users/other/private/key.pem' 'private'
-has "redact: another user's home is generic" "$(red 'see /Users/other/private/key.pem')" '/Users/<USER>/...'
-redcase "lookalike of my home (different user name)" 'x /Users/testerx/not-home y' 'not-home'
-redcase "linux-style home" 'x /home/alice/.ssh/id y' 'alice'
-redcase "email at localhost" 'mail jane@localhost now' 'jane'
-redcase "email at a bare host" 'mail bob@corp now' 'bob'
-redcase "email with one-letter parts" 'mail a@b.c now' 'a@b.c'
-redcase "email with non-ASCII local part" 'mail josé@exämple.org now' 'jos'
-redcase "user@host" 'ssh deploy@build-box now' 'deploy'
-has "redact: email becomes <EMAIL>" "$(red 'mail jane@localhost now')" 'mail <EMAIL> now'
-eq "redact: hyphenless 32-hex id" 'id <ID-1> and <ID-1> and <ID-2>' "$(red 'id 0123456789abcdef0123456789ABCDEF and 0123456789abcdef0123456789abcdef and 3f2b8c1e9a4d4e7b8c550123456789ab')"
-eq "redact: dashed and hyphenless forms of one id share a number" 'a <ID-1> b <ID-1>' "$(red 'a 3f2b8c1e-9a4d-4e7b-8c55-0123456789ab b 3f2b8c1e9a4d4e7b8c550123456789ab')"
-SHA40="0123456789abcdef0123456789abcdef01234567"
-eq "redact: a 40-hex git sha is not an id" "commit $SHA40" "$(red "commit $SHA40")"
-eq "redact: plain text is untouched" "hello world: 3 files changed" "$(red 'hello world: 3 files changed')"
-eq "redact: a lone @ is untouched" "use @ sign" "$(red 'use @ sign')"
-eq "redact: redacting twice changes nothing more" "$(red 'a /Users/other/x b jane@x.io')" "$(red 'a /Users/other/x b jane@x.io' | spike_redact)"
+mkmacho "$RG/unsigned" <<EOF
+touch "$FAKE/ran-\$\$"
+EOF
+mkmacho "$RG/wrong-claude" <<EOF
+touch "$FAKE/ran-\$\$"
+EOF
+mkmacho "$RG/adhoc-claude" <<EOF
+touch "$FAKE/ran-\$\$"
+EOF
+mkmacho "$RG/forged-claude" <<EOF
+touch "$FAKE/ran-\$\$"
+EOF
+mkmacho "$RG/notdev-claude" <<EOF
+touch "$FAKE/ran-\$\$"
+EOF
+mkmacho "$RG/weird-claude" <<EOF
+touch "$FAKE/ran-\$\$"
+EOF
+regcase "unsigned Mach-O (not signed at all)" unsigned claude "$RG/unsigned"
+regcase "wrong team (Developer ID, other team)" wrongteam claude "$RG/wrong-claude"
+regcase "ad-hoc signature" adhoc claude "$RG/adhoc-claude"
+regcase "forged text, chain requirement fails" forged claude "$RG/forged-claude"
+regcase "Apple Development authority, not Developer ID" notdev claude "$RG/notdev-claude"
+regcase "codesign fails with rc 3" weird claude "$RG/weird-claude"
+printf 'good\n' > "$FSDIR/mode"
+# A Claude-team copy registered under the codex name is refused by the pinned team of that name.
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" codex' _ "$COMMON" "$RG/claude" >/dev/null 2>&1
+eq "registration refused: a copy signed by the Anthropic team registered as codex (rc 2)" "2" "$?"
+# Magic: an ELF header and a script with a Mach-O name are refused before any signer runs.
+printf '\177ELF\002\001\001\000 not a mach-o\n' > "$RG/elf-claude"
+chmod +x "$RG/elf-claude"
+printf '#!/bin/sh\necho "%s"\n' "script with a Mach-O name" > "$RG/script-claude"
+chmod +x "$RG/script-claude"
+printf 'good\n' > "$FSDIR/mode"
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$RG/elf-claude" >/dev/null 2>&1
+eq "registration refused: an ELF header named claude (rc 2)" "2" "$?"
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$RG/script-claude" >/dev/null 2>&1
+eq "registration refused: a shell script with a Mach-O name (rc 2)" "2" "$?"
+if [ "$(head -c 4 /bin/sh | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
+  cp /bin/sh "$RG/dash-claude"
+  env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$RG/dash-claude" >/dev/null 2>&1
+  eq "registration refused: a copy of dash named claude (ELF on Linux, rc 2)" "2" "$?"
+  rm -f "$FAKE"/ran-*
+  env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_status 5 /dev/null "$2" --version' _ "$COMMON" "$RG/dash-claude" >/dev/null 2>&1
+  eq "a dash copy named claude is never run through spike_run_status (rc 3)" "3" "$?"
+fi
+# Positive: a Mach-O-headed copy that passes the fake pinned signer for claude registers (rc 0). The fake codesign was asked
+# about this exact copy path with the chain requirement. The status run passes the identity check and reaches exec.
+printf 'good\n' > "$FSDIR/mode"
+: > "$FSDIR/log"
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$RG/claude" >/dev/null 2>&1
+eq "registration accepts a Mach-O copy that passes the pinned signer (rc 0)" "0" "$?"
+has "registration asked codesign about the copy path (verify)" "$(cat "$FSDIR/log")" "--verify --strict $RG/claude"
+has "registration checked the chain-to-Apple requirement for the pinned team" "$(cat "$FSDIR/log")" 'anchor apple generic and certificate leaf[subject.OU] = "Q6L2SF6YDW"'
+rm -f "$FAKE"/ran-*
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude && spike_run_status 5 /dev/null "$2" --version' _ "$COMMON" "$RG/claude" >/dev/null 2>&1
+eq "registered binary passes the identity check and runs through spike_run_status (rc 0)" "0" "$?"
+eq "registered binary ran once" "1" "$(ran)"
+
+# --- round 6, item 1: resolve once, physically, and execute the resolved path --------------------------------------
+# Reviewer's repro: S is a symlink to an 11-level directory, and the command is S + 14 x "/.." + "/usr/bin/printf". The
+# kernel applies each '..' to the real directory, so the command is a file under the physical target. A fake printf sits
+# there. The old lexical resolution saw /usr/bin/printf; the fixed resolver must see the physical file and refuse.
+RR="$SANDBOX/rr"
+RQ="$RR/q1/q2/q3"
+RT="$RQ/c1/c2/c3/c4/c5/c6/c7/c8/c9/c10/c11"
+mkdir -p "$RT" "$RR/usr/bin"
+ln -s "$RT" "$RQ/S"
+printf '#!/bin/sh\ntouch "%s/rr-marker"\necho FAKE-PRINTF\n' "$RR" > "$RR/usr/bin/printf"
+chmod +x "$RR/usr/bin/printf"
+RUPS=""
+i=0
+while [ "$i" -lt 14 ]; do RUPS="$RUPS/.."; i=$((i + 1)); done
+RCMD="$RQ/S$RUPS/usr/bin/printf"
+eq "reviewer repro resolves to the physical target, not /usr/bin/printf" "$(cd -P "$RR" && pwd -P)/usr/bin/printf" "$(spike_resolve_path "$RCMD")"
+rm -f "$RR"/rr-marker
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2" hi' _ "$COMMON" "$RCMD" >/dev/null 2>&1
+eq "reviewer repro with a prompt is refused (rc 3)" "3" "$?"
+check "reviewer repro: the fake printf under the physical target never ran" test ! -e "$RR/rr-marker"
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2" hi' _ "$COMMON" "$RCMD" >/dev/null 2>&1
+eq "reviewer repro without a prompt is refused too (rc 3)" "3" "$?"
+check "reviewer repro (no prompt): the fake printf never ran" test ! -e "$RR/rr-marker"
+# Double slashes are normalised, so //usr//bin/printf runs the REAL printf (no false refusal).
+PFOUT="$SANDBOX/pf.out"
+: > "$PFOUT"
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 "$2" //usr//bin/printf hello' _ "$COMMON" "$PFOUT" >/dev/null 2>&1
+eq "//usr//bin/printf runs the real printf (rc 0)" "0" "$?"
+has "//usr//bin/printf wrote its output" "$(cat "$PFOUT")" "hello"
+eq "//usr//bin/printf resolves to /usr/bin/printf" "/usr/bin/printf" "$(spike_resolve_path //usr//bin/printf)"
+# A symlink named like a harmless tool, pointing at a non-system file, is refused (the resolved target decides).
+ln -s "$FAKE/claude" "$SANDBOX/alias-true"
+rm -f "$FAKE"/ran-*
+denied "a symlink named alias-true to a provider copy is not ungated (rc 3)" "spike_run_timeout 5 /dev/null '$SANDBOX/alias-true' --version"
+# PATH TOCTOU: a directory first on PATH holds printf as a symlink to the real binary, and a fake regular file that the
+# swapper puts in its place. Each run resolves printf once. The fake must never run; a run is either the real printf
+# (rc 0) or a refusal (rc 3) when the fake was resolved.
+TOC="$SANDBOX/toc"
+mkdir -p "$TOC/first"
+REALP="$(type -P printf)"
+printf '#!/bin/sh\ntouch "%s/toc-marker-$$"\nexit 0\n' "$TOC" > "$TOC/fake"
+chmod +x "$TOC/fake"
+ln -sf "$REALP" "$TOC/first/printf"
+(
+  while :; do
+    ln -sf "$REALP" "$TOC/first/.p.tmp" && mv -f "$TOC/first/.p.tmp" "$TOC/first/printf"
+    cp "$TOC/fake" "$TOC/first/.f.tmp" && mv -f "$TOC/first/.f.tmp" "$TOC/first/printf"
+  done
+) >/dev/null 2>&1 &
+SWAP=$!
+TOC_BAD=0
+TOC_BADRC=0
+for i in $(seq 1 25); do
+  rm -f "$TOC"/toc-marker-*
+  env -u SPIKE_LIVE PATH="$TOC/first:$PATH" /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null printf toc' _ "$COMMON" >/dev/null 2>&1
+  rc=$?
+  case "$rc" in 0|3) ;; *) TOC_BADRC=$((TOC_BADRC + 1)) ;; esac
+  for m in "$TOC"/toc-marker-*; do
+    if [ -e "$m" ]; then TOC_BAD=$((TOC_BAD + 1)); fi
+  done
+done
+kill "$SWAP" 2>/dev/null
+wait "$SWAP" 2>/dev/null
+eq "PATH TOCTOU: the swapped printf never ran in 25 trials (bad runs)" "0" "$TOC_BAD"
+eq "PATH TOCTOU: every trial ran the resolved printf or refused (rc 0 or 3)" "0" "$TOC_BADRC"
+
+# --- round 6, item 6: the runner body replaces the inherited traps as its FIRST statement -------------------------------
+BODY_SRC="$(/bin/bash -c '. "$1"; declare -f _spike_run_timeout_body' _ "$COMMON" 2>/dev/null)"
+FIRST_STMT="$(printf '%s\n' "$BODY_SRC" | sed -n '3p' | sed 's/^[[:space:]]*//')"
+case "$FIRST_STMT" in
+  "trap '_spike_signal 143' TERM"*) ok "item 6: the runner body's first statement replaces the TERM trap" ;;
+  *) bad "item 6: the runner body's first statement replaces the TERM trap (first statement: [$FIRST_STMT])" ;;
+esac
+
+# --- round 6, item 4 (rule 4): the CLI-home test on a resolved path (the names are not written in spike/) -------------
+UH="$SANDBOX/uhome"
+mkdir -p "$UH/.claude" "$UH/plain/bin" "$UH/.hidden-tool" "$SANDBOX/outside-real"
+ln -s "$SANDBOX/outside-real" "$UH/.linked"
+uhome() { # uhome <path>: 0 if spike_under_cli_home refuses it, with HOME set to the fake home
+  /bin/bash -c 'export HOME="$1"; . "$2"; spike_under_cli_home "$3"' _ "$UH" "$COMMON" "$1" >/dev/null 2>&1
+}
+if uhome "$UH/.claude/canary"; then ok "CLI home: a file under a dot-directory of HOME is refused"; else bad "CLI home: a file under a dot-directory of HOME is refused"; fi
+if uhome "$UH/.hidden-tool/x"; then ok "CLI home: any other dot-directory of HOME is refused too (superset of the list)"; else bad "CLI home: any other dot-directory of HOME is refused too (superset of the list)"; fi
+if uhome "$UH/plain/bin/claude"; then bad "CLI home: an ordinary path under HOME is not refused"; else ok "CLI home: an ordinary path under HOME is not refused"; fi
+if uhome "$SANDBOX/outside-real/x"; then ok "CLI home: a dot-entry symlinked to an outside directory refuses that directory"; else bad "CLI home: a dot-entry symlinked to an outside directory refuses that directory"; fi
+if uhome "$SANDBOX/other/x"; then bad "CLI home: an outside path is not refused"; else ok "CLI home: an outside path is not refused"; fi
+if /bin/bash -c 'unset HOME; . "$1"; spike_under_cli_home "$2"' _ "$COMMON" "$UH/plain/bin/claude" >/dev/null 2>&1; then ok "CLI home: HOME unset fails closed (refused)"; else bad "CLI home: HOME unset fails closed (refused)"; fi
 
 # --- spike_resolve_path / spike_run_timeout --------------------------------------------------------------------------
 mkdir -p "$SANDBOX/rp/real"
@@ -716,6 +881,90 @@ eq "stress: no command survives a TERM or HUP sent right after the start (bad ru
 # The caller's own TERM trap is restored after a run.
 out="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; trap "echo MYTRAP" TERM; spike_run_live 5 /dev/null true; trap -p TERM' _ "$COMMON" 2>/dev/null)"
 has "caller TERM trap is restored after spike_run_live" "$out" "echo MYTRAP"
+
+# --- spike_capture_dir -----------------------------------------------------------------------------------------------
+export SPIKE_CAPTURES_ROOT="$SANDBOX/captures"
+CAP="$(spike_capture_dir demo)"
+check "capture dir exists" test -d "$CAP"
+case "$CAP" in
+  "$SANDBOX/captures/demo/"2*Z/) ok "capture dir is <root>/<cli>/<UTC timestamp>/" ;;
+  *) bad "capture dir shape: $CAP" ;;
+esac
+spike_capture_dir "../x" >/dev/null 2>&1
+eq "capture dir rejects a bad cli name (rc)" "2" "$?"
+
+CAPREPO="$SANDBOX/caprepo"
+mkdir -p "$CAPREPO"
+git -C "$CAPREPO" init -q
+SPIKE_CAPTURES_ROOT="$CAPREPO/captures" spike_capture_dir demo >/dev/null 2>&1
+eq "capture dir refuses a root inside a repo that does not ignore it (rc)" "2" "$?"
+check "refused capture root was not created" test ! -e "$CAPREPO/captures"
+printf 'captures/\n' > "$CAPREPO/.gitignore"
+CAP2="$(SPIKE_CAPTURES_ROOT="$CAPREPO/captures" spike_capture_dir demo)"
+eq "capture dir accepts a root inside a repo when git ignores it (rc)" "0" "$?"
+check "ignored capture dir exists" test -d "$CAP2"
+# This test uses the shared default root spike/captures, so the suite must not run concurrently in one worktree.
+CAP3="$(unset SPIKE_CAPTURES_ROOT; spike_capture_dir selftest)"
+eq "default capture root (spike/captures) is accepted (ignored by spike/.gitignore)" "0" "$?"
+case "$CAP3" in "$HERE/../captures/selftest/"*|"$(cd "$HERE/.." && pwd -P)/captures/selftest/"*) rm -rf "$CAP3" ;; esac
+rmdir "$(cd "$HERE/.." && pwd -P)/captures/selftest" 2>/dev/null
+rmdir "$(cd "$HERE/.." && pwd -P)/captures" 2>/dev/null
+unset SPIKE_CAPTURES_ROOT
+
+# --- spike_redact ----------------------------------------------------------------------------------------------------
+U1="3f2b8c1e-9a4d-4e7b-8c55-0123456789ab"
+U2="AAAAAAAA-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+LINE="session $U1 and $U2 and $U1 again at $HOME/projects/secret/file.txt, mail jane.doe+x@example.com; wt $ROOT/run-1/repo-wt/a/file"
+OUT="$(printf '%s\n' "$LINE" | spike_redact)"
+lacks "redact removes UUID 1" "$OUT" "$U1"
+lacks "redact removes UUID 2" "$OUT" "$U2"
+has "redact numbers ids stably (same id, same number)" "$OUT" "session <ID-1> and <ID-2> and <ID-1> again"
+has 'redact rewrites a $HOME path to $HOME/...' "$OUT" 'at $HOME/...,'
+lacks "redact hides the home path tail" "$OUT" "projects/secret"
+has "redact rewrites an email to <EMAIL>" "$OUT" "mail <EMAIL>;"
+has "redact rewrites the scratch run dir to <WORKTREE>" "$OUT" "wt <WORKTREE>/repo-wt/a/file"
+lacks "redacted output has no @" "$OUT" "@"
+OUT2="$(printf '%s\n' "id $U2 only" | spike_redact)"
+eq "redact numbering restarts per invocation" "id <ID-1> only" "$OUT2"
+
+# Cases below use a fixed fake home so they behave the same on every machine.
+red() { printf '%s\n' "$1" | HOME=/Users/tester spike_redact; }
+redcase() { # redcase <name> <input> <leaked-substring>
+  local o
+  o="$(red "$2")"
+  lacks "redact: $1" "$o" "$3"
+}
+redcase "file:// URL" 'see file:///Users/tester/a.txt now' 'a.txt'
+has "redact: file:// URL keeps the scheme" "$(red 'see file:///Users/tester/a.txt now')" 'file://$HOME/... now'
+redcase "JSON-escaped newline before the path" 'x\n/Users/tester/secret\nnext' 'secret'
+has "redact: JSON-escaped newline keeps the escapes" "$(red 'x\n/Users/tester/secret\nnext')" 'x\n$HOME/...\nnext'
+redcase "JSON-escaped slashes" '{"cwd":"\/Users\/tester\/secret"}' 'secret'
+redcase "stream-json line" '{"type":"system","cwd":"/Users/tester/work/proj","session_id":"x"}' 'work/proj'
+has "redact: stream-json line stays parseable JSON" "$(red '{"type":"system","cwd":"/Users/tester/work/proj","k":1}' | jq -c .cwd)" '"$HOME/..."'
+eq "redact: home at end of sentence" 'cwd is $HOME/....' "$(red 'cwd is /Users/tester.')"
+eq "redact: single-quoted home" "q '\$HOME/...' end" "$(red "q '/Users/tester' end")"
+eq "redact: bracketed home" 'in [$HOME/...] end' "$(red 'in [/Users/tester] end')"
+eq "redact: paren home path" 'at ($HOME/...) end' "$(red 'at (/Users/tester/a/b) end')"
+redcase "path with a space" 'open /Users/tester/My Docs/secret now' 'secret'
+redcase "path with two spaces" 'open /Users/tester/My Big Docs/secret.txt, then' 'secret'
+has "redact: path with a space keeps the rest of the line" "$(red 'open /Users/tester/My Docs/secret now')" 'open $HOME/... now'
+redcase "another user's home" 'see /Users/other/private/key.pem' 'private'
+has "redact: another user's home is generic" "$(red 'see /Users/other/private/key.pem')" '/Users/<USER>/...'
+redcase "lookalike of my home (different user name)" 'x /Users/testerx/not-home y' 'not-home'
+redcase "linux-style home" 'x /home/alice/.ssh/id y' 'alice'
+redcase "email at localhost" 'mail jane@localhost now' 'jane'
+redcase "email at a bare host" 'mail bob@corp now' 'bob'
+redcase "email with one-letter parts" 'mail a@b.c now' 'a@b.c'
+redcase "email with non-ASCII local part" 'mail josé@exämple.org now' 'jos'
+redcase "user@host" 'ssh deploy@build-box now' 'deploy'
+has "redact: email becomes <EMAIL>" "$(red 'mail jane@localhost now')" 'mail <EMAIL> now'
+eq "redact: hyphenless 32-hex id" 'id <ID-1> and <ID-1> and <ID-2>' "$(red 'id 0123456789abcdef0123456789ABCDEF and 0123456789abcdef0123456789abcdef and 3f2b8c1e9a4d4e7b8c550123456789ab')"
+eq "redact: dashed and hyphenless forms of one id share a number" 'a <ID-1> b <ID-1>' "$(red 'a 3f2b8c1e-9a4d-4e7b-8c55-0123456789ab b 3f2b8c1e9a4d4e7b8c550123456789ab')"
+SHA40="0123456789abcdef0123456789abcdef01234567"
+eq "redact: a 40-hex git sha is not an id" "commit $SHA40" "$(red "commit $SHA40")"
+eq "redact: plain text is untouched" "hello world: 3 files changed" "$(red 'hello world: 3 files changed')"
+eq "redact: a lone @ is untouched" "use @ sign" "$(red 'use @ sign')"
+eq "redact: redacting twice changes nothing more" "$(red 'a /Users/other/x b jane@x.io')" "$(red 'a /Users/other/x b jane@x.io' | spike_redact)"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

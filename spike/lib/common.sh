@@ -9,6 +9,9 @@
 # spike_require_live) unless the caller already has its own.
 #
 # Hard-rule notes:
+#   - Resolve once, physically, execute the resolved path (round 6). A command is resolved ONCE to its absolute real
+#     path (PATH lookup, then every symlink, with '..' applied the way the kernel applies it). The identity checks and
+#     the exec both use that same path. The runner never executes the name it was given, and env never searches PATH.
 #   - spike_run_timeout / spike_run_live / spike_run_status are the only helpers that start a command. They run it with
 #     a scrubbed environment, in its own process group. The group is killed on timeout, on TERM/INT/HUP to the caller,
 #     and when the caller disappears (SIGKILL included, within about 0.5 s). Identity, not name: without SPIKE_LIVE=1,
@@ -19,12 +22,19 @@
 #   - Children run headless: stdin is /dev/null, output goes to the outfile, and they are not in a new session. A CLI
 #     that opens the terminal device is out of scope (rule 3).
 #   - SPIKE_LIVE=1 is a guard against accidents, not an approval. Only the human sets it.
-#   - Nothing here reads or names any CLI credential location or config-home override.
+#   - Registration (spike_mark_verified) runs the pinned-signer check and a Mach-O magic check itself (rule 6). Only
+#     preflight may register. Codesign read-only shapes run without the gate only on a path inside the private verify
+#     directory (rule 4). Preflight refuses paths inside the CLI home directories before it reads them (rule 4).
 
 if [ -n "${SPIKE_COMMON_LOADED:-}" ]; then
   return 0 2>/dev/null || true
 fi
 SPIKE_COMMON_LOADED=1
+
+# ---- FIXED CODESIGN PATH (rule 6) -----------------------------------------------------------------------------------
+# Every signature check calls this absolute path. It is a readonly constant: no environment variable, flag or PATH entry
+# changes it. The tests make a sandbox copy with only this line rewritten; the shipped script has no override hook.
+readonly CODESIGN_BIN="/usr/bin/codesign"
 
 SPIKE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
@@ -338,23 +348,195 @@ spike_redact() {
   '
 }
 
-# spike_resolve_path <path> -> absolute path with every symlink followed (portable; macOS 3.2-era tools).
+# ---- resolution (round 6, item 1) -----------------------------------------------------------------------------------
+# Resolve once, physically: the same file the kernel would open. A '..' that follows a symlink is applied to the real
+# directory the symlink points to (cd -P), never lexically. Runs of '/' are collapsed. A relative path is made absolute
+# from the current directory. A final '.' or '..' component (or a trailing slash) is refused. At most 40 symlinks.
+_spike_norm_slashes() { printf '%s' "$1" | tr -s /; }
+
+# spike_resolve_path <path> -> echoes the absolute physical path of the final component, following every symlink.
 spike_resolve_path() {
-  local p="${1:-}" n=0 t d
+  local p="${1:-}" n=0 d b t
   [ -n "$p" ] || return 1
-  while [ -L "$p" ] && [ "$n" -lt 40 ]; do
-    t="$(readlink "$p")"
-    case "$t" in
-      /*) p="$t" ;;
-      *) p="$(dirname "$p")/$t" ;;
-    esac
-    n=$((n + 1))
+  p="$(_spike_norm_slashes "$p")"
+  case "$p" in
+    /*) ;;
+    *) p="$(pwd -P)/$p" ;;
+  esac
+  p="$(_spike_norm_slashes "$p")"
+  while :; do
+    d="${p%/*}"
+    b="${p##*/}"
+    [ -n "$d" ] || d="/"
+    case "$b" in ""|.|..) return 1 ;; esac
+    d="$(CDPATH= cd -P -- "$d" 2>/dev/null && pwd -P)" || return 1
+    if [ -L "$d/$b" ]; then
+      n=$((n + 1))
+      [ "$n" -le 40 ] || return 1
+      t="$(readlink "$d/$b")" || return 1
+      case "$t" in
+        /*) p="$t" ;;
+        *) p="$d/$t" ;;
+      esac
+      p="$(_spike_norm_slashes "$p")"
+      continue
+    fi
+    break
   done
-  d="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || return 1
-  printf '%s/%s\n' "$d" "$(basename "$p")"
+  if [ "$d" = "/" ]; then
+    printf '/%s\n' "$b"
+  else
+    printf '%s/%s\n' "$d" "$b"
+  fi
 }
 
-# --- command runner ---------------------------------------------------------------------------------------------------
+# spike_run_timed <seconds> <outfile> <cmd> [args...]: a direct call for the fixed tools only (codesign, file, git, jq,
+# perl). stdin is /dev/null and output is appended to <outfile>. Returns 124 on timeout. Never used for a provider CLI.
+spike_run_timed() {
+  local secs="$1" out="$2" rc
+  shift 2
+  perl -e 'alarm shift; exec @ARGV' -- "$secs" "$@" </dev/null >>"$out" 2>&1
+  rc=$?
+  if [ "$rc" -eq 142 ]; then return 124; fi
+  return "$rc"
+}
+
+# spike_magic_ok <file>: 0 if <file> is a regular, non-symlink file whose first four bytes are a Mach-O or universal
+# (fat) magic. Reads exactly four bytes (dd bs=4 count=1). The six values are the byte sequences of MH_MAGIC_64,
+# MH_MAGIC and FAT_MAGIC in both byte orders (cf fa ed fe, fe ed fa cf, ce fa ed fe, fe ed fa ce, ca fe ba be, be ba fe ca).
+spike_magic_ok() {
+  local f="${1:-}" m
+  [ -n "$f" ] || return 1
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  m="$(dd if="$f" bs=4 count=1 2>/dev/null | od -An -tx1 | tr -d ' \t\n')"
+  case "$m" in
+    feedfacf|cffaedfe|feedface|cefaedfe|cafebabe|bebafeca) return 0 ;;
+  esac
+  return 1
+}
+
+# spike_under_cli_home <resolved-path>: 0 (refuse; rule 4) if the path is inside any dot-entry directly under the physical
+# $HOME, or inside the physical target of such an entry (a symlinked CLI home). This covers every CLI home that rule 4
+# lists, and more. The explicit names are deliberately NOT written here: the compliance scan forbids them outside its
+# allowlist, and the explicit list belongs in compliance/ (follow-up for the lead). HOME unset, "/" or unresolvable: 0.
+spike_under_cli_home() {
+  local p="${1:-}" home e t
+  [ -n "$p" ] || return 0
+  home="${HOME:-}"
+  [ -n "$home" ] && [ "$home" != "/" ] || return 0
+  home="$(CDPATH= cd -P -- "$home" 2>/dev/null && pwd -P)" || return 0
+  [ "$home" != "/" ] || return 0
+  case "$p" in
+    "$home"/.?*) return 0 ;;
+  esac
+  for e in "$home"/.?*; do
+    [ -L "$e" ] || continue
+    t="$(spike_resolve_path "$e" 2>/dev/null)" || return 0
+    case "$p" in
+      "$t"|"$t"/?*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# spike_set_verify_dir <dir>: records the private verify directory preflight created (physical path, shell state).
+# Ungated codesign read-only shapes are accepted only for a path that resolves inside it (rule 4).
+_SPIKE_VERIFY_DIR=""
+spike_set_verify_dir() {
+  local d="${1:-}" phys
+  [ -n "$d" ] || return 2
+  phys="$(CDPATH= cd -P -- "$d" 2>/dev/null && pwd -P)" || return 2
+  _SPIKE_VERIFY_DIR="$phys"
+}
+
+# ---- pinned signer (rule 6) -----------------------------------------------------------------------------------------
+# Apple Developer Team IDs that the official CLI binaries must be signed by. Taken from the binaries installed on the
+# developer's Mac on 2026-10-25 (claude: Anthropic PBC, codex: OpenAI). THE HUMAN MUST CONFIRM THESE AGAINST
+# VENDOR-PUBLISHED VALUES BEFORE ANY RELEASE; until then they only prove "same signer as the binary I installed".
+SPIKE_PINNED_AUTHORITY_PREFIX="Developer ID Application"
+spike_pinned_team() {
+  case "$1" in
+    claude) printf 'Q6L2SF6YDW' ;;  # Anthropic PBC
+    codex) printf '2DC432GLL2' ;;   # OpenAI
+    *) printf '' ;;
+  esac
+}
+
+# SPIKE_SIG_TEXT: the signature column text of the last spike_verify_signer / spike_mark_verified call.
+SPIKE_SIG_TEXT=""
+
+# _spike_verify_body <path> <cli> <outfile>: the pinned-signer checks. Sets SPIKE_SIG_TEXT; 0 only for a copy that passes
+# every check. Runs only CODESIGN_BIN, and only on <path>, which the caller passes as a resolved path.
+_spike_verify_body() {
+  local bin="$1" name="$2" out="$3" rc auth team want sigkind firstauth
+  if [ ! -x "$CODESIGN_BIN" ]; then
+    SPIKE_SIG_TEXT="NOT VERIFIED (codesign unavailable)"
+    return 1
+  fi
+  : > "$out"
+  spike_run_timed 20 "$out" "$CODESIGN_BIN" --verify --strict "$bin"
+  rc=$?
+  if [ "$rc" -eq 124 ]; then
+    SPIKE_SIG_TEXT="NOT VERIFIED (codesign timed out)"
+    return 1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    if grep -qi 'not signed at all' "$out"; then
+      SPIKE_SIG_TEXT="NOT SIGNED"
+    else
+      SPIKE_SIG_TEXT="NOT VERIFIED (codesign rc=$rc)"
+    fi
+    return 1
+  fi
+
+  # The signature is intact. Now identify the signer.
+  : > "$out"
+  spike_run_timed 20 "$out" "$CODESIGN_BIN" -dv --verbose=2 "$bin"
+  firstauth="$(grep -m1 '^Authority=' "$out" | cut -d= -f2-)"
+  team="$(grep -m1 '^TeamIdentifier=' "$out" | cut -d= -f2-)"
+  auth="$(printf '%s' "$firstauth" | _spike_clean | sed 's/ ([A-Z0-9]*)$//' | spike_redact | cut -c1-46)"
+  team="$(printf '%s' "$team" | _spike_clean | cut -c1-12)"
+  sigkind=""
+  if grep -q '^Signature=adhoc' "$out"; then sigkind="ad-hoc, "; fi
+  want="$(spike_pinned_team "$name")"
+
+  case "$firstauth" in
+    "$SPIKE_PINNED_AUTHORITY_PREFIX"*) ;;
+    *)
+      SPIKE_SIG_TEXT="UNTRUSTED (valid but ${sigkind}${auth:-no authority}; not Developer ID)"
+      return 1
+      ;;
+  esac
+  if [ -z "$want" ] || [ "$team" != "$want" ]; then
+    SPIKE_SIG_TEXT="UNTRUSTED (valid but team ${team:-not set} is not the pinned team)"
+    return 1
+  fi
+  # The text above can be forged by a self-made certificate; this asks codesign to check the chain to Apple's root.
+  : > "$out"
+  spike_run_timed 20 "$out" "$CODESIGN_BIN" --verify --strict -R="anchor apple generic and certificate leaf[subject.OU] = \"$want\"" "$bin"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    SPIKE_SIG_TEXT="UNTRUSTED (signer text matches but the certificate chain does not satisfy the pinned team)"
+    return 1
+  fi
+  SPIKE_SIG_TEXT="valid; ${auth}; team ${team}"
+  return 0
+}
+
+# spike_verify_signer <resolved-path> <cli>: the pinned-signer check on its own (registers nothing). Sets SPIKE_SIG_TEXT.
+spike_verify_signer() {
+  local out rc
+  SPIKE_SIG_TEXT=""
+  out="$(mktemp "${TMPDIR:-/tmp}/spike-verify.XXXXXX" 2>/dev/null)" || { SPIKE_SIG_TEXT="NOT VERIFIED (no temp file)"; return 1; }
+  _spike_verify_body "$1" "$2" "$out"
+  rc=$?
+  rm -f "$out"
+  return "$rc"
+}
+
+_spike_clean() { tr -cd '[:print:]'; }
+
+# ---- command runner -------------------------------------------------------------------------------------------------
 # Three entry points start a command. Each either runs it with a scrubbed environment in its own process group, or
 # refuses with rc 3 and starts nothing:
 #   spike_run_timeout  non-live. Runs only a command whose IDENTITY is on the harmless list (_spike_ungated_ok).
@@ -362,13 +544,14 @@ spike_resolve_path() {
 #   spike_run_live     always needs SPIKE_LIVE=1. Every real prompt or session goes through here.
 #   spike_run_status   only a private verified copy that preflight registered with spike_mark_verified, and only the
 #                      three status shapes. SPIKE_LIVE does not lift this refusal.
-# Identity, not name: a program named cat, printf or claude is not harmless because of its name. An ungated command must
-# be a bare name or an absolute path, and its fully resolved real path (PATH lookup, then every symlink) must be inside
-# /bin, /usr/bin, /usr/sbin or /sbin. A relative path with a slash (./x, ../x) is never identified and is refused.
-# Children get stdin from /dev/null and stdout+stderr appended to the outfile. They run in their own process group, not
-# in a new session: a CLI that opens the terminal device (/dev/tty) is out of scope, since the spikes are headless only.
-# The runner watches its caller (the shell's $$ at start) and kills the command's group about 0.5 s after the caller
-# disappears, including after SIGKILL, when no trap can run.
+# Round 6: every entry point resolves the command ONCE (_spike_resolve_cmd: PATH lookup, then every symlink, physically)
+# and executes that resolved path through /usr/bin/env -i, never the name it was given and never a PATH re-search.
+# Identity, not name: a program named cat, printf or claude is not harmless because of its name. An ungated command's
+# resolved real path must be inside /bin, /usr/bin, /usr/sbin or /sbin. A relative path with a slash (./x, ../x) is
+# refused. Children get stdin from /dev/null and stdout+stderr appended to the outfile. They run in their own process
+# group, not in a new session: a CLI that opens the terminal device (/dev/tty) is out of scope, since the spikes are
+# headless only. The runner watches its caller (the shell's $$ at start) and kills the command's group about 0.5 s after
+# the caller disappears, including after SIGKILL, when no trap can run.
 
 _spike_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
@@ -416,13 +599,35 @@ _spike_arg_is_path() {
 }
 
 # codesign read-only verify shapes only: --verify --strict <path> | -dv --verbose=2 <path> |
-# --verify --strict -R=<requirement> <path>. Anything else (--sign, --remove-signature, ...) needs the gate.
+# --verify --strict -R=<requirement> <path>. Anything else (--sign, --remove-signature, ...) needs the gate. The path is
+# also checked by _spike_codesign_rooted (it must resolve inside the private verify directory).
 _spike_codesign_shape() {
   if [ "$#" -eq 3 ] && [ "$1 $2" = "--verify --strict" ]; then _spike_arg_is_path "$3" && return 0; fi
   if [ "$#" -eq 3 ] && [ "$1 $2" = "-dv --verbose=2" ]; then _spike_arg_is_path "$3" && return 0; fi
   if [ "$#" -eq 4 ] && [ "$1 $2" = "--verify --strict" ]; then
     case "$3" in -R=anchor\ apple\ generic\ and\ certificate\ leaf\[subject.OU\]\ =\ \"*) _spike_arg_is_path "$4" && return 0 ;; esac
   fi
+  return 1
+}
+
+# _spike_last_arg <args...> -> echoes the last argument (empty when there are none).
+_spike_last_arg() {
+  local a=""
+  for a in "$@"; do :; done
+  printf '%s' "$a"
+}
+
+# _spike_codesign_rooted <path>: 0 only if the PHYSICAL path is strictly inside the private verify directory set by
+# spike_set_verify_dir (rule 4). A credential file, a symlink that leaves the directory, or a '..' escape: 1. With no
+# verify directory set, nothing is rooted.
+_spike_codesign_rooted() {
+  local rp
+  [ -n "${_SPIKE_VERIFY_DIR:-}" ] || return 1
+  [ -n "${1:-}" ] || return 1
+  rp="$(spike_resolve_path "$1" 2>/dev/null)" || return 1
+  case "$rp" in
+    "$_SPIKE_VERIFY_DIR"/?*) return 0 ;;
+  esac
   return 1
 }
 
@@ -437,12 +642,11 @@ _spike_args_mention_provider() {
   return 1
 }
 
-# _spike_ungated_ok <cmd> [args...] -> 0 if this command may run without SPIKE_LIVE, 1 if it needs the gate.
-# Order: argv[0] must be a bare name or an absolute path; its resolved real path must be in a system directory; its
-# basename (argv[0] and resolved) must be on the allowlist; then the per-program argument shape applies.
-_spike_ungated_ok() {
-  local cmd="${1:-}" full res ab rb
-  shift
+# _spike_resolve_cmd <cmd> -> echoes the resolved absolute real path of <cmd>, or returns 1 (round 6, item 1). A bare name
+# is looked up on PATH once (type -P, which ignores functions and aliases). An absolute path is taken as it is. A
+# relative path with a slash, a leading dash, or an empty name is refused. The result is physical (spike_resolve_path).
+_spike_resolve_cmd() {
+  local cmd="${1:-}" full
   case "$cmd" in
     "") return 1 ;;
     /*) full="$cmd" ;;
@@ -450,7 +654,16 @@ _spike_ungated_ok() {
     *) full="$(type -P "$cmd" 2>/dev/null)" || return 1 ;;
   esac
   [ -n "$full" ] || return 1
-  res="$(spike_resolve_path "$full" 2>/dev/null)" || return 1
+  spike_resolve_path "$full"
+}
+
+# _spike_ungated_ok <resolved> <argv0> [args...] -> 0 if this command may run without SPIKE_LIVE, 1 if it needs the gate.
+# <resolved> is the path _spike_resolve_cmd returned, which is the path that will be executed. <argv0> is the name the
+# caller typed; its basename must be allowlisted too. The resolved target must be in a system directory and allowlisted.
+_spike_ungated_ok() {
+  local res="${1:-}" cmd="${2:-}" ab rb
+  shift 2
+  [ -n "$res" ] || return 1
   _spike_system_path "$res" || return 1
   ab="$(_spike_base "$cmd")"
   rb="$(_spike_base "$res")"
@@ -462,8 +675,9 @@ _spike_ungated_ok() {
       return 1
       ;;
     codesign)
-      if _spike_codesign_shape "$@"; then return 0; fi
-      return 1
+      _spike_codesign_shape "$@" || return 1
+      _spike_codesign_rooted "$(_spike_last_arg "$@")" || return 1
+      return 0
       ;;
     *)
       if _spike_args_mention_provider "$@"; then return 1; fi
@@ -472,8 +686,9 @@ _spike_ungated_ok() {
   esac
 }
 
-# Verified private copies. preflight.sh calls spike_mark_verified only after the copy passed the pinned-signer checks.
-# spike_run_status accepts argv[0] only if it is one of these exact paths. The list is shell state, not environment.
+# Verified private copies. preflight.sh registers a copy only through spike_mark_verified, which runs the pinned-signer
+# check and the Mach-O magic check itself (round 6, item 2). The registry holds RESOLVED paths; spike_run_status resolves
+# its argument and compares. The list is shell state, not environment.
 _SPIKE_VERIFIED=""
 
 _spike_is_verified() {
@@ -488,9 +703,10 @@ EOF
   return 1
 }
 
-# spike_mark_verified <path>: register one private, regular, non-symlink, executable copy. Preflight only.
+# spike_mark_verified <path> <cli>: register one private, regular, non-symlink, executable Mach-O copy whose signer passes
+# the pinned check for <cli> (claude or codex). Returns 2 and registers nothing otherwise. Preflight only.
 spike_mark_verified() {
-  local p="${1:-}"
+  local p="${1:-}" name="${2:-}" rp
   case "$p" in
     /*) ;;
     *) spike_err "mark_verified: not an absolute path"; return 2 ;;
@@ -500,8 +716,24 @@ spike_mark_verified() {
     spike_err "mark_verified: not a regular executable file: $p"
     return 2
   fi
-  if _spike_is_verified "$p"; then return 0; fi
-  _SPIKE_VERIFIED="$_SPIKE_VERIFIED$p
+  rp="$(spike_resolve_path "$p")" || { spike_err "mark_verified: cannot resolve: $p"; return 2; }
+  SPIKE_SIG_TEXT=""
+  if ! spike_magic_ok "$rp"; then
+    SPIKE_SIG_TEXT="NOT VERIFIED (not a Mach-O file)"
+    spike_err "mark_verified: not a Mach-O file: $p"
+    return 2
+  fi
+  if [ -z "$(spike_pinned_team "$name")" ]; then
+    SPIKE_SIG_TEXT="NOT VERIFIED (no pinned team for this name)"
+    spike_err "mark_verified: no pinned team for: $name"
+    return 2
+  fi
+  if ! spike_verify_signer "$rp" "$name"; then
+    spike_err "mark_verified: signer check failed: $SPIKE_SIG_TEXT"
+    return 2
+  fi
+  if _spike_is_verified "$rp"; then return 0; fi
+  _SPIKE_VERIFIED="$_SPIKE_VERIFIED$rp
 "
   return 0
 }
@@ -546,9 +778,18 @@ _spike_caller_gone() {
   return 0
 }
 
-# Runs inside a subshell (see _spike_exec). Starts the command in its own process group with a scrubbed environment.
-# Any signal or exit path of this subshell kills that group, and so does the caller going away.
+# The scrubbed-environment launcher. Absolute, so the runner never searches PATH for it (round 6, item 1).
+SPIKE_ENV_BIN="/usr/bin/env"
+
+# Runs inside a subshell (see _spike_exec). Starts the RESOLVED command in its own process group with a scrubbed
+# environment. Any signal or exit path of this subshell kills that group, and so does the caller going away.
 _spike_run_timeout_body() {
+  # The FIRST statement (round 6, item 6): replace the caller's inherited traps before anything else, so a signal that
+  # lands during this subshell's start-up is recorded by the runner's own logic (_spike_signal), never by a caller trap.
+  trap '_spike_signal 143' TERM
+  trap '_spike_signal 130' INT
+  trap '_spike_signal 129' HUP
+  trap '_spike_kill_group' EXIT
   local secs="$1" out="$2" ticks=0 limit rc envargs pid
   shift 2
   limit=$((secs * 10))
@@ -556,15 +797,10 @@ _spike_run_timeout_body() {
   envargs=(PATH="${PATH:-/usr/bin:/bin}" HOME="${HOME:-/}" TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-C}" TERM="${TERM:-dumb}")
   if [ -n "${USER:-}" ]; then envargs[${#envargs[@]}]="USER=$USER"; fi
   if [ -n "${LOGNAME:-}" ]; then envargs[${#envargs[@]}]="LOGNAME=$LOGNAME"; fi
-  _SPIKE_CHILD_PID=""
-  _SPIKE_PENDING=""
-  trap '_spike_signal 143' TERM
-  trap '_spike_signal 130' INT
-  trap '_spike_signal 129' HUP
-  trap '_spike_kill_group' EXIT
-  perl -e 'setpgrp(0, 0); exec @ARGV' -- env -i "${envargs[@]}" "$@" </dev/null >>"$out" 2>&1 &
+  # "$@" is the resolved absolute path followed by the arguments: env execs that path directly (no PATH search).
+  perl -e 'setpgrp(0, 0); exec @ARGV' -- "$SPIKE_ENV_BIN" -i "${envargs[@]}" "$@" </dev/null >>"$out" 2>&1 &
   _SPIKE_CHILD_PID=$!
-  if [ -n "$_SPIKE_PENDING" ]; then
+  if [ -n "${_SPIKE_PENDING:-}" ]; then
     _spike_kill_group
     exit "$_SPIKE_PENDING"
   fi
@@ -604,8 +840,8 @@ _spike_forward() {
   exit "$1"
 }
 
-# _spike_exec <seconds> <outfile> <cmd> [args...] -- no gate here; callers decide. Returns the command's exit code,
-# or 124 if it was killed for taking too long. stdin is closed, stdout+stderr append to <outfile>.
+# _spike_exec <seconds> <outfile> <resolved-cmd> [args...] -- no gate here; callers decide. Returns the command's exit
+# code, or 124 if it was killed for taking too long. stdin is closed, stdout+stderr append to <outfile>.
 _spike_exec() {
   local rc old_int old_term old_hup
   if ! command -v perl >/dev/null 2>&1; then
@@ -616,11 +852,18 @@ _spike_exec() {
     spike_err "ps is required (the runner watches its caller)"
     return 2
   fi
+  if [ ! -x "$SPIKE_ENV_BIN" ]; then
+    spike_err "$SPIKE_ENV_BIN is required (it sets the scrubbed environment)"
+    return 2
+  fi
   old_int="$(trap -p INT)"
   old_term="$(trap -p TERM)"
   old_hup="$(trap -p HUP)"
+  # Reset here, in the caller, before the subshell exists: the subshell must not clear a signal it recorded.
   _SPIKE_BG=""
   _SPIKE_BG_PENDING=""
+  _SPIKE_CHILD_PID=""
+  _SPIKE_PENDING=""
   _SPIKE_CALLER_PID="$$"
   trap '_spike_forward 130' INT
   trap '_spike_forward 143' TERM
@@ -663,45 +906,59 @@ _spike_stop_script() {
 }
 
 # spike_run_timeout <seconds> <outfile> <cmd> [args...]
-# Non-live runner. Runs only the harmless identities listed in _spike_ungated_ok (git --version, codesign verify shapes,
-# true, false, sleep, echo, printf, each only from a system directory). Everything else needs SPIKE_LIVE=1.
+# Non-live runner. Runs only the harmless identities listed in _spike_ungated_ok (git --version, the codesign read-only
+# shapes on a path inside the private verify directory, true, false, sleep, echo, printf, each only from a system
+# directory). Everything else needs SPIKE_LIVE=1. The command is resolved once and the resolved path is what runs.
 spike_run_timeout() {
-  local secs out cmd
+  local secs out cmd res
   _spike_run_args_ok "$@" || return 2
   secs="$1" out="$2" cmd="$3"
   shift 3
-  if ! _spike_ungated_ok "$cmd" "$@"; then
+  res="$(_spike_resolve_cmd "$cmd")" || res=""
+  if [ -z "$res" ] || ! _spike_ungated_ok "$res" "$cmd" "$@"; then
     spike_require_live
   fi
-  _spike_exec "$secs" "$out" "$cmd" "$@"
+  if [ -z "$res" ]; then
+    spike_err "cannot resolve command: $cmd"
+    return 2
+  fi
+  _spike_exec "$secs" "$out" "$res" "$@"
 }
 
 # spike_run_live <seconds> <outfile> <cmd> [args...]
 # The runner for every real prompt or session. Always checks the live gate first (SPIKE_LIVE=1, set by the human).
 spike_run_live() {
+  local secs out cmd res
   _spike_run_args_ok "$@" || return 2
+  secs="$1" out="$2" cmd="$3"
+  shift 3
   spike_require_live
-  _spike_exec "$@"
+  res="$(_spike_resolve_cmd "$cmd")" || res=""
+  if [ -z "$res" ]; then
+    spike_err "cannot resolve command: $cmd"
+    return 2
+  fi
+  _spike_exec "$secs" "$out" "$res" "$@"
 }
 
 # spike_run_status <seconds> <outfile> <bin> [args...]
 # Only a copy that preflight verified and registered with spike_mark_verified, and only --version, auth status or
-# login status. Any other argv[0] or argument shape is refused (rc 3, nothing started), with or without SPIKE_LIVE.
+# login status. The argument is resolved and compared with the registry (physical paths). Any other shape is refused
+# (rc 3, nothing started), with or without SPIKE_LIVE.
 spike_run_status() {
-  local secs out cmd base resolved
+  local secs out cmd res
   _spike_run_args_ok "$@" || return 2
   secs="$1" out="$2" cmd="$3"
   shift 3
-  if ! _spike_is_verified "$cmd"; then
+  res="$(_spike_resolve_cmd "$cmd")" || res=""
+  if [ -z "$res" ] || ! _spike_is_verified "$res"; then
     _spike_stop_script "refusing: $cmd is not a verified copy registered by preflight; spike_run_status runs only those"
   fi
   if ! _spike_status_shape "$@"; then
     _spike_stop_script "refusing: spike_run_status runs only --version, auth status and login status; use spike_run_live"
   fi
-  base="$(_spike_base "$cmd")"
-  resolved="$(spike_resolve_path "$cmd" 2>/dev/null)" || resolved="$cmd"
-  if _spike_is_launcher_name "$base" || _spike_is_launcher_name "$(_spike_base "$resolved")"; then
+  if _spike_is_launcher_name "$(_spike_base "$res")"; then
     _spike_stop_script "refusing: $cmd is a launcher name"
   fi
-  _spike_exec "$secs" "$out" "$cmd" "$@"
+  _spike_exec "$secs" "$out" "$res" "$@"
 }
