@@ -3,14 +3,20 @@
 #   /bin/bash spike/tests/test_handoff.sh
 # Exit 0 = all checks passed. Uses only temp dirs; never touches the network.
 set -u
+unset CDPATH
 
-HERE=$(cd "$(dirname "$0")" && pwd)
-PARSE="$HERE/../handoff/parse.sh"
-FIX="$HERE/../fixtures/handoff"
+# Every path handed to the parser is physically resolved (macOS /tmp and /var are symlinks). The parser refuses a
+# symlinked parent directory, so a logical path with a symlink in it would be refused for the wrong reason.
+HERE=$(cd "$(dirname "$0")" && pwd -P)
+SPIKE=$(cd "$HERE/.." && pwd -P)
+PARSE="$SPIKE/handoff/parse.sh"
+FIX="$SPIKE/fixtures/handoff"
 SH=/bin/bash
+REAL_PERL=$(command -v perl)
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/handoff-test.XXXXXX") || exit 2
 trap 'rm -rf "$TMP"' EXIT
+TMP=$(cd "$TMP" && pwd -P) || exit 2
 
 PASS=0
 FAIL=0
@@ -413,6 +419,24 @@ reject_char "U+FFFB-IAT" $'\xEF\xBF\xBB'
 reject_char "U+E0001-TAG-LANGUAGE" $'\xF3\xA0\x80\x81'
 reject_char "U+E0020-TAG-SPACE" $'\xF3\xA0\x80\xA0'
 reject_char "U+E007F-TAG-CANCEL" $'\xF3\xA0\x81\xBF'
+# round 4 additions: variation selectors, the whole U+E0000-E0FFF block, and the other invisible fillers
+reject_char "U+FE00-VS1 (FE00-FE0F range)" $'\xEF\xB8\x80'
+reject_char "U+FE0F-VS16 (FE00-FE0F range)" $'\xEF\xB8\x8F'
+reject_char "U+E0100-VS17 (E0000-E0FFF block)" $'\xF3\xA0\x84\x80'
+reject_char "U+E0FFF-block-end (E0000-E0FFF block)" $'\xF3\xA0\xBF\xBF'
+reject_char "U+180B-MVS-range" $'\xE1\xA0\x8B'
+reject_char "U+180F-MVS-range" $'\xE1\xA0\x8F'
+reject_char "U+3164-HANGUL-FILLER" $'\xE3\x85\xA4'
+reject_char "U+2800-BRAILLE-BLANK" $'\xE2\xA0\x80'
+reject_char "U+FFA0-HALFWIDTH-HANGUL-FILLER" $'\xEF\xBE\xA0'
+reject_char "U+115F-HANGUL-CHOSEONG-FILLER" $'\xE1\x85\x9F'
+reject_char "U+1160-HANGUL-JUNGSEONG-FILLER" $'\xE1\x85\xA0'
+reject_char "U+17B4-KHMER-VOWEL-INHERENT-AQ" $'\xE1\x9E\xB4'
+reject_char "U+17B5-KHMER-VOWEL-INHERENT-AA" $'\xE1\x9E\xB5'
+# near misses just outside the new ranges, and an emoji, stay accepted
+expect_ok "U+FE10 (outside FE00-FE0F) is accepted" "$(mkd nearfe10 $'a\xEF\xB8\x90b')"
+expect_ok "U+E1000 (outside the E0000-E0FFF block) is accepted" "$(mkd nearE1000 $'a\xF3\xA1\x80\x80b')"
+expect_ok "U+1F600 emoji is accepted" "$(mkd emoji $'a\xF0\x9F\x98\x80b')"
 { printf '\xEF\xBB\xBF'; cat "$FIX/good.md"; } >"$TMP/bom.md"
 expect_fail "BOM at start of file" "$TMP/bom.md" "control character"
 # ordinary non-ASCII text stays allowed, and the JSON output is ASCII-only (jq -a)
@@ -420,8 +444,12 @@ expect_ok "plain non-ASCII text (e-acute, em dash, CJK) is accepted" "$(mkd uni 
 eq "non-ASCII text round-trips" "$(jq -r .summary "$TMP/out")" $'caf\xC3\xA9 \xE2\x80\x94 \xE6\x97\xA5\xE6\x9C\xAC'
 check "output is ASCII only" test "$(LC_ALL=C tr -d '\000-\177' <"$TMP/out" | wc -c | tr -d ' ')" = "0"
 
-# the input path is opened exactly once (source-level guard)
-check "parser opens the input path exactly once" test "$(grep -v '^[[:space:]]*#' "$PARSE" | grep -c '<"\$file"')" = "1"
+# the input path is opened exactly once (source-level guards). Round 4 replaced the old "<"$file" appears once" check:
+# the open is now a perl sysopen, so the path is named by exactly one code line, that line is not a redirect, and the
+# open has O_NOFOLLOW. The behavior of the open (symlink, hard link, FIFO) is tested in the round 4 block below.
+check "input path is named in exactly one code line" test "$(grep -v '^[[:space:]]*#' "$PARSE" | grep -c '"\$file"')" = "1"
+check "the input path is not a shell redirect" test "$(grep -v '^[[:space:]]*#' "$PARSE" | grep -c '<"\$file"')" = "0"
+check "the open is sysopen with O_NOFOLLOW and O_NONBLOCK" grep -q 'sysopen(\$in, \$src, O_RDONLY | O_NOFOLLOW | O_NONBLOCK' "$PARSE"
 check "no other command receives the input path as an argument" test -z "$(grep -v '^[[:space:]]*#' "$PARSE" | grep -E '(wc|tr|grep|awk|head|cat|sed)[^|<]*"\$file"[^|]*$' | grep -v '<"\$file"')"
 
 # ---- round 3: symlinks, exit codes, UTF-8, blank lines, limits, temp-dir hygiene -------------------------------------
@@ -529,6 +557,161 @@ expect_fail "files: .. component reports the rule" "$(mkd pd3 "$D_SUM" '- a/../b
 eq "no arguments is a usage error" "$?" "2"
 "$SH" "$PARSE" a b >/dev/null 2>&1
 eq "two arguments is a usage error" "$?" "2"
+
+# ---- round 4: one no-follow open, parent directories, hard links, FIFOs, strict UTF-8, signals, exit codes -------------
+r4="$TMP/r4"
+mkdir -p "$r4/sandbox" "$r4/outside"
+
+# the opener refuses a symlink as the last component at open time (ELOOP), and the message says that is where
+ln -s "$FIX/good.md" "$r4/sandbox/final-link.md"
+run_tmp "$r4/sandbox/final-link.md"
+eq "symlink as the last component is refused (rc)" "$RC" "1"
+check "symlink refused at open: the message comes from the open" test "${ERR#*the input is a symbolic link}" != "$ERR"
+eq "symlink refused at open: nothing copied to TMPDIR" "$(count_tmp)" "0"
+eq "symlink refused at open: stdout empty" "$(cat "$TMP/out")" ""
+ln -s "$TMP/nowhere-at-all" "$r4/sandbox/dangling.md"
+run_tmp "$r4/sandbox/dangling.md"
+eq "dangling symlink is refused at open (rc)" "$RC" "1"
+check "dangling symlink: symlink not allowed" test "${ERR#*symlink not allowed}" != "$ERR"
+
+# symlinked parent directories are refused before the open, absolute and relative
+ln -s "$FIX" "$TMP/dirlink"
+run_tmp "$TMP/dirlink/good.md"
+eq "symlinked parent directory is refused (rc)" "$RC" "1"
+check "symlinked parent directory: symlink not allowed" test "${ERR#*symlink not allowed}" != "$ERR"
+check "symlinked parent directory: the message names the parent directory" test "${ERR#*a parent directory}" != "$ERR"
+eq "symlinked parent directory: nothing copied to TMPDIR" "$(count_tmp)" "0"
+eq "symlinked parent directory: stdout empty" "$(cat "$TMP/out")" ""
+(cd "$TMP" && TMPDIR="$tdir" "$SH" "$PARSE" "dirlink/good.md" >"$TMP/out" 2>"$TMP/err" </dev/null)
+eq "relative path through a symlinked parent is refused (rc)" "$?" "1"
+eq "relative path through a symlinked parent: nothing copied" "$(count_tmp)" "0"
+
+# a '..' component is refused: bash resolves it lexically, so it could hide a symlinked directory
+cp "$FIX/good.md" "$r4/sandbox/good.md"
+run_tmp "$r4/sandbox/../sandbox/good.md"
+eq "a '..' component in the input path is refused (rc)" "$RC" "1"
+check "a '..' component: the message names the rule" grep -q "must not contain a '..' component" "$TMP/err"
+eq "a '..' component: nothing copied" "$(count_tmp)" "0"
+
+# hard links: the link count must be exactly one, wherever the other name lives
+printf 'CANARY-HARDLINK-SECRET\n' >"$r4/outside/secret.txt"
+ln "$r4/outside/secret.txt" "$r4/sandbox/hard.md"
+run_tmp "$r4/sandbox/hard.md"
+eq "hard-linked file outside the sandbox root is refused (rc)" "$RC" "1"
+check "hard-linked file: message says hard link not allowed" test "${ERR#*hard link not allowed}" != "$ERR"
+eq "hard-linked file: nothing copied to TMPDIR" "$(count_tmp)" "0"
+eq "hard-linked file: nothing on stdout" "$(cat "$TMP/out")" ""
+if grep -q CANARY-HARDLINK "$TMP/out" "$TMP/err"; then fail "hard-linked file: canary text leaked into output"; else pass; fi
+cp "$FIX/good.md" "$r4/sandbox/one.md"
+ln "$r4/sandbox/one.md" "$r4/sandbox/two.md"
+run_tmp "$r4/sandbox/two.md"
+eq "a hard link whose other name is also inside the sandbox is refused (rc)" "$RC" "1"
+
+# special files: a directory and /dev/null are not regular files
+mkdir "$r4/sandbox/adir.md"
+run_tmp "$r4/sandbox/adir.md"
+eq "a directory is refused (rc)" "$RC" "1"
+check "a directory: not a regular file" test "${ERR#*not a regular file}" != "$ERR"
+run_tmp /dev/null
+eq "/dev/null is refused (rc)" "$RC" "1"
+check "/dev/null: not a regular file" test "${ERR#*not a regular file}" != "$ERR"
+
+# a FIFO is refused without blocking: perl's open is O_NONBLOCK, and a 10 s alarm would give rc 142 if it hung
+mkfifo "$r4/sandbox/pipe.md"
+TMPDIR="$tdir" "$REAL_PERL" -e 'alarm 10; exec { $ARGV[0] } @ARGV or exit 127' -- "$SH" "$PARSE" "$r4/sandbox/pipe.md" >"$TMP/out" 2>"$TMP/err" </dev/null
+RC=$?
+ERR=$(cat "$TMP/err")
+eq "FIFO input is refused without blocking (rc 1, not the alarm's 142)" "$RC" "1"
+check "FIFO: not a regular file" test "${ERR#*not a regular file}" != "$ERR"
+eq "FIFO: nothing copied to TMPDIR" "$(count_tmp)" "0"
+eq "FIFO: stdout empty" "$(cat "$TMP/out")" ""
+
+# strict UTF-8: the bytes iconv used to accept, and the ones that are not Unicode at all
+expect_fail "strict UTF-8: f5 80 80 80 (lead byte F5)" "$(mkd u_f5 $'x \xf5\x80\x80\x80')" "invalid UTF-8"
+expect_fail "strict UTF-8: f4 90 80 80 (above U+10FFFF)" "$(mkd u_f4 $'x \xf4\x90\x80\x80')" "invalid UTF-8"
+expect_fail "strict UTF-8: 5-byte form f8 88 80 80 80" "$(mkd u_f8 $'x \xf8\x88\x80\x80\x80')" "invalid UTF-8"
+expect_fail "strict UTF-8: overlong c0 af" "$(mkd u_c0 $'x \xc0\xaf')" "invalid UTF-8"
+expect_fail "strict UTF-8: surrogate ed a0 80" "$(mkd u_ed $'x \xed\xa0\x80')" "invalid UTF-8"
+expect_fail "strict UTF-8: overlong 4-byte f0 80 80 80" "$(mkd u_f0 $'x \xf0\x80\x80\x80')" "invalid UTF-8"
+expect_ok "strict UTF-8: U+10FFFD (f4 8f bf bd, private use, the top of the range) is valid" "$(mkd u_max $'x \xf4\x8f\xbf\xbd')"
+expect_fail "strict UTF-8: noncharacter U+10FFFF (f4 8f bf bf) is refused by the strict decoder" "$(mkd u_nc $'x \xf4\x8f\xbf\xbf')" "invalid UTF-8"
+expect_fail "strict UTF-8: noncharacter U+FDD0 (ef b7 90) is refused by the strict decoder" "$(mkd u_nc2 $'x \xef\xb7\x90')" "invalid UTF-8"
+expect_ok "strict UTF-8: U+1F600 emoji (f0 9f 98 80) is valid" "$(mkd u_emoji $'x \xf0\x9f\x98\x80')"
+check "iconv is no longer used by the parser" test "$(grep -v '^[[:space:]]*#' "$PARSE" | grep -c iconv)" = "0"
+
+# missing tools are exit 2, for jq and for perl alike
+onlyjq="$TMP/only-jq"
+mkdir -p "$onlyjq"
+ln -s "$(command -v jq)" "$onlyjq/jq"
+PATH="$onlyjq" "$SH" "$PARSE" "$FIX/good.md" >"$TMP/out" 2>"$TMP/err" </dev/null
+RC=$?
+eq "perl missing is a missing-tool error (exit 2)" "$RC" "2"
+check "perl missing names perl" grep -q 'perl is required' "$TMP/err"
+onlyperl="$TMP/only-perl"
+mkdir -p "$onlyperl"
+ln -s "$REAL_PERL" "$onlyperl/perl"
+PATH="$onlyperl" "$SH" "$PARSE" "$FIX/good.md" >"$TMP/out" 2>"$TMP/err" </dev/null
+RC=$?
+eq "jq missing is a missing-tool error (exit 2)" "$RC" "2"
+check "jq missing names jq" grep -q 'jq is required' "$TMP/err"
+
+# internal errors are exit 3, with no stdout and no temp dir left, for failures of each tool the parser runs
+mkfake() { # <dir> <name> <lines...>: writes an executable fake tool
+  local d=$1 name=$2
+  shift 2
+  mkdir -p "$d"
+  printf '%s\n' "$@" >"$d/$name"
+  chmod +x "$d/$name"
+}
+expect_internal() { # <desc> <dir holding the fake tool first on PATH>
+  PATH="$2:$PATH" TMPDIR="$tdir" "$SH" "$PARSE" "$FIX/good.md" >"$TMP/out" 2>"$TMP/err" </dev/null
+  local rc=$?
+  if [ "$rc" -ne 3 ]; then fail "$1: expected exit 3, got $rc ($(cat "$TMP/err"))"
+  elif [ -n "$(cat "$TMP/out")" ]; then fail "$1: stdout must be empty"
+  elif ! grep -q '^handoff: internal error' "$TMP/err"; then fail "$1: no internal error message"
+  elif [ "$(count_tmp)" -ne 0 ]; then fail "$1: temp dir left behind"
+  else pass; fi
+}
+mkfake "$TMP/fake-jq" jq '#!/bin/sh' 'exit 1'
+expect_internal "a failing jq (building the JSON) is exit 3" "$TMP/fake-jq"
+mkfake "$TMP/fake-awk" awk '#!/bin/sh' 'exit 2'
+expect_internal "a failing awk (line length check) is exit 3" "$TMP/fake-awk"
+mkfake "$TMP/fake-perl-open" perl '#!/bin/sh' 'exit 255'
+expect_internal "a failing perl open and copy is exit 3" "$TMP/fake-perl-open"
+mkfake "$TMP/fake-perl-check" perl '#!/bin/sh' 'case "$2" in *Encode*) exit 255 ;; esac' "exec \"$REAL_PERL\" \"\$@\""
+expect_internal "a failing perl character check is exit 3" "$TMP/fake-perl-check"
+
+# signals: INT, HUP and TERM remove the temp dir and print nothing. The fake perl (first perl call, the copy step)
+# writes a marker and sleeps, so the signal arrives mid-run. The parser runs with default signal dispositions: a
+# background job in a non-interactive shell would otherwise inherit SIG_IGN for INT, which bash cannot trap.
+slowdir="$TMP/slow"
+mkdir -p "$slowdir"
+signal_run() { # <INT|HUP|TERM> <expected exit code>
+  local sig=$1 want=$2 marker waited=0 pid rc
+  marker="$slowdir/started-$sig"
+  rm -f "$marker"
+  mkfake "$slowdir" perl '#!/bin/sh' ": >\"$marker\"" 'sleep 2' "exec \"$REAL_PERL\" \"\$@\""
+  (
+    export TMPDIR="$tdir" PATH="$slowdir:$PATH"
+    exec "$REAL_PERL" -e '$SIG{INT} = $SIG{HUP} = $SIG{TERM} = "DEFAULT"; exec { $ARGV[0] } @ARGV or exit 127' -- "$SH" "$PARSE" "$FIX/good.md"
+  ) >"$TMP/sig.out" 2>"$TMP/sig.err" </dev/null &
+  pid=$!
+  while [ ! -e "$marker" ] && [ "$waited" -lt 100 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  kill -"$sig" "$pid" 2>/dev/null
+  wait "$pid"
+  rc=$?
+  if [ ! -e "$marker" ]; then fail "$sig: the parser never reached the copy step"
+  elif [ "$rc" -ne "$want" ]; then fail "$sig: expected exit $want, got $rc"
+  elif [ -n "$(cat "$TMP/sig.out")" ]; then fail "$sig: stdout must be empty"
+  elif [ "$(count_tmp)" -ne 0 ]; then fail "$sig: temp dir left behind"
+  else pass; fi
+}
+signal_run INT 130
+signal_run HUP 129
+signal_run TERM 143
 
 printf 'test_handoff: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

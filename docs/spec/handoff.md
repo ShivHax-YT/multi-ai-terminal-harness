@@ -18,13 +18,25 @@ data**. It is never instructions for the lead, never shell input and never a pat
 
 - never `eval`s, `source`s, expands or executes any part of the file (no `$(...)`, backtick or variable expansion);
 - puts text into JSON only through `jq --arg` / `--argjson`, never by shell interpolation into a command;
-- never follows a symlink: if the input path is a symbolic link the parser refuses it before reading a byte (a worker
-  controls its worktree and could otherwise point `HANDOFF.md` at a credential file, hard rule 4). The **caller** must
-  pass a canonical path inside the worker's worktree; symlinked parent directories are the caller's responsibility;
-- opens the file exactly once (a bounded read of at most 16385 bytes into a private copy) and runs every check on that
-  copy, so the file cannot change between checks and parsing; external commands only read it through stdin, so a file
+- never follows a symlink and never reads anything that is not a regular file. The input is opened once, by perl's
+  `sysopen` with `O_NOFOLLOW` (a symlink as the last component fails at the open with ELOOP) and `O_NONBLOCK` (a FIFO
+  cannot block the open). Before the open, a symlink in any parent directory is refused: the parser compares `pwd -L`
+  with `pwd -P` for the input's directory. A refused input is refused at open; nothing is copied. A worker controls its
+  worktree and could otherwise point `HANDOFF.md` at a credential file (hard rule 4). The **caller** must pass a
+  canonical absolute path inside the worker's worktree (a `..` component is refused for this reason). A relative
+  input is checked through the shell's logical working directory, so a parser run from a symlinked directory refuses
+  relative paths: pass an absolute path there;
+- reads the same handle it checked: the open file must be a regular file with exactly one link (a hard link is refused,
+  wherever its other name lives) and at most 16384 bytes. At most 16385 bytes are copied from that handle into a private
+  copy, and every later check runs on the copy, so the bytes checked are the bytes of the inode that was opened. The
+  input path reaches perl once, after `--`; no other command receives it, and the copy is read through stdin, so a file
   name can never act as an option or an `awk` assignment;
-- emits ASCII-only JSON (`jq -a`), so non-ASCII text is always `\uXXXX`-escaped in the output;
+- **remaining race:** between the parent-directory check and the open, a process that can write to the worktree could
+  swap a parent directory for a symlink. bash and perl offer no way to close that window, so the **caller must parse
+  only after the worker's whole process tree has exited** (no concurrent writer). The leaf file has no such window: it
+  is opened with `O_NOFOLLOW` and checked on that same handle;
+- validates the copy as strict UTF-8 and checks it for blocked characters, both in perl (see Global limits), and emits
+  ASCII-only JSON (`jq -a`), so non-ASCII text is always `\uXXXX`-escaped in the output;
 - rejects the file on any structural problem instead of guessing (fail closed);
 - does not echo file content in error messages (only section names, line numbers and limits).
 
@@ -62,15 +74,18 @@ Plain UTF-8 text, LF line endings. The sections appear **exactly once each, in e
 |---|---|---|
 | Whole file | 16384 bytes (16 KB) | `oversize` |
 | Any line | 2000 bytes | `line too long` |
-| Control and invisible characters | only tab and LF are allowed. Rejected: NUL, CR, ESC and other C0 controls, DEL; C1 controls U+0080-U+009F (U+009B is a terminal CSI); U+00AD soft hyphen, U+034F, U+061C, U+180E; U+200B-U+200F zero-width and direction marks; U+2028-U+202E line/paragraph separators and bidi overrides; U+2060-U+206F (word joiner, invisible operators, bidi isolates, deprecated format characters); U+FEFF (BOM, never allowed anywhere); U+FFF9-U+FFFB interlinear annotation; U+E0000-U+E007F tag characters | `control character` |
-| Encoding | valid UTF-8 | `invalid UTF-8` |
-| Input path | a regular file, not a symlink | `symlink not allowed` |
+| Control and invisible characters | only tab and LF are allowed. Rejected: NUL, CR, ESC and other C0 controls, DEL; C1 controls U+0080-U+009F (U+009B is a terminal CSI); U+00AD soft hyphen; U+034F combining grapheme joiner; U+061C Arabic letter mark; U+115F and U+1160 Hangul fillers; U+17B4 and U+17B5 Khmer vowel inherent marks; U+180B-U+180F Mongolian variation selectors and vowel separator (U+180E included); U+200B-U+200F zero-width and direction marks; U+2028-U+202E line/paragraph separators and bidi overrides; U+2060-U+206F (word joiner, invisible operators, bidi isolates, deprecated format characters); U+2800 braille blank; U+3164 Hangul filler; U+FE00-U+FE0F variation selectors (emoji presentation is not needed in handoffs, so these are refused); U+FEFF (BOM, never allowed anywhere); U+FFA0 halfwidth Hangul filler; U+FFF9-U+FFFB interlinear annotation; U+E0000-U+E0FFF, the whole block of tag characters and the variation selector supplement | `control character` |
+| Encoding | valid UTF-8, checked by perl's strict decoder (`Encode`, `UTF-8`). Refused: overlong forms, surrogates, code points above U+10FFFF, bytes F5-FF, 5-byte forms, and noncharacters (U+FDD0-U+FDEF, U+xFFFE, U+xFFFF). RFC 3629 allows the noncharacters, so this is stricter than the RFC; handoffs never need them | `invalid UTF-8` |
+| Input path | no `..` component; no symlink in any parent directory (refused at open; nothing is copied); the last component is not a symlink (refused at open by `O_NOFOLLOW`; nothing is copied); a regular file (not a FIFO, directory or device) with exactly one link, at most 16384 bytes | `symlink not allowed`, `'..' component`, `not a regular file`, `hard link not allowed`, `oversize` |
 
 Byte limits are bytes, not characters (the parser runs with `LC_ALL=C`). An empty file is an error.
 
-**Run the parser under a timeout.** The parser checks that the input is a regular file and then opens it, so a path
-swapped for a FIFO between the two steps would block the open. The caller (scheduler/lead) must run `parse.sh` with a
-wall-clock timeout (for example 10 s) and treat a timeout as a failed handoff.
+**Run the parser under a timeout, and only after the worker has exited.** The open is non-blocking, so a FIFO is
+refused at once, but the caller (scheduler/lead) should still run `parse.sh` with a wall-clock timeout (for example
+10 s) and treat a timeout as a failed handoff. The caller must also parse only after the worker's whole process tree
+has exited (no concurrent writer). That is the only defence against a parent directory swapped for a symlink between
+the directory check and the open (see the trust model). A signal (INT, HUP or TERM) stops the parser, removes its temp
+dir and prints nothing.
 
 ## Sections
 
@@ -132,16 +147,20 @@ JSON: `confidence` = `{level, why}`; `level` is always lowercase.
 ```
 
 Exit codes: `0` valid, `1` invalid handoff (message on stderr, nothing on stdout), `2` usage error or missing
-dependency (`jq`, `iconv`), `3` internal error (temp dir cannot be created, copy or tool failure; message starts with
-`handoff: internal error:`; the file was not judged, so do not treat it as an invalid handoff). A first argument
-starting with `-` is a usage error unless it follows `--` (or the path is written `./-name`).
+dependency (`jq`, `perl`), `3` internal error (temp dir cannot be created, copy, perl, jq or awk failure; message starts
+with `handoff: internal error:`; the file was not judged, so do not treat it as an invalid handoff). A signal exits
+`130` (INT), `129` (HUP) or `143` (TERM) after removing the temp dir, and prints nothing. A first argument starting
+with `-` is a usage error unless it follows `--` (or the path is written `./-name`).
 
 Error messages start with `handoff: ` and name the problem:
 
 | Problem | Message contains |
 |---|---|
 | File missing / unreadable | `cannot read` |
-| Input is a symlink | `symlink not allowed` |
+| Input is a symlink (last component, or any parent directory) | `symlink not allowed` |
+| Input is a hard link (link count above one) | `hard link not allowed` |
+| Input is a FIFO, directory or device | `not a regular file` |
+| `..` component in the input path | `'..' component` |
 | Invalid UTF-8 | `invalid UTF-8` |
 | File over 16 KB | `oversize` |
 | Missing section | `missing section` and the section name |
