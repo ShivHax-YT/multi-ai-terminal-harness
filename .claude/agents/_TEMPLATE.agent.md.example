@@ -1,0 +1,13 @@
+---
+name: my-new-agent
+description: When Claude should delegate to this agent (put the key use case first).
+tools: Read, Grep, Glob
+model: haiku            # opus | sonnet | haiku | inherit | full model ID
+effort: medium          # low | medium | high | xhigh | max (levels depend on the model)
+# isolation: worktree   # own git worktree; branches from the checked-out branch (worktree.baseRef: head)
+# disallowedTools: Edit, Write, NotebookEdit   # required for read-only roles and every haiku role that is not docs
+maxTurns: 20
+color: green
+---
+Instructions for the agent. Always: read docs/HARD_RULES.md first for any code task; never touch provider credential
+stores; finish with HANDOFF.md for code tasks.

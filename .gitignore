@@ -1,0 +1,17 @@
+# Claude Code
+.claude/worktrees/
+.claude/settings.local.json
+.claude/subagents.jsonl
+.claude/rate-limits.jsonl
+CLAUDE.local.md
+# Secrets (never commit keys; the app stores keys in Keychain)
+.env
+.env.*
+# Build output
+target/
+node_modules/
+dist/
+.build/
+DerivedData/
+*.xcuserstate
+.DS_Store
