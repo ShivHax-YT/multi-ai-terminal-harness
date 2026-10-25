@@ -1,682 +1,385 @@
 #!/usr/bin/env bash
-# parse.sh --root <dir> [--] <HANDOFF.md>  ->  JSON on stdout (format: docs/spec/handoff.md)
+# parse.sh --root <worktree>  ->  JSON on stdout (format: docs/spec/handoff.md). Reads exactly <root>/HANDOFF.md.
 #
 #   {task_id, summary, files_changed:[{path,note}], tests_run, hard_rules:[..], risks, confidence:{level,why}}
 #
-# Exit codes: 0 valid; 1 invalid handoff or refused input (message on stderr, nothing on stdout); 2 usage error:
-#             --root missing, empty, relative, not a directory, or with a '.' or '..' component; a missing jq or perl;
-#             3 internal error (temp dir, perl, wc, tr, awk, jq or cat failure, HOME not absolute; the input was not
-#             judged).
-#             A signal: INT exits 130, HUP 129, QUIT 131, TERM 143; the private temp dir is removed and nothing is
-#             printed. A signal during the final write (see "Output") can still cut the JSON short.
+# Exit codes: 0 valid; 1 invalid handoff or refused input (message on stderr, nothing on stdout);
+#             2 usage error (arguments, or --root empty, relative, too long, with a '.' or '..' component, not a
+#               directory; /usr/bin/perl missing);
+#             3 internal error (the input was not judged: do not treat it as an invalid handoff).
 #
-# SECURITY: the input file is written by a worker AI and is untrusted data. This script never eval's, sources or
-# expands file content. Content only ever sits inside quoted "$variables" and reaches jq through --arg or stdin.
-# Error messages never echo file content (only section names, line numbers and limits).
+# STRUCTURE (round 7): this script only checks its arguments and then execs ONE perl process (/usr/bin/perl) with a
+# scrubbed environment. That process does everything: it walks the root from "/", opens <root>/HANDOFF.md once, reads it
+# into memory, checks it, and prints the JSON once at the end. No temp file, no second process, no here-string, nothing
+# reopened by path. jq and awk are not used (the old design copied the file and re-read the copy).
 #
-# The root and the input path are resolved by ONE perl process (PERL_WALK), the only process that receives them:
-#   - the root is not resolved by this script (no pwd -P). perl walks it from "/": every component is lstat'ed and
-#     refused if it is a symlink or not a directory, entered, and its (dev, ino) compared with the lstat. A symlink
-#     anywhere in the root path is therefore refused: the root must be a physical absolute path;
-#   - the input must be inside the root: a relative path is relative to the root, an absolute one must start with the
-#     root followed by "/". Components ".", ".." and empty ones are refused;
-#   - each parent directory below the root is walked the same way, and after every step the physical working
-#     directory (Cwd::getcwd) must be the directory the walk expects, outside every provider CLI home;
-#   - every directory on the walk and the input must be on the device of the root's final directory;
-#   - a root or input that is, or is under, a provider CLI home (under HOME, as typed and as resolved) is refused
-#     before any open;
-#   - the leaf is lstat'ed (regular file, not a symlink, exactly one link), opened with O_NOFOLLOW, O_NONBLOCK and
-#     O_NOCTTY relative to the directory the process stands in, checked again on the open handle, and copied (at most
-#     MAX_BYTES+1 bytes). The process holds its working directory, so renaming a parent name cannot redirect the open.
-# Every perl call runs with PERL5OPT, PERL5LIB, PERLLIB, PERL5DB and PERL_UNICODE removed from its environment.
-# Everything after the copy reads only the private copy.
+# SECURITY: the input file is written by a worker AI and is untrusted data. Content never reaches a shell, never
+# becomes perl code, and is never expanded or evaluated. The perl program is a single-quoted constant. Messages never
+# echo file content.
+#
+# THREAT MODEL (honest, see docs/spec/handoff.md): the guarantees hold for filesystem state that does not change while
+# the parse runs. A concurrent process running as the same user can race (or ptrace) the parser; that is out of scope
+# here, and the caller must make sure the worker's process group has exited and been reaped before it parses.
+#
 # Targets bash 3.2 (macOS /bin/bash): no associative arrays, no mapfile.
 
 set -f
-set -o pipefail
-export LC_ALL=C
 unset CDPATH
+shopt -s execfail
 
-MAX_BYTES=16384
-MAX_LINE=2000
-MAX_FILES=100
-MAX_RULES=20
-
-SECTIONS=("Summary" "Files changed" "Tests run" "Hard rules touched" "Open risks / questions" "Confidence")
-
-die() {
-  printf 'handoff: %s\n' "$*" >&2
-  exit 1
-}
-
-# Internal errors (the parser itself could not do its job) are exit 3, never confused with an invalid handoff.
-internal() {
-  printf 'handoff: internal error: %s\n' "$*" >&2
-  exit 3
-}
+ENV_BIN=/usr/bin/env
+PERL_BIN=/usr/bin/perl
 
 usage() {
-  printf 'usage: parse.sh --root <dir> [--] <HANDOFF.md>  (the root is an absolute physical path; the file must be inside it; use "--" before a name that starts with "-")\n' >&2
+  printf 'usage: parse.sh --root <dir>   (reads <dir>/HANDOFF.md only; <dir> is an absolute physical path)\n' >&2
   exit 2
 }
 
-# Root problems are usage errors (exit 2): the root is not checked by resolution here, the walk refuses symlinks.
-root_error() {
-  printf 'handoff: %s\n' "$*" >&2
-  exit 2
-}
+# Arguments: exactly "--root <dir>". Anything else (a second positional argument, a second --root, an unknown option,
+# a missing value) is a usage error.
+if [ $# -eq 0 ]; then
+  printf 'handoff: --root <dir> is required\n' >&2
+  usage
+fi
+if [ $# -ne 2 ] || [ "$1" != "--root" ]; then
+  usage
+fi
+ROOT_ARG=$2
 
-# The cleanup trap is installed before anything creates a temp dir. WORK stays empty until mktemp succeeds, so the rm
-# is guarded. Each signal exits through the EXIT trap, so the temp dir is removed on INT, HUP, QUIT and TERM too.
-WORK=''
-cleanup() {
-  if [ -n "$WORK" ]; then
-    rm -rf -- "$WORK"
-  fi
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 129' HUP
-trap 'exit 143' TERM
-trap 'exit 131' QUIT
-
-# Arguments: parse.sh --root <dir> [--] <file>. A first argument that looks like an option is a usage error unless it
-# follows "--". --root is required.
-ROOT_ARG=''
-HAVE_ROOT=0
-while [ $# -gt 0 ]; do
-  case $1 in
-    --root)
-      if [ "$HAVE_ROOT" -ne 0 ] || [ $# -lt 2 ]; then usage; fi
-      ROOT_ARG=$2
-      HAVE_ROOT=1
-      shift 2
-      ;;
-    --) shift; break ;;
-    -?*) usage ;;
-    *) break ;;
-  esac
-done
-if [ "$HAVE_ROOT" -eq 0 ]; then
-  printf 'handoff: --root <dir> is required (the input must be inside that directory)\n' >&2
+if [ ! -x "$PERL_BIN" ]; then
+  printf 'handoff: perl is required but %s was not found\n' "$PERL_BIN" >&2
   exit 2
 fi
-if [ $# -ne 1 ]; then usage; fi
-for tool in jq perl; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
-    printf 'handoff: %s is required but was not found\n' "$tool" >&2
-    exit 2
-  fi
-done
 
-# Root checks: not empty or blank, absolute, no '.' or '..' component, and a directory. The root is not resolved here:
-# a trailing slash or doubled slashes are harmless (perl drops empty components), a symlink anywhere in it is refused.
-root_blank=${ROOT_ARG//[[:space:]]/}
-if [ -z "$root_blank" ]; then
-  root_error "--root must not be empty"
-fi
-case $ROOT_ARG in
-  /*) ;;
-  *) root_error "--root must be an absolute path to a physical directory (no symbolic link in it)" ;;
-esac
-case "$ROOT_ARG/" in
-  */./* | */../*) root_error "--root must not contain a '.' or '..' component" ;;
-esac
-if [ ! -d "$ROOT_ARG" ]; then
-  root_error "--root is not a directory"
-fi
-
-# The provider CLI homes are refused under HOME. HOME must be absolute, or the check cannot be made.
-case ${HOME:-} in
-  /*) ;;
-  *) internal "HOME must be an absolute path (the provider CLI home check needs it)" ;;
-esac
-
-file=$1
-
-# ---- the one open: root walk, path rules, the input walk and the copy (one perl process) -------------------------------
-# Strings are checked before the filesystem is touched. The copy file is created before the process walks, so a
-# relative TMPDIR still resolves. Every refusal exits 1 before any read of the input. Program text is a single-quoted
-# constant: no single quote inside it (double quotes only), and the input reaches perl only as @ARGV.
-PERL_WALK='
+# The one perl program. No single quote inside (double quotes, q~~ and \x27 only). The root and HOME reach it only as
+# @ARGV data. HOME is data for the CLI home identity check and is never used as a path to read.
+PERL_PROG='
+BEGIN {
+  $SIG{__DIE__} = sub { print STDERR "handoff: internal error: unexpected failure in the parser\n"; exit 3; };
+  $SIG{__WARN__} = sub { };
+  @INC = grep { !ref($_) && m{\A/} } @INC;
+}
 use strict;
 use warnings;
-use Errno qw(ELOOP);
-use Fcntl qw(:mode O_RDONLY O_WRONLY O_CREAT O_EXCL O_NOFOLLOW O_NONBLOCK O_NOCTTY);
+use Errno qw(ELOOP EINTR);
+use Fcntl qw(:mode O_RDONLY O_NOFOLLOW O_NONBLOCK O_NOCTTY);
 use Cwd ();
-exit 3 unless @ARGV == 5;
-my ($root, $file, $dst, $max, $home) = @ARGV;
-exit 3 unless defined $max && $max =~ /\A[0-9]+\z/;
-exit 3 unless defined $home && $home =~ m{\A/};
-sub refuse {
-  print STDERR "handoff: $_[0]\n";
-  exit 1;
+use Encode qw(decode FB_QUIET);
+use JSON::PP ();
+use POSIX ();
+
+my $MAX_BYTES = 16384;
+my $MAX_LINE = 2000;
+my $MAX_FILES = 100;
+my $MAX_RULES = 20;
+my $NAME = "HANDOFF.md";
+
+sub refuse { print STDERR "handoff: $_[0]\n"; exit 1; }
+sub usage_err { print STDERR "handoff: $_[0]\n"; exit 2; }
+sub internal { print STDERR "handoff: internal error: $_[0]\n"; exit 3; }
+
+internal("wrong number of arguments") unless @ARGV == 2;
+my ($root, $home_arg) = @ARGV;
+
+# ---- the root string: usage errors, before the filesystem is touched ------------------------------------------------
+usage_err("--root must not be empty") if $root =~ /\A[ \t\n\r\f\x0B]*\z/;
+usage_err("--root must be an absolute path to a physical directory (no symbolic link in it)") unless substr($root, 0, 1) eq "/";
+my $path_max = POSIX::PATH_MAX();
+usage_err("--root is longer than PATH_MAX ($path_max bytes): refused, nothing is read") if length($root) >= $path_max;
+my @rc = grep { length } split m{/}, $root, -1;
+for my $c (@rc) {
+  usage_err("--root must not contain a \x27.\x27 or \x27..\x27 component") if $c eq "." || $c eq "..";
 }
-# Provider CLI homes, named without the leading dot (the dot is added here, so no literal credential path appears in
-# this program text). Each one under HOME, as typed and as resolved, is refused.
+
+# ---- provider CLI homes, by identity (hard rule 4) -------------------------------------------------------------------
+# The homes are computed from the account database and from HOME (as data), and each candidate CLI home is stat-ed.
+# Every directory of the walk is then compared by (device, inode), so a case change, a bind mount or a HOME trick does not
+# help. The names are built from parts (the dot is added here), so no literal credential path is in this program.
 my @cli_names = ("claude", "claude.json", "codex", "grok", "kimi-code", "kimi", "gemini");
-my @homes = ($home);
-my $phome = Cwd::abs_path($home);
-push @homes, $phome if defined $phome && $phome ne $home;
-my @deny;
+my @homes;
+my $pw_home = (getpwuid($<))[7];
+push @homes, $pw_home if defined $pw_home && $pw_home =~ m{\A/};
+push @homes, $home_arg if defined $home_arg && $home_arg =~ m{\A/};
+internal("no home directory is known, so the provider CLI home check cannot be made") unless @homes;
+my %deny;
 for my $h (@homes) {
   (my $b = $h) =~ s{/+\z}{};
   for my $n (@cli_names) {
-    push @deny, "$b/.$n";
+    my @s = stat("$b/.$n");
+    $deny{"$s[0]:$s[1]"} = 1 if @s;
   }
 }
-my $cli_msg = "refused: provider CLI directory (the path is, or is under, a provider CLI home; nothing is read)";
-sub in_cli {
-  my ($p) = @_;
-  for my $d (@deny) {
-    return 1 if $p eq $d || index($p, "$d/") == 0;
-  }
-  return 0;
-}
-my $moved = "input path changed while it was being resolved: a directory on the path was replaced or moved (refused; nothing is copied)";
-my $moved_root = "--root changed while it was being resolved (refused; nothing is copied)";
-# at_dir: the physical working directory must be the one the walk expects, and not inside a provider CLI home.
+my $cli_msg = "refused: provider CLI directory (the root is, or is inside, a provider CLI home; nothing is read)";
+my $moved_root = "--root changed while it was being resolved (refused; nothing is read)";
+my $moved = "input path changed while it was being resolved: the working directory is not the root (refused; nothing is read)";
+sub denied { my @s = @_; return (@s >= 2 && $deny{"$s[0]:$s[1]"}) ? 1 : 0; }
+# at_dir: the identity of the working directory must not be a CLI home, and its physical path must be the expected one.
 sub at_dir {
   my ($want, $msg) = @_;
+  my @s = stat(".");
+  internal("cannot stat the working directory") unless @s;
+  refuse($cli_msg) if denied(@s);
   my $here = Cwd::getcwd();
   refuse($msg) unless defined $here && $here eq $want;
-  refuse($cli_msg) if in_cli($here);
   return;
 }
-# The root in string form (empty components dropped), and the string checks made before anything is touched.
-my @rc = grep { length } split m{/}, $root, -1;
-my $nroot = "/" . join("/", @rc);
-my $pref = $nroot eq "/" ? "/" : "$nroot/";
-refuse($cli_msg) if in_cli($nroot);
-my $rel = $file;
-if (substr($file, 0, 1) eq "/") {
-  refuse("outside root: the input is not inside --root (refused before any open; nothing is copied)")
-    unless index($file, $pref) == 0;
-  $rel = substr($file, length($pref));
-}
-refuse("input path must name a file inside --root") if $rel eq "";
-for my $c (split m{/}, $rel, -1) {
-  refuse("input path must not contain a \x27..\x27 component (give a path inside --root)") if $c eq "..";
-  refuse("input path must not contain a \x27.\x27 component") if $c eq ".";
-  refuse("input path must not contain an empty component") if $c eq "";
-}
-my $abs_in = $nroot eq "/" ? "/$rel" : "$nroot/$rel";
-refuse($cli_msg) if in_cli($abs_in);
-# The copy file is created before the walk (a relative TMPDIR still resolves from the start directory).
-my $out;
-exit 3 unless sysopen($out, $dst, O_WRONLY | O_CREAT | O_EXCL, 0600);
-# Root walk: from "/", every component of the root path, the same rules as the parents below it.
-exit 3 unless chdir("/");
+
+# ---- the root walk: from "/", every component ------------------------------------------------------------------------
+internal("cannot enter /") unless chdir("/");
 at_dir("/", $moved_root);
 my $cur = "/";
 for my $c (@rc) {
   my @l = lstat($c);
-  refuse("cannot read --root: a directory of the root path is missing or cannot be read") unless @l;
-  refuse("symlink not allowed: a directory of --root is a symbolic link (refused; nothing is copied)") if S_ISLNK($l[2]);
-  refuse("--root is not a directory") unless S_ISDIR($l[2]);
+  usage_err("--root is not a directory, or a directory of the root path does not exist") unless @l;
+  refuse("symlink not allowed: a directory of --root is a symbolic link (refused; nothing is read)") if S_ISLNK($l[2]);
+  usage_err("--root is not a directory") unless S_ISDIR($l[2]);
   refuse("cannot read --root: a directory of the root path cannot be entered") unless chdir($c);
   my @s = stat(".");
-  exit 3 unless @s;
+  internal("cannot stat the working directory") unless @s;
   refuse($moved_root) unless $s[0] == $l[0] && $s[1] == $l[1];
   $cur = $cur eq "/" ? "/$c" : "$cur/$c";
   at_dir($cur, $moved_root);
 }
-exit 3 unless $cur eq $nroot;
+internal("root walk ended in the wrong place") unless $cur eq "/" . join("/", @rc);
 my @rs = stat(".");
-exit 3 unless @rs;
+internal("cannot stat the root") unless @rs;
 my $root_dev = $rs[0];
-# Input walk: the parents below the root, then the leaf.
-my @comp = split m{/}, $rel, -1;
-my $leaf = pop @comp;
-my $dir = $nroot;
-for my $c (@comp) {
-  my @l = lstat($c);
-  refuse("cannot read input file: a parent directory is missing or cannot be read") unless @l;
-  refuse("symlink not allowed: a parent directory of the input is a symbolic link (refused before open; nothing is copied)")
-    if S_ISLNK($l[2]);
-  refuse("cannot read input file: a parent of the input is not a directory") unless S_ISDIR($l[2]);
-  refuse("crosses a mount: a parent directory of the input is on another device than --root (refused; nothing is copied)")
-    unless $l[0] == $root_dev;
-  refuse("cannot read input file: a parent directory cannot be entered") unless chdir($c);
-  my @s = stat(".");
-  exit 3 unless @s;
-  refuse("input path changed while it was being resolved: a parent directory was replaced (refused; nothing is copied)")
-    unless $s[0] == $l[0] && $s[1] == $l[1];
-  $dir = $dir eq "/" ? "/$c" : "$dir/$c";
-  at_dir($dir, $moved);
-}
-my @ll = lstat($leaf);
-refuse("cannot read input file") unless @ll;
-refuse("symlink not allowed: the input is a symbolic link (refused before open; nothing is copied)") if S_ISLNK($ll[2]);
-refuse("not a regular file: the input must be a regular file (refused before open; nothing is copied)") unless S_ISREG($ll[2]);
-refuse("hard link not allowed: the input must have exactly one link (refused before open; nothing is copied)") unless $ll[3] == 1;
-refuse("crosses a mount: the input is on another device than --root (refused; nothing is copied)") unless $ll[0] == $root_dev;
-refuse("oversize: file is larger than $max bytes") if $ll[7] > $max;
-at_dir($dir, $moved);
-my $phys_leaf = $dir eq "/" ? "/$leaf" : "$dir/$leaf";
-refuse($cli_msg) if in_cli($phys_leaf);
+
+# ---- the one leaf: <root>/HANDOFF.md ---------------------------------------------------------------------------------
+my @ll = lstat($NAME);
+refuse("cannot read $NAME: it is missing from --root or cannot be read") unless @ll;
+refuse("symlink not allowed: $NAME is a symbolic link (refused before open; nothing is read)") if S_ISLNK($ll[2]);
+refuse("not a regular file: $NAME must be a regular file (refused before open; nothing is read)") unless S_ISREG($ll[2]);
+refuse("hard link not allowed: $NAME must have exactly one link (refused before open; nothing is read)") unless $ll[3] == 1;
+refuse("crosses a mount: $NAME is on another device than --root (refused; nothing is read)") unless $ll[0] == $root_dev;
+refuse($cli_msg) if denied(@ll);
+refuse("oversize: file is larger than $MAX_BYTES bytes") if $ll[7] > $MAX_BYTES;
+at_dir($cur, $moved);
 my $in;
-unless (sysopen($in, $leaf, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)) {
-  refuse("symlink not allowed: the input is a symbolic link (refused at open; nothing is copied)") if $! == ELOOP;
-  refuse("cannot read input file");
+unless (sysopen($in, $NAME, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)) {
+  refuse("symlink not allowed: $NAME is a symbolic link (refused at open; nothing is read)") if $! == ELOOP;
+  refuse("cannot read $NAME: it cannot be opened");
 }
 my @fs = stat($in);
-exit 3 unless @fs;
-refuse("not a regular file: the opened input is not a regular file (nothing is copied)") unless S_ISREG($fs[2]);
-refuse("hard link not allowed: the opened input has more than one link (nothing is copied)") unless $fs[3] == 1;
-refuse("input changed between the lstat and the open (refused; nothing is copied)") unless $fs[0] == $ll[0] && $fs[1] == $ll[1];
-refuse("oversize: file is larger than $max bytes") if $fs[7] > $max;
-at_dir($dir, $moved);
+internal("cannot stat the open file") unless @fs;
+refuse("not a regular file: the opened $NAME is not a regular file (nothing is read)") unless S_ISREG($fs[2]);
+refuse("hard link not allowed: the opened $NAME has more than one link (nothing is read)") unless $fs[3] == 1;
+refuse("input changed between the lstat and the open (refused; nothing is read)") unless $fs[0] == $ll[0] && $fs[1] == $ll[1];
+refuse("oversize: file is larger than $MAX_BYTES bytes") if $fs[7] > $MAX_BYTES;
+at_dir($cur, $moved);
 binmode($in);
-binmode($out);
-my $left = $max + 1;
+my $bytes = "";
+my $left = $MAX_BYTES + 1;
 while ($left > 0) {
-  my $want = $left < 65536 ? $left : 65536;
   my $buf = "";
-  my $n = sysread($in, $buf, $want);
-  exit 3 unless defined $n;
-  last if $n == 0;
-  my $off = 0;
-  while ($off < $n) {
-    my $w = syswrite($out, $buf, $n - $off, $off);
-    exit 3 unless defined $w;
-    $off += $w;
+  my $n = sysread($in, $buf, $left < 65536 ? $left : 65536);
+  if (!defined $n) {
+    next if $! == EINTR;
+    internal("read failed");
   }
+  last if $n == 0;
+  $bytes .= $buf;
   $left -= $n;
 }
-exit 3 unless close($out);
+# A consistency check on the open handle (not a defence against a concurrent writer; see the spec).
+my @fs2 = stat($in);
+internal("cannot stat the open file") unless @fs2;
+refuse("input changed while it was being read (refused; nothing is printed)")
+  unless $fs2[0] == $fs[0] && $fs2[1] == $fs[1] && $fs2[3] == 1 && $fs2[7] == length($bytes);
 close($in);
-exit 0;
-'
 
-# The temp dir. mktemp runs with INT, HUP, TERM and QUIT ignored (an ignored disposition is inherited by mktemp), so no
-# signal can land between the creation of the directory and the assignment of WORK. A signal in that short window is
-# dropped; the traps are restored right after.
-WORK=''
-trap '' INT HUP TERM QUIT
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/handoff-parse.XXXXXX")
-made=$?
-trap 'exit 130' INT
-trap 'exit 129' HUP
-trap 'exit 143' TERM
-trap 'exit 131' QUIT
-if [ "$made" -ne 0 ]; then
-  WORK=''
-  internal "cannot create temp dir"
-fi
-copy="$WORK/copy"
-env -u PERL5OPT -u PERL5LIB -u PERLLIB -u PERL5DB -u PERL_UNICODE perl -e "$PERL_WALK" -- "$ROOT_ARG" "$file" "$copy" "$MAX_BYTES" "$HOME"
-rc=$?
-case $rc in
-  0) ;;
-  1) exit 1 ;; # perl has already printed the reason
-  *) internal "cannot copy input file" ;;
-esac
+# ---- whole-file checks (all in memory) -------------------------------------------------------------------------------
+refuse("oversize: file is larger than $MAX_BYTES bytes") if length($bytes) > $MAX_BYTES;
+refuse("empty file") if length($bytes) == 0;
+refuse("control character: NUL byte in file") if index($bytes, "\x00") >= 0;
 
-# ---- whole-file checks (on the private copy only) -----------------------------------------------------------------------
-size=$(wc -c <"$copy") || internal "cannot determine file size"
-size=${size//[[:space:]]/}
-case $size in
-  '' | *[!0-9]*) internal "cannot determine file size" ;;
-esac
-if [ "$size" -gt "$MAX_BYTES" ]; then
-  die "oversize: file is larger than $MAX_BYTES bytes"
-fi
-if [ "$size" -eq 0 ]; then
-  die "empty file"
-fi
-nonul=$(tr -d '\000' <"$copy" | wc -c) || internal "NUL byte check failed"
-nonul=${nonul//[[:space:]]/}
-case $nonul in
-  '' | *[!0-9]*) internal "NUL byte check failed" ;;
-esac
-if [ "$nonul" != "$size" ]; then
-  die "control character: NUL byte in file"
-fi
-
-# Strict UTF-8, the noncharacters and the character blocklist (see docs/spec/handoff.md, "Global limits"). Encode's
-# "UTF-8" decoder rejects overlong forms, surrogates, code points above U+10FFFF, bytes F5-FF and 5-byte forms.
-# FB_QUIET stops at the first bad byte and leaves the unread rest in $rest, so a non-empty rest means invalid UTF-8.
-# The noncharacters and the Cf category are refused by explicit regular expressions as well, so the result does not
-# depend on the decoder version. The Cf class is \p{Cf} of the perl that runs this check.
-PERL_CHECK='
-use strict;
-use warnings;
-use Encode qw(decode FB_QUIET);
-binmode(STDIN);
-my $bytes = do { local $/; <STDIN> };
-exit 3 unless defined $bytes;
+# Strict UTF-8 (Encode "UTF-8" rejects overlong forms, surrogates, code points above U+10FFFF, bytes F5-FF and 5-byte
+# forms). FB_QUIET stops at the first bad byte and leaves the unread rest, so a non-empty rest means invalid UTF-8. The
+# noncharacters and the Cf category are refused by explicit expressions as well, so the result does not depend on the
+# decoder version.
 my $rest = $bytes;
 my $text = decode("UTF-8", $rest, FB_QUIET);
-if (length($rest) > 0) {
-  print STDERR "handoff: invalid UTF-8 in file\n";
-  exit 1;
-}
+refuse("invalid UTF-8 in file") if length($rest) > 0;
 if ($text =~ /[\x{FDD0}-\x{FDEF}\x{FFFE}\x{FFFF}\x{1FFFE}\x{1FFFF}\x{2FFFE}\x{2FFFF}\x{3FFFE}\x{3FFFF}\x{4FFFE}\x{4FFFF}\x{5FFFE}\x{5FFFF}\x{6FFFE}\x{6FFFF}\x{7FFFE}\x{7FFFF}\x{8FFFE}\x{8FFFF}\x{9FFFE}\x{9FFFF}\x{AFFFE}\x{AFFFF}\x{BFFFE}\x{BFFFF}\x{CFFFE}\x{CFFFF}\x{DFFFE}\x{DFFFF}\x{EFFFE}\x{EFFFF}\x{FFFFE}\x{FFFFF}\x{10FFFE}\x{10FFFF}]/) {
-  print STDERR "handoff: invalid UTF-8 in file (a noncharacter code point is refused)\n";
-  exit 1;
+  refuse("invalid UTF-8 in file (a noncharacter code point is refused)");
 }
 if ($text =~ /[\p{Cf}\x{01}-\x{08}\x{0B}-\x{1F}\x{7F}-\x{9F}\x{AD}\x{34F}\x{600}-\x{605}\x{61C}\x{6DD}\x{70F}\x{890}-\x{891}\x{8E2}\x{115F}\x{1160}\x{17B4}\x{17B5}\x{180B}-\x{180F}\x{200B}-\x{200F}\x{2028}-\x{202E}\x{2060}-\x{206F}\x{2800}\x{3164}\x{FE00}-\x{FE0F}\x{FEFF}\x{FFA0}\x{FFF9}-\x{FFFB}\x{110BD}\x{110CD}\x{13430}-\x{1343F}\x{1BCA0}-\x{1BCA3}\x{1D173}-\x{1D17A}\x{E0000}-\x{E0FFF}]/) {
-  print STDERR "handoff: control character in file (only tab, LF and plain text allowed; no CR, ESC, C1, bidi, zero-width or other format characters)\n";
-  exit 1;
+  refuse("control character in file (only tab, LF and plain text allowed; no CR, ESC, C1, bidi, zero-width or other format characters)");
+}
+
+# Lines are split on LF on the validated bytes (a final line without LF counts). Byte limits are bytes.
+my @lines = split /\n/, $bytes, -1;
+pop @lines if @lines && $lines[-1] eq "";
+for my $i (0 .. $#lines) {
+  refuse("line too long: line " . ($i + 1) . " exceeds $MAX_LINE bytes") if length($lines[$i]) > $MAX_LINE;
+}
+
+# ---- helpers (byte strings; whitespace is ASCII space, tab, VT, FF, CR, LF; U+00A0 counts as blank) --------------------
+sub rtrim { my $t = $_[0]; $t =~ s/[ \t\n\r\f\x0B]+\z//; return $t; }
+sub nonblank { my $t = $_[0]; $t =~ s/[ \t\n\r\f\x0B]//g; $t =~ s/\xC2\xA0//g; return length($t) > 0; }
+sub reason_ok { my $t = $_[0]; $t =~ s/[ \t\n\r\f\x0B,:;.-]//g; $t =~ s/\xC2\xA0//g; return length($t) > 0; }
+# load_lines(text, name, max): the lines of text without leading and trailing blank lines.
+sub load_lines {
+  my ($t, $name, $max) = @_;
+  my @all = split /\n/, $t, -1;
+  pop @all if @all && $all[-1] eq "";
+  my ($first, $last) = (-1, -1);
+  for my $i (0 .. $#all) {
+    if (nonblank($all[$i])) {
+      $first = $i if $first < 0;
+      $last = $i;
+    }
+  }
+  refuse("empty section: $name") if $first < 0;
+  my $n = $last - $first + 1;
+  refuse("too many lines in section: $name has $n lines (max $max)") if $n > $max;
+  return @all[$first .. $last];
+}
+sub is_none { return rtrim($_[0]) =~ /\A[Nn][Oo][Nn][Ee]\z/ ? 1 : 0; }
+
+# ---- pass 1: structure (title, headings, order, fences) --------------------------------------------------------------
+my @SEC = ("Summary", "Files changed", "Tests run", "Hard rules touched", "Open risks / questions", "Confidence");
+my $FENCE = "\x60\x60\x60";
+my @S = ("", "", "", "", "", "");
+my %seen;
+my $task_id = "";
+my ($lineno, $cur_idx, $last_idx, $fence, $acc) = (0, -1, -1, 0, "");
+for my $line (@lines) {
+  $lineno++;
+  if ($lineno == 1) {
+    my $t = rtrim($line);
+    if ($t =~ /\A# HANDOFF (T-[0-9]{3,6})\z/) {
+      $task_id = $1;
+    } else {
+      refuse("bad title: line 1 must be \x27# HANDOFF T-NNN\x27 (3 to 6 digits)");
+    }
+    next;
+  }
+  if (index($line, $FENCE) == 0) {
+    refuse("unexpected content before first section (line $lineno)") if $cur_idx < 0;
+    $fence = 1 - $fence;
+    $acc .= "$line\n";
+    next;
+  }
+  if ($fence == 0) {
+    if (index($line, "## ") == 0) {
+      my $name = rtrim(substr($line, 3));
+      my $idx = -1;
+      for my $k (0 .. 5) { $idx = $k if $SEC[$k] eq $name; }
+      refuse("unknown section heading at line $lineno") if $idx < 0;
+      refuse("duplicate section: $SEC[$idx] (line $lineno)") if $seen{$idx};
+      refuse("section out of order: $SEC[$idx] (line $lineno) comes after $SEC[$last_idx]") if $idx < $last_idx;
+      $S[$cur_idx] = $acc if $cur_idx >= 0;
+      $seen{$idx} = 1;
+      $last_idx = $idx;
+      $cur_idx = $idx;
+      $acc = "";
+      next;
+    }
+    refuse("unexpected top-level heading at line $lineno") if index($line, "# ") == 0;
+  }
+  if ($cur_idx < 0) {
+    refuse("unexpected content before first section (line $lineno)") if nonblank($line);
+    next;
+  }
+  $acc .= "$line\n";
+}
+refuse("unterminated code fence at end of file") if $fence != 0;
+$S[$cur_idx] = $acc if $cur_idx >= 0;
+for my $k (0 .. 5) {
+  refuse("missing section: $SEC[$k]") unless $seen{$k};
+}
+
+# ---- pass 2: per-section content -------------------------------------------------------------------------------------
+my @L = load_lines($S[0], "Summary", 5);
+my $summary = join("\n", @L);
+
+@L = load_lines($S[1], "Files changed", 100000);
+my @files;
+unless (@L == 1 && is_none($L[0])) {
+  my $items = 0;
+  for my $line (@L) {
+    next unless nonblank($line);
+    $items++;
+    refuse("too many lines in section: Files changed has more than $MAX_FILES entries") if $items > $MAX_FILES;
+    refuse("bad files_changed entry: item $items must start with \x27- \x27") unless substr($line, 0, 2) eq "- ";
+    my $entry = substr($line, 2);
+    unless ($entry =~ /\A([\]A-Za-z0-9_.\/@+=,()\[-]+)(?: - (.*))?\z/) {
+      refuse("bad files_changed entry: item $items must be \x27- <path> - <note>\x27 with a plain relative path");
+    }
+    my ($path, $note) = ($1, defined $2 ? $2 : "");
+    refuse("bad files_changed entry: item $items path longer than 256 bytes") if length($path) > 256;
+    if (substr($path, 0, 1) eq "-" || substr($path, 0, 1) eq "/" || ("/$path/" =~ m{/\.\./})) {
+      refuse("bad files_changed entry: item $items path must be relative (no leading \x27/\x27), must not start with \x27-\x27, and contain no \x27..\x27 component");
+    }
+    push @files, [$path, $note];
+  }
+}
+
+@L = load_lines($S[2], "Tests run", 60);
+my $tests_run = join("\n", @L);
+
+@L = load_lines($S[3], "Hard rules touched", 100000);
+my @rules;
+unless (@L == 1 && is_none($L[0])) {
+  my $items = 0;
+  for my $line (@L) {
+    next unless nonblank($line);
+    $items++;
+    refuse("too many lines in section: Hard rules touched has more than $MAX_RULES entries") if $items > $MAX_RULES;
+    refuse("bad hard_rules entry: item $items must start with \x27- \x27") unless substr($line, 0, 2) eq "- ";
+    my $entry = substr($line, 2);
+    refuse("bad hard_rules entry: item $items is empty") unless nonblank($entry);
+    push @rules, $entry;
+  }
+}
+
+@L = load_lines($S[4], "Open risks / questions", 60);
+my $risks = join("\n", @L);
+
+# Confidence: the level is case-insensitive and is output in lowercase. Blanks before the level are ignored.
+@L = load_lines($S[5], "Confidence", 10);
+my $first_line = $L[0];
+$first_line =~ s/\A[ \t\n\r\f\x0B]+//;
+my $bad_level = "bad confidence level: the Confidence section must start with low, medium or high";
+refuse($bad_level) unless $first_line =~ /\A([A-Za-z]+)(?:[ \t\n\r\f\x0B,:;.]|\z)(.*)\z/;
+my ($word, $after) = (lc($1), $2);
+refuse($bad_level) unless $word eq "low" || $word eq "medium" || $word eq "high";
+$after =~ s/\A[ \t\n\r\f\x0B,:;.-]+//;
+$L[0] = $after;
+my $why = join("\n", @L);
+$why =~ s/\A\n+//;
+refuse("confidence missing reason: give a reason after the level (separators alone are not a reason)") unless reason_ok($why);
+
+# ---- output: built in memory, written once, only now ------------------------------------------------------------------
+my $json = JSON::PP->new->ascii->allow_nonref;
+sub js {
+  my $s = "" . $_[0];
+  internal("output text is not valid UTF-8") unless utf8::decode($s);
+  return $json->encode($s);
+}
+my $out = q~{"task_id":~ . js($task_id)
+  . q~,"summary":~ . js($summary)
+  . q~,"files_changed":[~ . join(",", map { q~{"path":~ . js($_->[0]) . q~,"note":~ . js($_->[1]) . q~}~ } @files) . q~]~
+  . q~,"tests_run":~ . js($tests_run)
+  . q~,"hard_rules":[~ . join(",", map { js($_) } @rules) . q~]~
+  . q~,"risks":~ . js($risks)
+  . q~,"confidence":{"level":~ . js($word) . q~,"why":~ . js($why) . q~}}~ . "\n";
+binmode(STDOUT);
+my $off = 0;
+while ($off < length($out)) {
+  my $w = syswrite(STDOUT, $out, length($out) - $off, $off);
+  if (!defined $w) {
+    next if $! == EINTR;
+    internal("writing output failed");
+  }
+  $off += $w;
 }
 exit 0;
 '
-env -u PERL5OPT -u PERL5LIB -u PERLLIB -u PERL5DB -u PERL_UNICODE perl -e "$PERL_CHECK" <"$copy"
-rc=$?
-case $rc in
-  0) ;;
-  1) exit 1 ;; # perl has already printed the reason
-  *) internal "character check failed" ;;
-esac
 
-long_line=$(awk -v max="$MAX_LINE" 'length($0) > max { print NR; exit }' <"$copy") || internal "line length check failed"
-if [ -n "$long_line" ]; then
-  die "line too long: line $long_line exceeds $MAX_LINE bytes"
-fi
-
-# ---- helpers -----------------------------------------------------------------------------------------------------------
-NBSP=$'\xC2\xA0'
-
-# nonblank <text>: true if the text has any character other than ASCII whitespace and U+00A0 (no-break space).
-nonblank() {
-  local t=${1//[[:space:]]/}
-  t=${t//"$NBSP"/}
-  [ -n "$t" ]
-}
-
-# reason_ok <text>: true if the text has a character other than blanks, no-break spaces and the separators - , : ; .
-# A reason made only of separators is no reason, on the level line or on any line after it.
-reason_ok() {
-  local t=${1//[[:space:],:;.-]/}
-  t=${t//"$NBSP"/}
-  [ -n "$t" ]
-}
-
-# Sets RT to $1 without trailing whitespace.
-rtrim() {
-  RT=${1%"${1##*[![:space:]]}"}
-}
-
-# load_lines <text> <section name> <max lines>
-# Sets L (array) and LN (count): the lines of <text> without leading/trailing blank lines.
-load_lines() {
-  local text=$1 name=$2 max=$3 line i first=-1 last=-1
-  local -a all
-  all=()
-  while IFS= read -r line; do
-    all+=("$line")
-  done <<<"$text"
-  for ((i = 0; i < ${#all[@]}; i++)); do
-    if nonblank "${all[i]}"; then
-      if [ "$first" -lt 0 ]; then first=$i; fi
-      last=$i
-    fi
-  done
-  if [ "$first" -lt 0 ]; then
-    die "empty section: $name"
-  fi
-  LN=$((last - first + 1))
-  if [ "$LN" -gt "$max" ]; then
-    die "too many lines in section: $name has $LN lines (max $max)"
-  fi
-  L=("${all[@]:first:LN}")
-}
-
-# join_lines: joins L with newlines into J.
-join_lines() {
-  local i
-  J=''
-  for ((i = 0; i < LN; i++)); do
-    if [ "$i" -eq 0 ]; then
-      J=${L[i]}
-    else
-      J+=$'\n'"${L[i]}"
-    fi
-  done
-}
-
-# is_none <line>: true if the line is the single word "none" in any case.
-is_none() {
-  rtrim "$1"
-  case $RT in
-    [Nn][Oo][Nn][Ee]) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-store_section() { # index text
-  case $1 in
-    0) S0=$2 ;;
-    1) S1=$2 ;;
-    2) S2=$2 ;;
-    3) S3=$2 ;;
-    4) S4=$2 ;;
-    5) S5=$2 ;;
-  esac
-}
-
-# ---- pass 1: structure (title, headings, order, fences) ------------------------------------------------------------
-TITLE_RE='^# HANDOFF (T-[0-9]{3,6})$'
-FENCE='```'
-S0='' S1='' S2='' S3='' S4='' S5=''
-task_id=''
-lineno=0
-cur_idx=-1 # -1 = between title and first section
-last_idx=-1
-seen=','
-fence=0
-cur=''
-
-while IFS= read -r line || [ -n "$line" ]; do
-  lineno=$((lineno + 1))
-
-  if [ "$lineno" -eq 1 ]; then
-    rtrim "$line"
-    if [[ $RT =~ $TITLE_RE ]]; then
-      task_id=${BASH_REMATCH[1]}
-    else
-      die "bad title: line 1 must be '# HANDOFF T-NNN' (3 to 6 digits)"
-    fi
-    continue
-  fi
-
-  if [[ $line == "$FENCE"* ]]; then
-    if [ "$cur_idx" -lt 0 ]; then
-      die "unexpected content before first section (line $lineno)"
-    fi
-    fence=$((1 - fence))
-    cur+="$line"$'\n'
-    continue
-  fi
-
-  if [ "$fence" -eq 0 ]; then
-    if [[ $line == '## '* ]]; then
-      name=${line#\#\# }
-      rtrim "$name"
-      name=$RT
-      idx=-1
-      case $name in
-        "Summary") idx=0 ;;
-        "Files changed") idx=1 ;;
-        "Tests run") idx=2 ;;
-        "Hard rules touched") idx=3 ;;
-        "Open risks / questions") idx=4 ;;
-        "Confidence") idx=5 ;;
-      esac
-      if [ "$idx" -lt 0 ]; then
-        die "unknown section heading at line $lineno"
-      fi
-      case $seen in
-        *",$idx,"*) die "duplicate section: ${SECTIONS[idx]} (line $lineno)" ;;
-      esac
-      if [ "$idx" -lt "$last_idx" ]; then
-        die "section out of order: ${SECTIONS[idx]} (line $lineno) comes after ${SECTIONS[last_idx]}"
-      fi
-      if [ "$cur_idx" -ge 0 ]; then
-        store_section "$cur_idx" "$cur"
-      fi
-      seen+="$idx,"
-      last_idx=$idx
-      cur_idx=$idx
-      cur=''
-      continue
-    fi
-    if [[ $line == '# '* ]]; then
-      die "unexpected top-level heading at line $lineno"
-    fi
-  fi
-
-  if [ "$cur_idx" -lt 0 ]; then
-    if nonblank "$line"; then
-      die "unexpected content before first section (line $lineno)"
-    fi
-    continue
-  fi
-  cur+="$line"$'\n'
-done <"$copy"
-
-if [ "$fence" -ne 0 ]; then
-  die "unterminated code fence at end of file"
-fi
-if [ "$cur_idx" -ge 0 ]; then
-  store_section "$cur_idx" "$cur"
-fi
-
-i=0
-while [ "$i" -lt "${#SECTIONS[@]}" ]; do
-  case $seen in
-    *",$i,"*) ;;
-    *) die "missing section: ${SECTIONS[i]}" ;;
-  esac
-  i=$((i + 1))
-done
-
-# ---- pass 2: per-section content -----------------------------------------------------------------------------------
-
-# Summary
-load_lines "$S0" "Summary" 5
-join_lines
-summary=$J
-
-# Files changed (blank lines between bullets are allowed; only items are counted)
-FILE_RE='^([]A-Za-z0-9_./@+=,()[-]+)( - (.*))?$'
-load_lines "$S1" "Files changed" 100000
-files_tsv=''
-if [ "$LN" -eq 1 ] && is_none "${L[0]}"; then
-  files_json='[]'
-else
-  items=0
-  for ((i = 0; i < LN; i++)); do
-    line=${L[i]}
-    if ! nonblank "$line"; then
-      continue
-    fi
-    items=$((items + 1))
-    if [ "$items" -gt "$MAX_FILES" ]; then
-      die "too many lines in section: Files changed has more than $MAX_FILES entries"
-    fi
-    if [[ $line != '- '* ]]; then
-      die "bad files_changed entry: item $items must start with '- '"
-    fi
-    entry=${line#- }
-    if ! [[ $entry =~ $FILE_RE ]]; then
-      die "bad files_changed entry: item $items must be '- <path> - <note>' with a plain relative path"
-    fi
-    path=${BASH_REMATCH[1]}
-    note=${BASH_REMATCH[3]}
-    if [ "${#path}" -gt 256 ]; then
-      die "bad files_changed entry: item $items path longer than 256 bytes"
-    fi
-    case "/$path/" in
-      /-* | //* | */../*) die "bad files_changed entry: item $items path must be relative (no leading '/'), must not start with '-', and contain no '..' component" ;;
-    esac
-    files_tsv+="$path"$'\t'"$note"$'\n'
-  done
-  files_json=$(printf '%s' "$files_tsv" | jq -Rn '[inputs | index("\t") as $i | {path: .[:$i], note: .[$i+1:]}]') ||
-    internal "building files_changed failed"
-fi
-
-# Tests run
-load_lines "$S2" "Tests run" 60
-join_lines
-tests_run=$J
-
-# Hard rules touched (blank lines between bullets are allowed; only items are counted)
-load_lines "$S3" "Hard rules touched" 100000
-if [ "$LN" -eq 1 ] && is_none "${L[0]}"; then
-  rules_json='[]'
-else
-  rules_txt=''
-  items=0
-  for ((i = 0; i < LN; i++)); do
-    line=${L[i]}
-    if ! nonblank "$line"; then
-      continue
-    fi
-    items=$((items + 1))
-    if [ "$items" -gt "$MAX_RULES" ]; then
-      die "too many lines in section: Hard rules touched has more than $MAX_RULES entries"
-    fi
-    if [[ $line != '- '* ]]; then
-      die "bad hard_rules entry: item $items must start with '- '"
-    fi
-    entry=${line#- }
-    if ! nonblank "$entry"; then
-      die "bad hard_rules entry: item $items is empty"
-    fi
-    rules_txt+="$entry"$'\n'
-  done
-  rules_json=$(printf '%s' "$rules_txt" | jq -Rn '[inputs]') ||
-    internal "building hard_rules failed"
-fi
-
-# Open risks / questions
-load_lines "$S4" "Open risks / questions" 60
-join_lines
-risks=$J
-
-# Confidence: the level is case-insensitive and is output in lowercase. Blanks before the level are ignored (ASCII
-# space and tab only).
-CONF_RE='^([A-Za-z]+)([[:space:],:;.]|$)(.*)$'
-load_lines "$S5" "Confidence" 10
-first_line=${L[0]}
-lead=${first_line%%[![:space:]]*}
-first_line=${first_line#"$lead"}
-if ! [[ $first_line =~ $CONF_RE ]]; then
-  die "bad confidence level: the Confidence section must start with low, medium or high"
-fi
-word=${BASH_REMATCH[1]}
-rest=${BASH_REMATCH[3]}
-case $word in
-  [Ll][Oo][Ww]) level=low ;;
-  [Mm][Ee][Dd][Ii][Uu][Mm]) level=medium ;;
-  [Hh][Ii][Gg][Hh]) level=high ;;
-  *) die "bad confidence level: the Confidence section must start with low, medium or high" ;;
-esac
-prefix=${rest%%[![:space:],:;.-]*}
-rest=${rest#"$prefix"}
-L[0]=$rest
-join_lines
-nl=$'\n'
-why=${J#"${J%%[!"$nl"]*}"} # drop leading newlines (level alone on the first line)
-if ! reason_ok "$why"; then
-  die "confidence missing reason: give a reason after the level (separators alone are not a reason)"
-fi
-
-# ---- output (only reached when everything above passed) --------------------------------------------------------------
-# The JSON goes to a temp file first and is written to stdout last, with one cat of that prepared file. An interrupt
-# before that point (which runs the trap) leaves stdout empty. A signal during the cat can still cut the output short.
-jq -a -n \
-  --arg task_id "$task_id" \
-  --arg summary "$summary" \
-  --argjson files "$files_json" \
-  --arg tests_run "$tests_run" \
-  --argjson hard_rules "$rules_json" \
-  --arg risks "$risks" \
-  --arg level "$level" \
-  --arg why "$why" \
-  '{task_id: $task_id, summary: $summary, files_changed: $files, tests_run: $tests_run,
-    hard_rules: $hard_rules, risks: $risks, confidence: {level: $level, why: $why}}' >"$WORK/json" ||
-  internal "building output failed"
-cat -- "$WORK/json" || internal "writing output failed"
+# scrubbed environment: PERL5LIB, PERL5OPT, PERLLIB, PERL5DB, PERL_UNICODE, PERL_USE_UNSAFE_INC and every other variable
+# are gone (env -i), PATH is fixed, and LC_ALL=C. HOME is passed only as data in @ARGV.
+exec "$ENV_BIN" -i PATH=/usr/bin:/bin LC_ALL=C "$PERL_BIN" -e "$PERL_PROG" -- "$ROOT_ARG" "${HOME-}"
+printf 'handoff: internal error: cannot run %s\n' "$PERL_BIN" >&2
+exit 3
