@@ -25,8 +25,19 @@ die() {
   exit 1
 }
 
+# Arguments: parse.sh [--] <file>. Without "--", a first argument that looks like an option is a usage error.
+if [ $# -ge 1 ] && [ "$1" = "--" ]; then
+  shift
+elif [ $# -ge 1 ]; then
+  case $1 in
+    -?*)
+      printf 'usage: parse.sh [--] <HANDOFF.md>  (use "--" or ./ for file names starting with "-")\n' >&2
+      exit 2
+      ;;
+  esac
+fi
 if [ $# -ne 1 ]; then
-  printf 'usage: parse.sh <HANDOFF.md>\n' >&2
+  printf 'usage: parse.sh [--] <HANDOFF.md>\n' >&2
   exit 2
 fi
 if ! command -v jq >/dev/null 2>&1; then
@@ -39,23 +50,46 @@ if [ ! -f "$file" ] || [ ! -r "$file" ]; then
   die "cannot read input file"
 fi
 
+# The file is opened exactly once, with a bounded read, into a private copy. Every later check and the main loop
+# read that copy through stdin redirection, so a file name can never act as an option or an awk assignment and the
+# file cannot change between the checks and the parse (TOCTOU). External commands never receive a path argument
+# derived from the input.
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/handoff-parse.XXXXXX") || die "cannot create temp dir"
+trap 'rm -rf "$WORK"' EXIT
+copy="$WORK/copy"
+head -c $((MAX_BYTES + 1)) <"$file" >"$copy" 2>/dev/null || die "cannot read input file"
+
 # ---- whole-file checks (before any line is interpreted) ----------------------------------------------------------
-size=$(wc -c <"$file" | tr -d '[:space:]')
+size=$(wc -c <"$copy" | tr -d '[:space:]')
+case $size in
+  '' | *[!0-9]*) die "cannot determine file size" ;;
+esac
 if [ "$size" -gt "$MAX_BYTES" ]; then
-  die "oversize: file is $size bytes (max $MAX_BYTES)"
+  die "oversize: file is larger than $MAX_BYTES bytes"
 fi
 if [ "$size" -eq 0 ]; then
   die "empty file"
 fi
-nonul=$(tr -d '\000' <"$file" | wc -c | tr -d '[:space:]')
-if [ "$nonul" -ne "$size" ]; then
+nonul=$(tr -d '\000' <"$copy" | wc -c | tr -d '[:space:]')
+if [ "$nonul" != "$size" ]; then
   die "control character: NUL byte in file"
 fi
-# Control characters other than tab and LF (CR, ESC, ...). The class is built from raw bytes by $'..'.
-if grep -q -e $'[\001-\010\013-\037\177]' "$file"; then
-  die "control character in file (only tab and LF allowed)"
-fi
-long_line=$(awk -v max="$MAX_LINE" 'length($0) > max { print NR; exit }' "$file")
+
+# Control characters and look-alikes, all rejected (LC_ALL=C, so these are raw byte patterns):
+#   C0 controls except tab and LF (includes CR and ESC), DEL
+#   C1 controls U+0080-U+009F (U+009B is CSI, a terminal escape introducer)
+#   U+200B-U+200F zero-width and direction marks, U+2028-U+202E line/paragraph separators and bidi overrides
+#   U+2066-U+2069 bidi isolates, U+FEFF byte order mark / zero-width no-break space
+# grep reads stdin; only exit status 1 (no match) counts as clean. 0 (match) and >= 2 (error) both fail closed.
+BAD_CHARS=$'[\001-\010\013-\037\177]|\xC2[\x80-\x9F]|\xE2\x80[\x8B-\x8F\xA8-\xAE]|\xE2\x81[\xA6-\xA9]|\xEF\xBB\xBF'
+grep -q -E -e "$BAD_CHARS" <"$copy" 2>/dev/null
+case $? in
+  1) ;;
+  0) die "control character in file (only tab, LF and plain text allowed; no CR, ESC, C1, bidi or zero-width characters)" ;;
+  *) die "internal error checking control characters" ;;
+esac
+
+long_line=$(awk -v max="$MAX_LINE" 'length($0) > max { print NR; exit }' <"$copy") || die "internal error checking line length"
 if [ -n "$long_line" ]; then
   die "line too long: line $long_line exceeds $MAX_LINE bytes"
 fi
@@ -203,7 +237,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     continue
   fi
   cur+="$line"$'\n'
-done <"$file"
+done <"$copy"
 
 if [ "$fence" -ne 0 ]; then
   die "unterminated code fence at end of file"
@@ -308,7 +342,7 @@ if ! [[ $why =~ $NONBLANK_RE ]]; then
 fi
 
 # ---- output (only reached when everything above passed) --------------------------------------------------------------
-jq -n \
+jq -a -n \
   --arg task_id "$task_id" \
   --arg summary "$summary" \
   --argjson files "$files_json" \

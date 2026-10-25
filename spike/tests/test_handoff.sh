@@ -315,6 +315,95 @@ for pat in '(^|[;&|({[:space:]])eval[[:space:]]' '(^|[;&|({[:space:]])source[[:s
   if printf '%s\n' "$code" | grep -Eq -e "$pat"; then fail "parser must not contain pattern: $pat"; else pass; fi
 done
 
+# ---- hostile file names, odd characters, single read ---------------------------------------------------------------------
+# run_named <dir> <file name> [args before the name...]: runs the parser from <dir> with the name as the last argument
+run_named() {
+  local dir=$1 name=$2
+  shift 2
+  (cd "$dir" && "$SH" "$PARSE" "$@" "$name" </dev/null >"$TMP/out" 2>"$TMP/err")
+  RC=$?
+  OUT=$(cat "$TMP/out")
+  ERR=$(cat "$TMP/err")
+}
+expect_named_fail() { # desc dir name substring [args...]
+  local desc=$1 dir=$2 name=$3 sub=$4
+  shift 4
+  run_named "$dir" "$name" "$@"
+  if [ "$RC" -ne 1 ]; then fail "$desc: expected exit 1, got $RC (err: $ERR)"
+  elif [ -n "$OUT" ]; then fail "$desc: stdout must be empty on failure"
+  elif [[ $ERR != "handoff: "*"$sub"* ]]; then fail "$desc: error should contain '$sub', got: $ERR"
+  elif [[ $ERR == *"usage:"* || $ERR == *"grep"* || $ERR == *"awk"* ]]; then fail "$desc: tool usage leaked to stderr: $ERR"
+  else pass; fi
+}
+
+ESC_SUM=$'\033[2J\033]0;pwn\007 clear screen'
+mk "$ESC_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$TMP/esc-payload.md"
+dashdir="$TMP/dash"
+mkdir -p "$dashdir"
+for n in -n.md -q.md -e.md; do cp "$TMP/esc-payload.md" "$dashdir/$n"; done
+for n in -n.md -q.md -e.md; do
+  expect_named_fail "ESC in file named $n (after --)" "$dashdir" "$n" "control character" --
+  expect_named_fail "ESC in file named ./$n" "$dashdir" "./$n" "control character"
+done
+# the same names without "--" or ./ are a usage error, not a silent success
+run_named "$dashdir" "-n.md"
+eq "option-looking name without -- is a usage error" "$RC" "2"
+eq "usage error leaves stdout empty" "$OUT" ""
+# a valid handoff with a dash name parses with -- and ./
+cp "$FIX/good.md" "$dashdir/-g.md"
+run_named "$dashdir" "-g.md" --
+eq "good handoff named -g.md parses after --" "$RC" "0"
+run_named "$dashdir" "./-g.md"
+eq "good handoff named ./-g.md parses" "$RC" "0"
+run_named "$dashdir" "-g.md" -- --
+eq "extra arguments after -- are a usage error" "$RC" "2"
+"$SH" "$PARSE" -x "$FIX/good.md" >/dev/null 2>&1
+eq "unknown option is a usage error" "$?" "2"
+"$SH" "$PARSE" -- >/dev/null 2>&1
+eq "-- alone is a usage error" "$?" "2"
+
+# a file named like an awk assignment must not skip the line-length check
+assigndir="$TMP/assign"
+mkdir -p "$assigndir"
+for n in max=1 max=99999999; do
+  mkd "assign-src" "$(printf '%600s' '' | tr ' ' q)" >/dev/null
+  cp "$TMP/assign-src.md" "$assigndir/$n"
+  expect_named_fail "600-byte line in file named $n" "$assigndir" "$n" "line too long"
+done
+cp "$FIX/good.md" "$assigndir/max=1"
+run_named "$assigndir" "max=1"
+eq "good handoff named max=1 parses" "$RC" "0"
+
+# C1 controls, bidi and zero-width characters (UTF-8 sequences) must be rejected
+reject_char() { # name, utf-8 bytes
+  local name=$1 bytes=$2
+  expect_fail "$name in Summary" "$(mkd "u_$name" "before${bytes}after")" "control character"
+  expect_fail "$name in Confidence" "$(mkd "uc_$name" "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "high, why${bytes}")" "control character"
+}
+reject_char "U+009B-CSI" $'\xC2\x9B'
+reject_char "U+0085-NEL" $'\xC2\x85'
+reject_char "U+0080" $'\xC2\x80'
+reject_char "U+009F" $'\xC2\x9F'
+reject_char "U+202E-RLO" $'\xE2\x80\xAE'
+reject_char "U+202A-LRE" $'\xE2\x80\xAA'
+reject_char "U+2028-LS" $'\xE2\x80\xA8'
+reject_char "U+2029-PS" $'\xE2\x80\xA9'
+reject_char "U+200B-ZWSP" $'\xE2\x80\x8B'
+reject_char "U+200F-RLM" $'\xE2\x80\x8F'
+reject_char "U+2066-LRI" $'\xE2\x81\xA6'
+reject_char "U+2069-PDI" $'\xE2\x81\xA9'
+reject_char "U+FEFF-BOM-mid" $'\xEF\xBB\xBF'
+{ printf '\xEF\xBB\xBF'; cat "$FIX/good.md"; } >"$TMP/bom.md"
+expect_fail "BOM at start of file" "$TMP/bom.md" "control character"
+# ordinary non-ASCII text stays allowed, and the JSON output is ASCII-only (jq -a)
+expect_ok "plain non-ASCII text (e-acute, em dash, CJK) is accepted" "$(mkd uni $'caf\xC3\xA9 \xE2\x80\x94 \xE6\x97\xA5\xE6\x9C\xAC')"
+eq "non-ASCII text round-trips" "$(jq -r .summary "$TMP/out")" $'caf\xC3\xA9 \xE2\x80\x94 \xE6\x97\xA5\xE6\x9C\xAC'
+check "output is ASCII only" test "$(LC_ALL=C tr -d '\000-\177' <"$TMP/out" | wc -c | tr -d ' ')" = "0"
+
+# the input path is opened exactly once (source-level guard)
+check "parser opens the input path exactly once" test "$(grep -v '^[[:space:]]*#' "$PARSE" | grep -c '<"\$file"')" = "1"
+check "no other command receives the input path as an argument" test -z "$(grep -v '^[[:space:]]*#' "$PARSE" | grep -E '(wc|tr|grep|awk|head|cat|sed)[^|<]*"\$file"[^|]*$' | grep -v '<"\$file"')"
+
 # ---- usage -----------------------------------------------------------------------------------------------------------
 "$SH" "$PARSE" >/dev/null 2>&1
 eq "no arguments is a usage error" "$?" "2"

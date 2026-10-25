@@ -12,6 +12,10 @@ data**. It is never instructions for the lead, never shell input and never a pat
 
 - never `eval`s, `source`s, expands or executes any part of the file (no `$(...)`, backtick or variable expansion);
 - puts text into JSON only through `jq --arg` / `--argjson`, never by shell interpolation into a command;
+- opens the file exactly once (a bounded read of at most 16385 bytes into a private copy) and runs every check on that
+  copy, so the file cannot change between checks and parsing; external commands only read it through stdin, so a file
+  name can never act as an option or an `awk` assignment;
+- emits ASCII-only JSON (`jq -a`), so non-ASCII text is always `\uXXXX`-escaped in the output;
 - rejects the file on any structural problem instead of guessing (fail closed);
 - does not echo file content in error messages (only section names, line numbers and limits).
 
@@ -47,7 +51,7 @@ Plain UTF-8 text, LF line endings. The sections appear **exactly once each, in e
 |---|---|---|
 | Whole file | 16384 bytes (16 KB) | `oversize` |
 | Any line | 500 bytes | `line too long` |
-| Control characters | none except tab and LF (NUL, CR, ESC and the rest are rejected) | `control character` |
+| Control and look-alike characters | only tab and LF are allowed. Rejected: NUL, CR, ESC and other C0 controls, DEL, C1 controls U+0080-U+009F (U+009B is a terminal CSI), U+200B-U+200F, U+2028-U+202E (includes bidi overrides), U+2066-U+2069, and U+FEFF (BOM, never allowed anywhere) | `control character` |
 
 Byte limits are bytes, not characters (the parser runs with `LC_ALL=C`). An empty file is an error.
 
@@ -95,7 +99,7 @@ JSON: `confidence` = `{level, why}`.
 
 ## Parser output
 
-`parse.sh <file>` prints one JSON object on stdout and exits 0:
+`parse.sh [--] <file>` prints one JSON object on stdout and exits 0:
 
 ```json
 {
