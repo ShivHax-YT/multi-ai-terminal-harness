@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/schemas/plan.schema.json",
+  "title": "Plan",
+  "description": "A plan produced by the lead and approved by the user (docs/spec/plan.md). Structural checks only; hard-rule checks (rules 1, 2, 7, 9) live in spike/plan/check.jq because they span several fields. Ceilings are deliberately not encoded here so an over-ceiling plan is still a well-formed plan the UI can warn about.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["plan_id", "created_at", "lead", "request_summary", "tasks"],
+  "properties": {
+    "plan_id": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "lead": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider"],
+      "properties": { "provider": { "$ref": "#/$defs/provider" } }
+    },
+    "request_summary": { "type": "string" },
+    "summary_budget_tokens": { "type": "integer", "minimum": 1, "default": 200 },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/task" }
+    },
+    "approval": { "$ref": "#/$defs/approval" }
+  },
+  "$defs": {
+    "provider": { "enum": ["claude", "codex", "grok", "kimi", "gemini", "glm"] },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "role",
+        "provider",
+        "auth_mode",
+        "owned_files",
+        "acceptance",
+        "depends_on",
+        "estimated_usage",
+        "fallback_providers"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+        "title": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "minLength": 1 },
+        "provider": { "$ref": "#/$defs/provider" },
+        "auth_mode": { "enum": ["subscription", "api_key"] },
+        "owned_files": { "type": "array", "items": { "type": "string" } },
+        "acceptance": { "type": "array", "items": { "type": "string" } },
+        "depends_on": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "estimated_usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["prompts", "turns"],
+          "properties": {
+            "prompts": { "type": "integer", "minimum": 0 },
+            "turns": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "fallback_providers": { "type": "array", "items": { "$ref": "#/$defs/provider" } }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plan_hash", "approved_at", "approved_via", "nonce"],
+      "properties": {
+        "plan_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "approved_at": { "type": "string", "format": "date-time" },
+        "approved_via": { "const": "ui" },
+        "nonce": { "type": "string", "minLength": 16 }
+      }
+    }
+  }
+}

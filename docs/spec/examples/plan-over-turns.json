@@ -1,0 +1,99 @@
+{
+  "plan_id": "plan-2026-10-25-004",
+  "created_at": "2026-10-25T09:00:00Z",
+  "lead": {
+    "provider": "claude"
+  },
+  "request_summary": "Add a settings screen with a usage panel and tests.",
+  "summary_budget_tokens": 200,
+  "tasks": [
+    {
+      "id": "t1",
+      "title": "Build the settings screen",
+      "role": "implementer",
+      "provider": "claude",
+      "auth_mode": "subscription",
+      "owned_files": [
+        "src/settings/screen.ts"
+      ],
+      "acceptance": [
+        "Settings screen renders",
+        "make check-fast passes"
+      ],
+      "depends_on": [],
+      "estimated_usage": {
+        "prompts": 10,
+        "turns": 41
+      },
+      "fallback_providers": [
+        "codex"
+      ]
+    },
+    {
+      "id": "t2",
+      "title": "Build the usage panel",
+      "role": "implementer",
+      "provider": "codex",
+      "auth_mode": "subscription",
+      "owned_files": [
+        "src/settings/usage.ts"
+      ],
+      "acceptance": [
+        "Panel shows per-provider usage against ceilings"
+      ],
+      "depends_on": [],
+      "estimated_usage": {
+        "prompts": 10,
+        "turns": 25
+      },
+      "fallback_providers": [
+        "kimi"
+      ]
+    },
+    {
+      "id": "t3",
+      "title": "Review the settings and usage diffs",
+      "role": "reviewer",
+      "provider": "kimi",
+      "auth_mode": "subscription",
+      "owned_files": [],
+      "acceptance": [
+        "Review notes cover every acceptance item of t1 and t2"
+      ],
+      "depends_on": [
+        "t1",
+        "t2"
+      ],
+      "estimated_usage": {
+        "prompts": 8,
+        "turns": 10
+      },
+      "fallback_providers": [
+        "claude"
+      ]
+    },
+    {
+      "id": "t4",
+      "title": "Write integration tests",
+      "role": "tester",
+      "provider": "gemini",
+      "auth_mode": "api_key",
+      "owned_files": [
+        "tests/settings.test.ts"
+      ],
+      "acceptance": [
+        "Integration tests pass offline"
+      ],
+      "depends_on": [
+        "t1"
+      ],
+      "estimated_usage": {
+        "prompts": 12,
+        "turns": 15
+      },
+      "fallback_providers": [
+        "codex"
+      ]
+    }
+  ]
+}
