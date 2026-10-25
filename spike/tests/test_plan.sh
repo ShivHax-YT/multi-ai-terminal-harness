@@ -116,7 +116,124 @@ expect_pass "rule 1: exactly 40 turns allowed" "$TMP/turns40.json"
 jq '.tasks[3].estimated_usage.prompts = 500' "$EX/plan-valid.json" > "$TMP/apikey.json"
 expect_pass "api_key prompts not counted against subscription ceiling" "$TMP/apikey.json"
 
-# rule 7: gemini api_key passes (plan-valid has one), covered above; schema/examples are valid JSON
+# ---- hardening: crafted plans must not bypass or crash the checker ------------------------------------------------
+CHECKJQ="$ROOT/spike/plan/check.jq"
+
+# mut NAME FILTER RULE [BASE]: apply FILTER to BASE (default plan-valid), expect hash.sh --check to reject with RULE,
+# and expect check.jq run directly to neither crash (rc 0) nor print nothing.
+mut() {
+  local name="$1" filter="$2" rule="$3" base="${4:-$EX/plan-valid.json}" f out rc
+  f="$TMP/mut-$(printf '%s' "$name" | cksum | cut -d' ' -f1).json"
+  jq "$filter" "$base" > "$f"
+  expect_reject "$name" "$f" "$rule"
+  rc=0
+  out="$(jq -r --arg hash x --argjson require_approval false -f "$CHECKJQ" "$f" 2>&1)" || rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q "^$rule"; then ok "no crash: $name"; else bad "no crash: $name (rc=$rc, out=$out)"; fi
+}
+# mut_pass NAME FILTER [BASE]
+mut_pass() {
+  local name="$1" filter="$2" base="${3:-$EX/plan-valid.json}" f
+  f="$TMP/mutp-$(printf '%s' "$name" | cksum | cut -d' ' -f1).json"
+  jq "$filter" "$base" > "$f"
+  expect_pass "$name" "$f"
+}
+
+# 1. rule 7: provider allow-list (case and whitespace variants, null)
+mut 'rule 7: provider "Gemini" with subscription' '.tasks[3].provider = "Gemini" | .tasks[3].auth_mode = "subscription"' "rule 7:"
+mut 'rule 7: provider "gemini " with subscription' '.tasks[3].provider = "gemini " | .tasks[3].auth_mode = "subscription"' "rule 7:"
+mut 'rule 7: provider null' '.tasks[3].provider = null' "rule 7:"
+mut 'rule 7: provider missing' 'del(.tasks[0].provider)' "rule 7:"
+mut 'rule 7: provider number' '.tasks[0].provider = 5' "rule 7:"
+mut 'rule 7: unknown provider' '.tasks[0].provider = "other"' "rule 7:"
+mut 'rule 7: lead provider "Claude"' '.lead.provider = "Claude"' "rule 7:"
+mut 'rule 7: lead missing' 'del(.lead)' "rule 7:"
+mut 'rule 7: fallback "Gemini"' '.tasks[0].fallback_providers = ["Gemini"]' "rule 2:"
+mut 'rule 2: fallback "claude " (trailing space)' '.tasks[0].fallback_providers = ["codex", "claude "]' "rule 2:"
+mut 'rule 2: case-variant fallback "Kimi" next to "kimi"' '.tasks[1].fallback_providers = ["kimi", "Kimi"]' "rule 2:"
+mut 'rule 2: fallback null element' '.tasks[0].fallback_providers = [null]' "rule 2:"
+
+# 2. rule 1: type bypasses and fail-closed auth_mode
+mut 'rule 1: turns true' '.tasks[0].estimated_usage.turns = true' "rule 1:"
+mut 'rule 1: turns null' '.tasks[0].estimated_usage.turns = null' "rule 1:"
+mut 'rule 1: turns string' '.tasks[0].estimated_usage.turns = "99"' "rule 1:"
+mut 'rule 1: turns negative' '.tasks[0].estimated_usage.turns = -1' "rule 1:"
+mut 'rule 1: turns fractional' '.tasks[0].estimated_usage.turns = 1.5' "rule 1:"
+mut 'rule 1: turns missing' 'del(.tasks[0].estimated_usage.turns)' "rule 1:"
+mut 'rule 1: prompts true' '.tasks[0].estimated_usage.prompts = true' "rule 1:"
+mut 'rule 1: prompts negative' '.tasks[0].estimated_usage.prompts = -100' "rule 1:"
+mut 'rule 1: prompts null' '.tasks[0].estimated_usage.prompts = null' "rule 1:"
+mut 'rule 1: estimated_usage missing' 'del(.tasks[0].estimated_usage)' "rule 1:"
+mut 'rule 1: estimated_usage null' '.tasks[0].estimated_usage = null' "rule 1:"
+mut 'rule 1: estimated_usage array' '.tasks[0].estimated_usage = []' "rule 1:"
+mut 'rule 7: auth_mode "API_KEY"' '.tasks[3].auth_mode = "API_KEY"' "rule 7:"
+mut 'rule 7: auth_mode null' '.tasks[0].auth_mode = null' "rule 7:"
+mut 'rule 7: auth_mode missing' 'del(.tasks[0].auth_mode)' "rule 7:"
+# negative prompts cannot cancel out a real subscription total (and are rejected outright)
+mut 'rule 1: negative prompts hiding an overrun' '.tasks[0].estimated_usage.prompts = 40 | .tasks[3].auth_mode = "subscription" | .tasks[3].provider = "claude" | .tasks[3].estimated_usage.prompts = -20' "rule 1:"
+
+# 3. rule 9: --require-approval (scheduler path)
+out="$("$HASH" --check --require-approval "$EX/plan-valid.json" 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q '^rule 9: plan has no approval'; then
+  ok "rule 9: --require-approval rejects unapproved plan"
+else
+  bad "rule 9: --require-approval rejects unapproved plan (rc=$rc, out=$out)"
+fi
+out="$("$HASH" --check --require-approval "$EX/plan-approved.json" 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && [ -z "$out" ] && ok "--require-approval accepts a correctly approved plan" \
+  || bad "--require-approval accepts a correctly approved plan (rc=$rc, out=$out)"
+out="$("$HASH" --check --require-approval "$EX/plan-stale-approval.json" 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q '^rule 9:' && ok "--require-approval rejects stale approval" \
+  || bad "--require-approval rejects stale approval (rc=$rc, out=$out)"
+jq '.approval = null' "$EX/plan-valid.json" > "$TMP/null-approval.json"
+out="$("$HASH" --check --require-approval "$TMP/null-approval.json" 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q '^rule 9: plan has no approval' && ok "--require-approval rejects approval:null" \
+  || bad "--require-approval rejects approval:null (rc=$rc, out=$out)"
+expect_pass "plain --check still accepts unapproved plan (pre-approval UI warning)" "$EX/plan-valid.json"
+"$HASH" --check --bogus "$EX/plan-valid.json" >/dev/null 2>&1; [ $? -ne 0 ] && ok "unknown --check flag is an error" || bad "unknown --check flag is an error"
+
+# 4. rule 9: malformed approval / fallbacks / tasks never crash and never pass
+mut 'rule 9: approval "yes"' '.approval = "yes"' "rule 9:"
+mut 'rule 9: approval []' '.approval = []' "rule 9:"
+mut 'rule 9: approval true' '.approval = true' "rule 9:"
+mut 'rule 9: approval {} (no fields)' '.approval = {}' "rule 9:"
+mut 'rule 9: approval.plan_hash number' '.approval.plan_hash = 7' "rule 9:" "$EX/plan-approved.json"
+mut 'rule 9: approval.nonce missing' 'del(.approval.nonce)' "rule 9:" "$EX/plan-approved.json"
+mut 'rule 9: approval.approved_at null' '.approval.approved_at = null' "rule 9:" "$EX/plan-approved.json"
+mut 'rule 9: approval.approved_via missing' 'del(.approval.approved_via)' "rule 9:" "$EX/plan-approved.json"
+mut 'rule 2: fallback_providers "codex" (string)' '.tasks[0].fallback_providers = "codex"' "rule 2:"
+mut 'rule 2: fallback_providers null' '.tasks[0].fallback_providers = null' "rule 2:"
+mut 'rule 2: fallback_providers missing' 'del(.tasks[0].fallback_providers)' "rule 2:"
+mut 'rule 2: fallback_providers object' '.tasks[0].fallback_providers = {}' "rule 2:"
+mut 'rule 9: task is a string' '.tasks[0] = "x"' "rule 9:"
+mut 'rule 9: task is null' '.tasks[0] = null' "rule 9:"
+mut 'rule 9: depends_on string' '.tasks[0].depends_on = "t2"' "rule 9:"
+
+# a non-object or unparsable plan file is rejected by the wrapper
+printf '[]' > "$TMP/arr.json"
+expect_reject "rule 9: top-level array rejected" "$TMP/arr.json" "rule 9:"
+printf '"x"' > "$TMP/str.json"
+expect_reject "rule 9: top-level string rejected" "$TMP/str.json" "rule 9:"
+printf '{not json' > "$TMP/broken.json"
+expect_reject "rule 9: unparsable JSON rejected" "$TMP/broken.json" "rule 9:"
+: > "$TMP/empty.json"
+expect_reject "rule 9: empty file rejected" "$TMP/empty.json" "rule 9:"
+
+# 5. rules 2/9: tasks shape and duplicate ids
+mut 'rule 9: tasks null' '.tasks = null' "rule 9:"
+mut 'rule 9: tasks []' '.tasks = []' "rule 9:"
+mut 'rule 9: tasks {}' '.tasks = {}' "rule 9:"
+mut 'rule 9: tasks string' '.tasks = "x"' "rule 9:"
+mut 'rule 9: tasks missing' 'del(.tasks)' "rule 9:"
+mut 'rule 9: duplicate task ids' '.tasks[1].id = .tasks[0].id' "rule 9:"
+mut 'rule 9: task id missing' 'del(.tasks[0].id)' "rule 9:"
+mut 'rule 9: task id number' '.tasks[0].id = 1' "rule 9:"
+
+# the original good plans still pass after all the hardening
+expect_pass "plan-valid.json still passes" "$EX/plan-valid.json"
+mut_pass "integer-valued float turns (20.0) is an integer" '.tasks[0].estimated_usage.turns = 20.0'
+mut_pass "zero usage allowed" '.tasks[2].estimated_usage = {prompts: 0, turns: 0}'
+
+# schema/examples are valid JSON
 for f in "$EX"/*.json "$ROOT/docs/spec/plan.schema.json"; do
   if jq empty "$f" 2>/dev/null; then ok "valid JSON: ${f#"$ROOT"/}"; else bad "valid JSON: ${f#"$ROOT"/}"; fi
 done

@@ -41,6 +41,11 @@ raw character. The schema forbids floats (`integer` only) and unknown keys, whic
 (number formatting, UTF-16 key ordering of non-ASCII keys). The app must not use `jq` output as its canonical form and
 needs its own JCS test vectors.
 
+**Duplicate keys.** The app's canonicalizer and plan parser must reject any JSON object with duplicate keys, before
+hashing and before validation. Parsers disagree on duplicates (the spike's `jq` keeps the last value; others keep the
+first or error), so a plan with `"provider"` twice could be hashed and checked by one parser and executed by another
+(parser-differential attack). The spike does not detect duplicates and must not be taken as evidence they are safe.
+
 ## Approval token
 
 ```json
@@ -53,18 +58,38 @@ needs its own JCS test vectors.
 - The scheduler recomputes the hash of the plan it is about to run and compares it with `approval.plan_hash`. A missing
   token, a non-`ui` source or a mismatch means the plan is rejected. Failover only moves work to providers that appear
   as a task provider in the approved plan.
+- **`hash.sh --approve` is a spike test fixture only.** It mints `approved_via: "ui"` from any shell, which is exactly
+  what must never be possible in the app. It exists so tests can build approved plans and must not be ported to the app.
+  In the app only a UI click handler creates a token, and it is signed with the per-install key.
 
 ## Checks (`spike/plan/check.jq`)
 
-Each violation prints one line starting with its rule number.
+Each violation prints one line starting with its rule number. Two modes:
+
+- **Pre-approval** (`hash.sh --check FILE`): the UI warning before the user approves. A plan with no approval is fine.
+- **Scheduler** (`hash.sh --check --require-approval FILE`): additionally rejects a plan with no approval
+  (`rule 9: plan has no approval`). The scheduler path always uses this mode.
+
+Callers must check the exit code, not just whether output is empty. `hash.sh --check` exits 0 only when the plan passes,
+1 on any violation, unparsable input or checker failure (fail closed).
+
+**Shape validation runs first**, before any default value is applied, and never crashes: a wrong type is itself a
+violation. Only a well-shaped plan reaches the rule checks below.
 
 | Rule | Rejects |
 |---|---|
+| 7 | A `provider` (task, fallback or lead) that is not exactly `claude`, `codex`, `grok`, `kimi`, `gemini` or `glm`. No case folding or trimming: `Gemini` and `gemini ` are rejected. |
+| 7 | An `auth_mode` that is not exactly `subscription` or `api_key`. |
+| 1 | `estimated_usage` missing or not an object, or `turns` / `prompts` that are not integers >= 0 (booleans, null, strings, negatives, fractions). |
+| 2 | `fallback_providers` that is not an array of exact provider names. |
+| 9 | `tasks` that is not a non-empty array, a task that is not an object, a missing or non-string task `id`, duplicate task ids, `depends_on` that is not an array of strings. |
+| 9 | An `approval` that is not an object with string `plan_hash`, `approved_at`, `approved_via`, `nonce`. |
 | 2 | A task whose `fallback_providers` contains its own `provider`, or repeats a provider. |
 | 9 | A fallback provider that no task in the plan uses (failover only to providers in the approved plan). |
 | 7 | A `gemini` task whose `auth_mode` is not `api_key`. |
-| 1 | A task with `estimated_usage.turns` over 40, or a subscription provider whose summed `prompts` exceed 30, so the UI can warn before approval. |
-| 9 | An `approval` whose `plan_hash` is missing or does not match the computed hash, or whose `approved_via` is not `ui`. |
+| 1 | A task with `estimated_usage.turns` over 40, or a provider whose summed `prompts` exceed 30 across every task not exactly `api_key` (fail closed), so the UI can warn before approval. |
+| 9 | An `approval` whose `plan_hash` does not match the computed hash, or whose `approved_via` is not `ui`. |
+| 9 | Scheduler mode only: no approval at all. |
 
 The ceilings are copied from docs/HARD_RULES.md rule 1 for the spike only. In the app they are compile-time constants
 in one module. The checker is advisory for the UI (warn before approval); the scheduler enforces the same ceilings at
@@ -74,6 +99,7 @@ dispatch regardless of what a plan says.
 
 ```
 spike/plan/hash.sh docs/spec/examples/plan-valid.json            # print hash
-spike/plan/hash.sh --check docs/spec/examples/plan-valid.json    # exit 0 = passes
+spike/plan/hash.sh --check docs/spec/examples/plan-valid.json    # exit 0 = passes (pre-approval)
+spike/plan/hash.sh --check --require-approval docs/spec/examples/plan-approved.json   # scheduler mode
 /bin/bash spike/tests/test_plan.sh                               # full offline test
 ```
