@@ -33,12 +33,15 @@ different provider, verification, and summaries. See [docs/ARCHITECTURE.md](docs
 
 ## Stack decision
 
-> **TODO (HUMAN MUST CHOOSE before Phase 1 starts):** Tauri 2 (Rust core + TypeScript UI + xterm.js + portable-pty)
-> **or** native Swift/SwiftUI (+ SwiftTerm). The plan recommends **Tauri 2** (small binary, Rust PTY libraries, a later
-> Windows port). Pick Swift only if the app will stay macOS-only and the team is Swift-first.
-> Record the choice in `docs/adr/0001-stack.md` and update the `Makefile` targets and CI job, then delete this TODO.
+**Tauri 2** (Rust core + TypeScript UI + xterm.js + portable-pty), accepted 2026-10-25 in
+[docs/adr/0001-stack.md](docs/adr/0001-stack.md). Cargo workspace under `src-tauri/`: `harness-core` (lead, scheduler,
+adapters, compliance), `pty-view` (PTY spawn/write), `app` (Tauri shell); UI in `src/`. `harness-core` never depends
+on `pty-view` (rule 3). Pin `portable-pty`; avoid 0.9.0 on macOS.
 
-Until the choice is recorded: do **not** scaffold app code. Phase 0 spike scripts go in `spike/`.
+Still open, to land with the Phase 1 scaffold (not before: unconditional checks fail until `src-tauri/` exists): make
+the `Makefile` stack targets and the CI `stack` job Tauri-only, set `compliance/pty-boundary.conf` to the real crate
+paths and symbols, and pick a product name and bundle ID with no provider trademark (rule 8).
+Phase 0 spike scripts go in `spike/`.
 
 ## Coding conventions
 

@@ -108,5 +108,5 @@ registered in each CLI's own config. It never exposes CLI home directories (rule
 
 ## Stack
 
-> **TODO (human):** record Tauri 2 vs Swift in `docs/adr/0001-stack.md`. Plan recommendation: Tauri 2 (Rust core,
-> `portable-pty`, xterm.js, Keychain access). Note: one project's macOS build broke on portable-pty 0.9.0; pin it.
+**Tauri 2** (accepted 2026-10-25, [ADR 0001](adr/0001-stack.md)): Rust core, `portable-pty`, xterm.js, Keychain
+via the `keyring` crate. Note: one project's macOS build broke on portable-pty 0.9.0; pin it.
