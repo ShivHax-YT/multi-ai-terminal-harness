@@ -30,11 +30,17 @@
 #   - Registration (spike_mark_verified / spike_register_cli) opens the file once, copies from that descriptor into a
 #     private 0700 directory the helper creates, runs the fixed codesign on the COPY and records the copy's sha256.
 #     spike_run_status re-hashes the copy before it runs it (rule 6). The verify directory cannot be chosen by the caller.
+#   - Round 8 policy: the CLI-home names come from compliance/denylist.txt at run time (every operation fails closed, rc 121,
+#     if it is unusable). A run refuses (rc 125) unless HOME is the account's password-database home, and the child's HOME
+#     is always that home. The outfile is opened O_NOFOLLOW|O_APPEND, mode 0600, and a symlink, a hard link, a non-regular
+#     file (the null device excepted) or a parent inside a CLI home is refused. spike_run_timed runs exactly `jq --version`
+#     or `git --version`. A pinned CLI name (claude, codex) runs live only as the registered, hash-verified copy.
 
-if [ -n "${SPIKE_COMMON_LOADED:-}" ]; then
+# Load-once guard (round 8): the library is "loaded" only if its own function exists in THIS shell. An inherited variable
+# cannot make a fresh shell skip loading (and so skip the live gate and the TERM trap).
+if declare -F spike_require_live >/dev/null 2>&1; then
   return 0 2>/dev/null || true
 fi
-SPIKE_COMMON_LOADED=1
 
 # ---- FIXED PATHS (rule 6) -------------------------------------------------------------------------------------------
 # Constants, not overridable. The codesign path is a constant inside lib/runner.pl (CODESIGN_BIN); the tests make a sandbox
@@ -68,6 +74,12 @@ spike_root() {
   if [ -d "$base" ]; then
     base="$(cd "$base" && pwd -P)"
   fi
+  # Rule 4: a scratch root inside a CLI home is refused (nothing printed, rc 1). Judged by identity, and also when the
+  # directory does not exist yet.
+  if ! _spike_dir_outside_cli_homes "$base/harness-spike"; then
+    spike_err "refusing a scratch root inside a CLI home directory (or one that cannot be checked): $base"
+    return 1
+  fi
   printf '%s/harness-spike\n' "$base"
 }
 
@@ -80,7 +92,8 @@ _spike_git() {
 # spike_scratch_repo -> creates <root>/<run-id>/repo with one commit, echoes the repo path.
 spike_scratch_repo() {
   local root run repo stamp
-  root="$(spike_root)"
+  root="$(spike_root)" || return 1
+  [ -n "$root" ] || return 1
   mkdir -p "$root" || return 1
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   run="$(mktemp -d "$root/run-$stamp-XXXXXX")" || return 1
@@ -115,7 +128,8 @@ spike_worktree_add() {
 # Refuses (returns 2) anything that is not strictly inside <TMPDIR>/harness-spike/ (physical or logical spelling).
 spike_cleanup() {
   local target="${1:-}" root lroot phys line
-  root="$(spike_root)"
+  root="$(spike_root)" || { spike_err "cleanup refused (no safe scratch root)"; return 2; }
+  [ -n "$root" ] || { spike_err "cleanup refused (no scratch root)"; return 2; }
   lroot="${TMPDIR:-/tmp}"
   lroot="${lroot%/}/harness-spike"
   if [ -z "$target" ]; then
@@ -186,6 +200,13 @@ spike_capture_dir() {
   esac
   root="${SPIKE_CAPTURES_ROOT:-$SPIKE_DIR/captures}"
   case "$root" in /*) ;; *) root="$PWD/$root" ;; esac
+  case "$root" in *[[:cntrl:]]*) spike_err "capture root refused (control character in path)"; return 2 ;; esac
+  while [ "${root%/}" != "$root" ] && [ "$root" != "/" ]; do root="${root%/}"; done
+  # Rule 4: a capture root inside a CLI home is refused (judged by identity, also when it does not exist yet).
+  if ! _spike_dir_outside_cli_homes "$root"; then
+    spike_err "capture root is inside a CLI home directory (or cannot be checked): $root"
+    return 2
+  fi
   dir="$root/$cli/$(date -u +%Y%m%dT%H%M%SZ)/"
   anc="$root"
   while [ ! -d "$anc" ] && [ "$anc" != "/" ]; do anc="$(dirname "$anc")"; done
@@ -208,7 +229,7 @@ spike_capture_dir() {
 #   UUIDs, dashed or 32 hex     -> <ID-n>
 # Over-redacting is the intended failure mode.
 spike_redact() {
-  SPIKE_R_ROOT1="$(spike_root)" SPIKE_R_ROOT2="${TMPDIR:-/tmp}" SPIKE_R_HOME="${HOME:-}" awk '
+  SPIKE_R_ROOT1="$(spike_root 2>/dev/null)" SPIKE_R_ROOT2="${TMPDIR:-/tmp}" SPIKE_R_HOME="${HOME:-}" awk '
     function rep(s, n,   o, i) { o = ""; for (i = 0; i < n; i++) o = o s; return o }
     function isdelim(c) { return (c == " " || c == "\t" || index(DELIMS, c) > 0) }
 
@@ -418,12 +439,30 @@ spike_magic_ok() {
 # password-database home or of an absolute $HOME (compared by device and inode), if it is a hard-linked regular file, or
 # if it cannot be resolved. 1 if it is outside every CLI home.
 spike_under_cli_home() {
+  local rc
   [ -n "${1:-}" ] || return 0
   _spike_have_helper || return 0
   _spike_helper clihome "$1" >/dev/null 2>&1
+  rc=$?
+  # Fail closed: only the helper's own "outside every CLI home" answer (1) lifts the refusal. Any other status (a crashed
+  # helper, the unusable-denylist status) means refuse.
+  [ "$rc" -eq 1 ] && return 1
+  return 0
 }
 
-# spike_tool_path <name> -> echoes the physical path of a probe tool (jq, git or file) found on PATH; rc 1 if none.
+# _spike_dir_outside_cli_homes <path>: 0 only if the directory (which may not exist yet) is outside every CLI home. Any other
+# answer, including an unusable CLI-home denylist, is "not outside".
+_spike_dir_outside_cli_homes() {
+  local rc
+  [ -n "${1:-}" ] || return 1
+  _spike_have_helper || return 1
+  _spike_helper clihome-new "$1" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 1 ]
+}
+
+# spike_tool_path <name> -> echoes the physical path of a probe tool (jq or git) found on PATH, only if it is a native
+# executable in a system or package-manager prefix (a wrapper script or a copy in a user directory is refused); rc 1 if none.
 spike_tool_path() {
   [ -n "${1:-}" ] || return 1
   _spike_have_helper || return 1
@@ -448,6 +487,7 @@ spike_verify_init() {
   rc=$?
   if [ "$rc" -ne 0 ] || [ -z "$d" ]; then
     if [ "$rc" -eq 5 ]; then return 5; fi
+    if [ "$rc" -eq 121 ]; then _spike_denylist_fail; fi
     return 1
   fi
   _SPIKE_VERIFY_DIR="$d"
@@ -545,12 +585,18 @@ spike_register_cli() {
 # or refuses and starts nothing:
 #   spike_run_timeout  non-live. Runs only a command whose IDENTITY is on the harmless list (checked by the helper on the
 #                      resolved path). Anything else needs SPIKE_LIVE=1, including every provider CLI, whatever its name.
-#   spike_run_live     always needs SPIKE_LIVE=1. Every real prompt or session goes through here.
+#   spike_run_live     always needs SPIKE_LIVE=1. Every real prompt or session goes through here. A command whose basename (or
+#                      resolved basename) is a pinned CLI name (claude, codex) runs ONLY as the current registered,
+#                      hash-verified copy (SPIKE_VERIFIED_COPY); SPIKE_LIVE does not lift that (rule 6).
 #   spike_run_status   only a private verified copy that registration produced (SPIKE_VERIFIED_COPY), only if its content
 #                      still has the recorded sha256, and only the three status shapes. SPIKE_LIVE does not lift this.
-#   spike_run_timed    jq, git and file probes (display only): closed environment, no provider names in the arguments.
+#   spike_run_timed    exactly `jq --version` and `git --version` (display only), nothing else: closed environment.
 # Exit codes: the command's own; 124 timeout; 2 usage / cannot resolve; 3 refused by the gate (the calling SCRIPT is
-# stopped, see spike_require_live); 125 the helper refused at exec time.
+# stopped, see spike_require_live); 121 the CLI-home denylist file is unusable (nothing runs); 125 the helper refused at exec
+# time (HOME is not the account home, the output file is refused, or the policy was not met). The helper's own codes are
+# also the command's: 126 cannot execute, 127 not found, 143/130/129 after TERM/INT/HUP. A command that itself exits with
+# 121, 124, 125, 126, 127 or 143 is therefore indistinguishable from the helper's code of that number; callers that must tell
+# them apart check the output file, not the status alone.
 
 # _spike_secs <digits> -> echoes the decimal value (leading zeros are not octal), 1..3600; rc 1 otherwise.
 _spike_secs() {
@@ -628,10 +674,36 @@ _spike_stop_script() {
   exit 3
 }
 
+# _spike_denylist_fail: the helper could not use compliance/denylist.txt (rc 121). Nothing was started.
+_spike_denylist_fail() {
+  spike_err "the CLI-home denylist (compliance/denylist.txt) is missing, empty or malformed; every operation is refused"
+}
+
+# _spike_run_live_policy <seconds> <outfile> <cmd> [args...]: the live path shared by spike_run_timeout (after its gate) and
+# spike_run_live. SPIKE_LIVE=1 is already required. The helper refuses (rc 3) a command whose basename or resolved basename is
+# a pinned CLI name (claude, codex) unless it is the current registered, hash-verified copy; that stops the calling SCRIPT.
+_spike_run_live_policy() {
+  local secs="$1" out="$2" cmd="$3" res rc
+  shift 3
+  res="$(_spike_helper gate live "${_SPIKE_VERIFY_DIR:--}" "$cmd" "$@" 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -eq 121 ]; then _spike_denylist_fail; return 121; fi
+  if [ "$rc" -eq 3 ]; then
+    _spike_stop_script "refusing: $cmd is named like a pinned CLI and is not the current registered, hash-verified copy (rule 6); pass \"\$SPIKE_VERIFIED_COPY\" after preflight registration"
+  fi
+  if [ "$rc" -ne 0 ]; then
+    spike_err "cannot resolve command: $cmd"
+    return 2
+  fi
+  _spike_exec live "$secs" "$out" "${_SPIKE_VERIFY_DIR:--}" "$res" "$@"
+}
+
 # spike_run_timeout <seconds> <outfile> <cmd> [args...]
 # Non-live runner. Runs only the harmless identities the helper lists (git --version, the codesign read-only shapes on a
-# path inside the private verify directory, true, false, sleep, echo, printf, each only from a system directory).
-# Everything else needs SPIKE_LIVE=1. The command is resolved once and the resolved path is what runs.
+# path inside the private verify directory, true, false, sleep, echo, printf, each only from a system directory). The words
+# in the ARGUMENTS of those commands are not examined (they cannot launch anything once the identity is enforced); a provider
+# word in the program name is never ungated. Everything else needs SPIKE_LIVE=1, and a pinned CLI name needs the registered
+# copy even then. The command is resolved once and the resolved path is what runs.
 spike_run_timeout() {
   local secs out cmd res rc
   _spike_run_args_ok "$@" || return 2
@@ -643,6 +715,7 @@ spike_run_timeout() {
     _spike_exec ungated "$secs" "$out" "${_SPIKE_VERIFY_DIR:--}" "$res" "$@"
     return $?
   fi
+  if [ "$rc" -eq 121 ]; then _spike_denylist_fail; return 121; fi
   if [ "$rc" -eq 1 ] || [ "$rc" -eq 2 ]; then
     spike_require_live
   fi
@@ -650,24 +723,20 @@ spike_run_timeout() {
     spike_err "cannot resolve command: $cmd"
     return 2
   fi
-  _spike_exec live "$secs" "$out" - "$res" "$@"
+  _spike_run_live_policy "$secs" "$out" "$cmd" "$@"
 }
 
 # spike_run_live <seconds> <outfile> <cmd> [args...]
-# The runner for every real prompt or session. Always checks the live gate first (SPIKE_LIVE=1, set by the human).
+# The runner for every real prompt or session. Always checks the live gate first (SPIKE_LIVE=1, set by the human). A command
+# named like a pinned CLI (claude, codex; by argv[0] or by the resolved target) runs only as the current registered,
+# hash-verified copy: pass "$SPIKE_VERIFIED_COPY" (rule 6).
 spike_run_live() {
-  local secs out cmd res rc
+  local secs out cmd
   _spike_run_args_ok "$@" || return 2
   secs="$_SPIKE_SECS" out="$2" cmd="$3"
   shift 3
   spike_require_live
-  res="$(_spike_helper gate live - "$cmd" "$@" 2>/dev/null)"
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    spike_err "cannot resolve command: $cmd"
-    return 2
-  fi
-  _spike_exec live "$secs" "$out" - "$res" "$@"
+  _spike_run_live_policy "$secs" "$out" "$cmd" "$@"
 }
 
 # spike_run_status <seconds> <outfile> <copy> [args...]
@@ -687,9 +756,10 @@ spike_run_status() {
   _spike_exec status "$secs" "$out" "$_SPIKE_VERIFY_DIR" "$res" "$@"
 }
 
-# spike_run_timed <seconds> <outfile> <cmd> [args...]
-# A probe of a fixed tool (jq, git or file) for display purposes: found on PATH by the helper, run with the closed
-# environment under the same watchdog. Anything else (and any argument naming a provider) is refused with rc 2.
+# spike_run_timed <seconds> <outfile> jq --version | git --version
+# A display probe of a fixed tool, and nothing else: exactly `jq --version` or `git --version` (no other argument at all). The
+# tool is found on PATH by the helper and must be a native executable in a system or package-manager prefix; a wrapper script
+# or a copy in a user directory that is first on PATH is refused and never run. Closed environment, same watchdog. Refused: rc 2.
 spike_run_timed() {
   local secs out cmd res rc
   _spike_run_args_ok "$@" || return 2
@@ -698,8 +768,9 @@ spike_run_timed() {
   res="$(_spike_helper gate tool - "$cmd" "$@" 2>/dev/null)"
   rc=$?
   if [ "$rc" -ne 0 ]; then
-    spike_err "not a probe tool (jq, git, file) or not found: $cmd"
+    spike_err "not a probe: only 'jq --version' and 'git --version' (a native tool in a system prefix) are allowed: $cmd"
     return 2
   fi
   _spike_exec tool "$secs" "$out" - "$res" "$@"
 }
+

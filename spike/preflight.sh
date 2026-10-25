@@ -8,8 +8,8 @@
 # lib/common.sh), by file identity, in one pass per CLI (spike_register_cli):
 #   - the CLI name is looked up on PATH inside the helper and resolved ONCE, physically;
 #   - a path inside a CLI home (compared by device and inode, for the account's password-database home and for an absolute
-#     HOME) is never read, except the provider binary itself, whose first four bytes are checked for a Mach-O magic (the
-#     ratified narrow exception); a hard-linked file is refused before any read;
+#     HOME) is never read, except the provider binary itself: it is lstat-ed first (regular, owner-execute bit, >= 1 MiB, else refused
+#     without being opened), then the helper reads the magic and copies the binary for verification (the ratified narrow exception); a hard-linked file is refused before any read;
 #   - the file is opened once; a Mach-O is copied FROM THAT DESCRIPTOR into a private 0700 directory the helper made, and
 #     the COPY is checked with the fixed codesign (--verify --strict, a "Developer ID Application" authority, the pinned
 #     team of that CLI, and the chain-to-Apple requirement for that team); its sha256 is recorded;
@@ -105,7 +105,7 @@ check_cli() { # check_cli <name> <signin-args...>
   if [ "$reg" -ne 0 ]; then
     case "$SPIKE_REG_STATUS" in
       clihome)
-        add_note "$name resolves inside a CLI home directory and was NOT read (rule 4). Only the provider binary itself may be read, and only when its first four bytes are a Mach-O magic." ;;
+        add_note "$name resolves inside a CLI home directory and was NOT read (rule 4). Only the provider binary itself may be read, and only if it is a regular owner-executable file of at least 1 MiB; the helper reads the magic, then copies the binary for verification." ;;
       hardlink)
         add_note "$name is a hard-linked file; it could be a second name for a file inside a CLI home, so it was NOT read and NOT executed (rule 4)." ;;
       script)

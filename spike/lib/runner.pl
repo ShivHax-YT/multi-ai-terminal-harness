@@ -12,12 +12,18 @@
 #     target or in the result refuses the path, so a caller's $(...) can never strip or inject bytes
 #   - CLI-home membership compares (device, inode) of every directory on the path and of the file against the CLI homes of
 #     BOTH the password-database home and an absolute HOME; hard links, case-insensitive spellings and firmlinks therefore
-#     cannot hide a home
+#     cannot hide a home. The list of CLI home names is NOT in this file: it is read at run time from the lead-owned
+#     compliance/denylist.txt (located from this file's own physical path), and every operation fails closed (rc 121 and one
+#     fixed message) if that file is missing, empty or malformed (round 8)
 #   - a file is opened ONCE (O_RDONLY|O_NOFOLLOW|O_NOCTTY|O_NONBLOCK), checked with fstat, read from that descriptor
 #   - registration copies from that descriptor into a private 0700 directory this helper creates, runs the fixed
 #     codesign on the COPY, records the copy's sha256, and a status run re-hashes the copy before it is executed
 #   - a run puts the helper at the head of a NEW process group and forks the command into that group; the helper watches
 #     the timeout, its caller (parent pid changes when the caller dies) and TERM/INT/HUP, and kills the whole group
+#   - a run refuses (rc 125) unless the caller's HOME is the password-database home (same device and inode); the child's HOME
+#     is always that home. The output file is opened O_WRONLY|O_CREAT|O_APPEND|O_NOFOLLOW, mode 0600; a symlink, a hard-linked
+#     file, a non-regular file (the null device excepted) and a parent inside a CLI home are refused (rule 4)
+#   - the fixed codesign the helper starts for registration is watched too: TERM/INT/HUP or the caller's death kill its group
 #
 # Core modules only (POSIX Fcntl Errno Cwd Digest::SHA). Works with the system perl of macOS and of Linux.
 
@@ -38,13 +44,21 @@ use Digest::SHA ();
 use constant CODESIGN_BIN => "/usr/bin/codesign";
 use constant CODESIGN_SECS => 20;
 use constant AUTH_PREFIX => "Developer ID Application";
+# The designated-requirement text: the chain must reach Apple's root, the leaf must be a Developer ID Application certificate
+# (Apple's marker extension OID 1.2.840.113635.100.6.1.13; documented in Apple's Code Signing Requirement Language and used in
+# Developer ID requirements), and the leaf's subject OU must be the pinned team. The team and the closing quote follow.
+use constant REQ_PREFIX => 'anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "';
 my %PINNED = (
     claude => 'Q6L2SF6YDW',    # Anthropic PBC. THE HUMAN MUST CONFIRM THESE AGAINST VENDOR-PUBLISHED VALUES.
     codex  => '2DC432GLL2',    # OpenAI
 );
 
+use constant DENY_FAIL_RC  => 121;    # distinct: the CLI-home denylist file could not be used
+use constant DENY_FAIL_MSG => 'the CLI-home denylist (compliance/denylist.txt) is missing, empty or malformed; every operation is refused';
+
 my %IN;      # the caller's inputs, copied from SPIKE_IN_* at start
 my $CWD;     # physical cwd at start (relative inputs are made absolute from it)
+my $ORIG_PPID = getppid();    # the caller; a different parent pid later means the caller died
 
 $| = 1;
 
@@ -60,11 +74,16 @@ sub base_lc { my ($p) = @_; $p =~ s{.*/}{}s; $p = lc $p; $p =~ s/\.exe\z//; retu
 # Runs of '/' collapse; '.' is skipped; '..' pops the (already physical) stack; every symlink is expanded in place.
 # A trailing slash, a final '.' or '..', an empty path and a control character are refused. Only the FINAL component may
 # be missing.
+#
+# resolve_phys(path, 1) is the LOOSE form used to judge a directory that does not exist yet (a capture or scratch root that
+# mkdir -p will create): the first missing component and everything after it are returned lexically in { tail => [...] }
+# and { path } is the physical path of the part that exists.
 sub resolve_phys {
-    my ($in) = @_;
+    my ($in, $loose) = @_;
     return unless defined $in && length $in;
     return if has_ctl($in);
     return if $in =~ m{/\z};
+    $CWD = Cwd::getcwd() unless defined $CWD;
     my $p = $in;
     $p = $CWD . '/' . $p unless substr($p, 0, 1) eq '/';
     my @todo = grep { length } split m{/}, $p;
@@ -80,6 +99,15 @@ sub resolve_phys {
         my $full = '/' . join('/', @stack, $c);
         my @st = lstat($full);
         if (!@st) {
+            if ($loose && $!{ENOENT}) {
+                my @tail = ($c);
+                for my $t (@todo) {
+                    next if $t eq '.';
+                    if ($t eq '..') { if (@tail) { pop @tail; } else { pop @stack; } next; }
+                    push @tail, $t;
+                }
+                return { path => '/' . join('/', @stack), exists => 0, st => [], tail => \@tail };
+            }
             if (!@todo && $!{ENOENT}) { push @stack, $c; $exists = 0; last; }
             return;
         }
@@ -131,12 +159,61 @@ sub resolve_cmd {
 }
 
 # ---- CLI homes (rule 4), by (device, inode) ------------------------------------------------------------------------------
-# The names are built from parts so the repository's compliance scan sees no credential-path literal in spike/.
-sub cli_names {
-    my @n = map { '.' . $_ } ('cla' . 'ude', 'cod' . 'ex', 'gr' . 'ok', 'kimi' . '-code', 'ki' . 'mi', 'gem' . 'ini');
-    push @n, '.' . 'cla' . 'ude' . '.json';
+# The names are NOT in this file. They are read at run time from compliance/denylist.txt, the lead-owned single list of CLI
+# homes: one entry per line relative to the account's home, '#' comments, blank lines; every entry must match
+# ^\.[A-Za-z0-9._-]+$. The file is found from this script's own physical path (spike/lib/runner.pl -> <repo root>/compliance/
+# denylist.txt), opened O_NOFOLLOW and must be a regular file. Missing, unreadable, empty or malformed means FAIL CLOSED:
+# denylist_ok() is false, under_cli_home() refuses everything, and main() refuses every subcommand (DENY_FAIL_RC).
+my @DENY;
+my $DENY_LOADED = 0;      # 0 = not tried, 1 = loaded, -1 = failed
+
+sub denylist_file {
+    my $r = resolve_phys(__FILE__);
+    return unless $r && $r->{exists};
+    my @parts = grep { length } split m{/}, $r->{path};
+    return unless @parts >= 4;    # /<root>/<dir>/lib/runner.pl at the least
+    splice @parts, -3;            # runner.pl, lib, spike
+    return '/' . join('/', @parts, 'compliance', 'denylist.txt');
+}
+
+# parse_denylist(text) -> list of entries, or empty list if the text is empty or any line is malformed.
+sub parse_denylist {
+    my ($text) = @_;
+    return unless defined $text;
+    my (@n, %seen);
+    for my $line (split /\n/, $text, -1) {
+        $line =~ s/#.*\z//s;
+        $line =~ s/\A[ \t]+//;
+        $line =~ s/[ \t]+\z//;
+        next unless length $line;
+        return unless $line =~ /\A\.[A-Za-z0-9._-]+\z/ && $line ne '..';
+        push @n, $line unless $seen{$line}++;
+    }
     return @n;
 }
+
+sub load_denylist {
+    return $DENY_LOADED > 0 ? 1 : 0 if $DENY_LOADED;
+    $DENY_LOADED = -1;
+    my $p = denylist_file();
+    return 0 unless defined $p;
+    my $fh;
+    sysopen($fh, $p, O_RDONLY | O_NOFOLLOW | O_NOCTTY | O_NONBLOCK) or return 0;
+    my @fs = stat($fh);
+    unless (@fs && S_ISREG($fs[2]) && $fs[7] > 0 && $fs[7] <= 65536) { close $fh; return 0; }
+    my ($data, $buf) = ('', '');
+    while ((sysread($fh, $buf, 65536) || 0) > 0) { $data .= $buf; }
+    close $fh;
+    my @n = parse_denylist($data);
+    return 0 unless @n;
+    @DENY = @n;
+    $DENY_LOADED = 1;
+    return 1;
+}
+
+sub denylist_ok { return load_denylist(); }
+
+sub cli_names { return load_denylist() ? @DENY : (); }
 
 # candidate_homes(pw_home, env_home) -> the absolute, control-free, distinct homes to check. Pure, so a test can show that
 # an HOME pointed away (or unset, or relative) never removes the password-database home.
@@ -155,9 +232,12 @@ sub candidate_homes {
     return @h;
 }
 
+# account_home() -> the password-database home of this account. ONE line, so a test can point a SANDBOX COPY of this file at a
+# fake home (the same technique as the codesign constant); the shipped file is checked to keep the getpwuid form.
+sub account_home { my @pw = getpwuid($<); return $pw[7]; }
+
 sub current_homes {
-    my @pw = getpwuid($<);
-    return candidate_homes($pw[7], $IN{HOME});
+    return candidate_homes(account_home(), $IN{HOME});
 }
 
 # home_idents(homes...) -> { "dev:ino" => 1 } for every CLI home entry (the entry itself and, for a symlink, its target).
@@ -198,10 +278,33 @@ sub path_idents {
 # can be determined at all.
 sub under_cli_home {
     my ($path) = @_;
+    return 1 unless denylist_ok();
     my @homes = current_homes();
     return 1 unless @homes;
     my $set = home_idents(@homes);
     for my $id (path_idents($path)) { return 1 if $set->{$id}; }
+    return 0;
+}
+
+# under_cli_home_loose(path) -> 1 if a directory that may not exist yet would be, or lie inside, a CLI home. The part that
+# exists is judged by identity; a missing first component that is named like a CLI home entry directly under a home is refused
+# too (mkdir -p would create it). Fails closed when the path cannot be resolved at all.
+sub under_cli_home_loose {
+    my ($in) = @_;
+    return 1 unless denylist_ok();
+    my $r = resolve_phys($in, 1) or return 1;
+    return under_cli_home($r->{path}) unless $r->{tail} && @{ $r->{tail} };
+    return 1 if under_cli_home($r->{path});
+    my %deny = map { lc($_) => 1 } cli_names();
+    if ($deny{ lc $r->{tail}[0] }) {
+        my @here = stat($r->{path});
+        for my $h (current_homes()) {
+            my $hr = resolve_phys($h);
+            next unless $hr && $hr->{exists};
+            my @hs = stat($hr->{path});
+            return 1 if @hs && @here && ident(@hs) eq ident(@here);
+        }
+    }
     return 0;
 }
 
@@ -277,7 +380,9 @@ sub parent_ok {
     my ($d) = @_;
     my @s = lstat($d);
     return 0 unless @s && S_ISDIR($s[2]) && !S_ISLNK($s[2]);
-    return 1 if $s[2] & 01000;
+    # A sticky directory is shared, but another user's sticky directory is not ours to put a private directory in: the owner
+    # must be this user or root (round 8).
+    if ($s[2] & 01000) { return ($s[4] == $> || $s[4] == 0) ? 1 : 0; }
     return 0 unless $s[4] == $>;
     return 0 if $s[2] & 022;
     return 1;
@@ -427,33 +532,53 @@ sub registry_ok {
 
 # ---- codesign (fixed absolute path) ----------------------------------------------------------------------------------------
 # run_capture(secs, argv...) -> (status, output, timed_out). stdout+stderr go through a pipe; no temporary file.
+# The child leads its own process group. This function WATCHES it: a timeout, TERM/INT/HUP to the helper, or the death of the
+# helper's caller (the parent pid changes; polled every 100 ms) kills that whole group, and in the signal and caller-death cases
+# the helper then ends (143 / 130 / 129), so no codesign is ever left running under init.
+my $CAP_SIG = 0;
+
 sub run_capture {
     my ($secs, @argv) = @_;
     my ($rd, $wr);
     pipe($rd, $wr) or return (-1, '', 0);
+    my $mask = POSIX::SigSet->new(POSIX::SIGTERM(), POSIX::SIGINT(), POSIX::SIGHUP());
+    my $old  = POSIX::SigSet->new();
+    POSIX::sigprocmask(POSIX::SIG_BLOCK(), $mask, $old);
     my $pid = fork();
-    return (-1, '', 0) unless defined $pid;
+    unless (defined $pid) { POSIX::sigprocmask(POSIX::SIG_SETMASK(), $old, undef); return (-1, '', 0); }
     if (!$pid) {
         close $rd;
+        $SIG{$_} = 'DEFAULT' for qw(TERM INT HUP);
+        POSIX::sigprocmask(POSIX::SIG_SETMASK(), POSIX::SigSet->new(), undef);
         POSIX::setpgid(0, 0);
         open(STDIN, '<', '/dev/null');
         POSIX::dup2(fileno($wr), 1);
         POSIX::dup2(fileno($wr), 2);
-        %ENV = (PATH => '/usr/bin:/bin', LANG => 'C', HOME => def($IN{HOME}, '/'));
+        # Rule 2: the account's own home, never an alternate one.
+        %ENV = (PATH => '/usr/bin:/bin', LANG => 'C', HOME => def(account_home(), '/'));
         {
             no warnings 'exec';
             exec { $argv[0] } @argv;
         }
         POSIX::_exit(127);
     }
+    POSIX::setpgid($pid, $pid);
     close $wr;
-    my ($out, $timed) = ('', 0);
+    $CAP_SIG = 0;
+    local $SIG{TERM} = sub { $CAP_SIG ||= 143 };
+    local $SIG{INT}  = sub { $CAP_SIG ||= 130 };
+    local $SIG{HUP}  = sub { $CAP_SIG ||= 129 };
+    POSIX::sigprocmask(POSIX::SIG_SETMASK(), $old, undef);
+    my ($out, $timed, $ended) = ('', 0, 0);
     my $deadline = time + $secs;
     my $rin = '';
     vec($rin, fileno($rd), 1) = 1;
     while (1) {
+        if ($CAP_SIG) { $ended = $CAP_SIG; last; }
+        if (getppid() != $ORIG_PPID) { $ended = 143; last; }
         my $left = $deadline - time;
         if ($left <= 0) { $timed = 1; last; }
+        $left = 0.1 if $left > 0.1;
         my $rout = $rin;
         my $n = select($rout, undef, undef, $left);
         next if $n < 0;
@@ -464,9 +589,10 @@ sub run_capture {
             $out .= $buf if length($out) < 262144;
         }
     }
-    if ($timed) { kill 'KILL', -$pid; kill 'KILL', $pid; }
+    if ($timed || $ended) { kill 'KILL', -$pid; kill 'KILL', $pid; }
     close $rd;
     waitpid($pid, 0);
+    POSIX::_exit($ended) if $ended;
     my $st = $?;
     my $rc = ($st & 127) ? 128 + ($st & 127) : ($st >> 8);
     return ($timed ? -1 : $rc, $out, $timed);
@@ -503,7 +629,7 @@ sub verify_signer {
     }
     # The text above can be forged by a self-made certificate; this asks codesign to check the chain to Apple's root.
     ($rc, $out, $timed) = run_capture(CODESIGN_SECS, CODESIGN_BIN, '--verify', '--strict',
-        '-R=anchor apple generic and certificate leaf[subject.OU] = "' . $want . '"', $bin);
+        '-R=' . REQ_PREFIX . $want . '"', $bin);
     return (0, 'UNTRUSTED (signer text matches but the certificate chain does not satisfy the pinned team)') if $rc != 0;
     return (1, "valid; $auth; team $team");
 }
@@ -514,6 +640,17 @@ sub emit_result {
     my @f = map { my $v = defined $r{$_} ? $r{$_} : ''; $v =~ s/[\x00-\x1f\x7f]//g; $v } qw(STATUS KIND PATH COPY SIG);
     print join("\t", @f), "\n";
     return 0;
+}
+
+# home_binary_ok(stat fields) -> 1 only for a regular file with the owner-execute bit set and a size of at least 1 MiB.
+use constant HOME_BINARY_MIN => 1048576;
+sub home_binary_ok {
+    my (@s) = @_;
+    return 0 unless @s >= 8;
+    return 0 unless S_ISREG($s[2]);
+    return 0 unless $s[2] & 0100;
+    return 0 unless $s[7] >= HOME_BINARY_MIN;
+    return 1;
 }
 
 # register <vdir> <cli> <path|name> <src>: one open, one copy, one signer check, one registry line.
@@ -552,6 +689,15 @@ sub cmd_register {
 
     # Rule 4: decide from identity BEFORE any byte is read.
     my $inhome = under_cli_home($path);
+    # The ratified narrow exception (a vendor binary inside its CLI home) is for a vendor binary only: lstat it FIRST and
+    # require a regular file, the owner-execute bit and a size of at least 1 MiB. A credential file is small and 0600, so
+    # it is refused here WITHOUT being opened (round 8).
+    if ($inhome && !home_binary_ok(@{ $res->{st} })) {
+        $r{STATUS} = 'clihome';
+        $r{KIND}   = 'refused';
+        $r{SIG}    = 'REFUSED (inside a CLI home directory; not read)';
+        return emit_result(%r);
+    }
     my $fh = open_ro($path);
     unless ($fh) {
         $r{STATUS} = 'unresolvable';
@@ -574,8 +720,16 @@ sub cmd_register {
         $r{SIG}    = 'REFUSED (hard-linked file; cannot prove it is outside a CLI home directory; not read)';
         return emit_result(%r);
     }
+    if ($inhome && !home_binary_ok(@fs)) {
+        close $fh;
+        $r{STATUS} = 'clihome';
+        $r{KIND}   = 'refused';
+        $r{SIG}    = 'REFUSED (inside a CLI home directory; not read)';
+        return emit_result(%r);
+    }
 
-    # The only read before the copy: the first four bytes (the ratified narrow exception for a binary inside a CLI home).
+    # The first read is the 4-byte magic. For a Mach-O the whole file is then copied (it IS the vendor binary: the ratified
+    # narrow exception for a binary inside a CLI home) so that the COPY can be verified and run.
     my $head = '';
     sysread($fh, $head, 4);
     if (!is_macho($head)) {
@@ -668,15 +822,22 @@ sub cmd_register {
 # ---- identity gate ---------------------------------------------------------------------------------------------------------
 my %ALLOW  = map { $_ => 1 } qw(git codesign true false sleep echo printf);
 my %LAUNCH = map { $_ => 1 } qw(env sh bash zsh dash ksh csh tcsh fish xargs nohup command exec time nice perl python python3 node ruby script expect osascript open);
-my %TOOLS  = map { $_ => 1 } qw(jq git file);
+my %TOOLS  = map { $_ => 1 } qw(jq git);
 
 sub system_path { return ($_[0] =~ m{\A(?:/bin|/usr/bin|/usr/sbin|/sbin)/.}) ? 1 : 0; }
 
-sub args_mention_provider {
-    for my $a (@_) {
-        return 1 if $a =~ /(?:^|[^A-Za-z0-9])(?:claude|codex|grok|gemini|kimi)(?:[^A-Za-z0-9]|$)/im;
-    }
-    return 0;
+# Provider words are judged ONLY on a program name: argv[0]'s basename and the resolved target's basename. Identity is enforced
+# separately (system directory, resolved once), so the words in the ARGUMENTS of an ungated system command (echo, printf, a
+# path under a directory named after a provider) cannot launch anything and are not examined (round 8).
+sub provider_word {
+    my ($base) = @_;
+    return ($base =~ /(?:^|[^a-z0-9])(?:claude|codex|grok|gemini|kimi)(?:[^a-z0-9]|$)/i) ? 1 : 0;
+}
+
+# pinned_name(lower-case basename) -> 1 for the pinned CLI names (claude, codex), including claude.exe, claude-real, claude.2.
+sub pinned_name {
+    my ($base) = @_;
+    return ($base =~ /\A(?:claude|codex)(?![a-z0-9])/) ? 1 : 0;
 }
 
 sub status_shape {
@@ -694,7 +855,7 @@ sub codesign_shape {
     return 1 if @a == 3 && $a[0] eq '--verify' && $a[1] eq '--strict' && arg_is_path($a[2]);
     return 1 if @a == 3 && $a[0] eq '-dv' && $a[1] eq '--verbose=2' && arg_is_path($a[2]);
     if (@a == 4 && $a[0] eq '--verify' && $a[1] eq '--strict') {
-        return 1 if $a[2] =~ /\A-R=anchor apple generic and certificate leaf\[subject\.OU\] = "/ && arg_is_path($a[3]);
+        return 1 if index($a[2], '-R=' . REQ_PREFIX) == 0 && $a[2] =~ /"[A-Z0-9]{10}"\z/ && arg_is_path($a[3]);
     }
     return 0;
 }
@@ -715,6 +876,7 @@ sub ungated_ok {
     my $ab = base_lc($cmd);
     my $rb = base_lc($res);
     return 0 unless $ALLOW{$ab} && $ALLOW{$rb};
+    return 0 if provider_word($ab) || provider_word($rb);
     return 0 if $LAUNCH{$rb};
     if ($rb eq 'git') { return (@args == 1 && $args[0] eq '--version') ? 1 : 0; }
     if ($rb eq 'codesign') {
@@ -722,7 +884,49 @@ sub ungated_ok {
         return 0 unless codesign_rooted($args[-1], $vdir);
         return 1;
     }
-    return args_mention_provider(@args) ? 0 : 1;
+    return 1;
+}
+
+# Probe tools (display only): exactly `jq --version` and `git --version`, nothing else. The tool must be a native executable in
+# a system or package-manager prefix (so a wrapper script or a copy in a user directory that happens to be first on PATH is
+# refused, never run), owned by this user or root and not writable by group or others.
+my @TOOL_PREFIXES = ('/bin/', '/usr/bin/', '/usr/sbin/', '/sbin/', '/usr/local/', '/opt/homebrew/');
+
+sub tool_file_ok {
+    my ($path) = @_;
+    return 0 unless defined $path && !has_ctl($path);
+    return 0 unless grep { index($path, $_) == 0 } @TOOL_PREFIXES;
+    my @l = lstat($path);
+    return 0 unless @l && S_ISREG($l[2]) && !S_ISLNK($l[2]);
+    return 0 unless $l[4] == 0 || $l[4] == $>;
+    return 0 if $l[2] & 022;
+    return 0 unless $l[2] & 0100;
+    my $fh = open_ro($path) or return 0;
+    my $head = '';
+    sysread($fh, $head, 2);
+    close $fh;
+    return 0 if substr($head, 0, 2) eq '#!';
+    return 1;
+}
+
+# tool_resolve(cmd) -> (verdict, path): ok | unresolved | refuse.
+sub tool_resolve {
+    my ($cmd) = @_;
+    return ('refuse') unless defined $cmd && ($cmd =~ /\A[A-Za-z0-9._+-]+\z/ || substr($cmd, 0, 1) eq '/') && $TOOLS{ base_lc($cmd) };
+    my $path = resolve_cmd($cmd);
+    return ('unresolved') unless defined $path;
+    return ('refuse') unless $TOOLS{ base_lc($path) };
+    return ('refuse') unless tool_file_ok($path);
+    return ('ok', $path);
+}
+
+# live_pinned_ok(vdir, cmd, resolved path) -> 0 if the command is named like a pinned CLI (claude, codex), by argv[0] or by the
+# resolved target, and is not the CURRENT registered, hash-verified copy (rule 6).
+sub live_pinned_ok {
+    my ($vdir, $cmd, $path) = @_;
+    return 1 unless pinned_name(base_lc($cmd)) || pinned_name(base_lc($path));
+    return 0 unless defined $vdir && $vdir ne '-';
+    return registry_ok($vdir, $path) ? 1 : 0;
 }
 
 # authorize(mode, vdir, cmd, args...) -> (verdict, path); verdict is ok | gate (needs SPIKE_LIVE) | unresolved | refuse.
@@ -730,26 +934,21 @@ sub authorize {
     my ($mode, $vdir, $cmd, @args) = @_;
     my $path = resolve_cmd($cmd);
     if ($mode eq 'live') {
-        return defined $path ? ('ok', $path) : ('unresolved');
+        return ('unresolved') unless defined $path;
+        return ('refuse') unless live_pinned_ok($vdir, $cmd, $path);
+        return ('ok', $path);
     }
     if ($mode eq 'ungated') {
         return ('unresolved') unless defined $path;
         return ungated_ok($path, $cmd, $vdir, @args) ? ('ok', $path) : ('gate', $path);
     }
     if ($mode eq 'tool') {
-        return ('refuse') unless defined $cmd && ($cmd =~ /\A[A-Za-z0-9._+-]+\z/ || substr($cmd, 0, 1) eq '/') && $TOOLS{ base_lc($cmd) };
-        return ('unresolved') unless defined $path;
-        return ('refuse') unless $TOOLS{ base_lc($path) };
-        return ('refuse') if args_mention_provider(@args);
-        # A probe never reads a CLI home: an argument that resolves to one (or to a hard-linked regular file, which could be
-        # a second name for a home file) is refused (rule 4).
-        for my $a (@args) {
-            next if !defined $a || $a =~ /\A-/ || $a eq '';
-            my $r = resolve_phys($a);
-            next unless $r;
-            return ('refuse') if path_refused($r);
-        }
-        return ('ok', $path);
+        # Exactly `<jq|git> --version`: no other argument can load a module (jq -L, import), define an alias (git -c) or name
+        # a file, so a probe can never read a CLI home or start another program (rules 1 and 4).
+        my ($v, $p) = tool_resolve($cmd);
+        return ($v) unless $v eq 'ok';
+        return ('refuse') unless @args == 1 && defined $args[0] && $args[0] eq '--version';
+        return ('ok', $p);
     }
     if ($mode eq 'status') {
         return ('refuse') unless defined $cmd && substr($cmd, 0, 1) eq '/' && defined $path;
@@ -776,10 +975,75 @@ sub cmd_gate {
 }
 
 # ---- the run: a new process group, an in-group watchdog ----------------------------------------------------------------------
+# child_home() -> the password-database home, or empty if the caller's HOME is set and is not that same directory (same device and
+# inode). Rule 2: a child never gets an alternate home; a run with a different HOME is refused instead (rc 125).
+sub child_home {
+    my $pw = account_home();
+    return unless defined $pw && length $pw && substr($pw, 0, 1) eq '/' && !has_ctl($pw);
+    my @ps = stat($pw);
+    return unless @ps;
+    my $h = $IN{HOME};
+    if (defined $h && length $h) {
+        return unless substr($h, 0, 1) eq '/' && !has_ctl($h);
+        my @hs = stat($h);
+        return unless @hs && ident(@hs) eq ident(@ps);
+    }
+    return $pw;
+}
+
+# open_outfile(path) -> a write handle, or empty (the reason goes to stderr). The file is opened O_WRONLY|O_CREAT|O_APPEND|
+# O_NOFOLLOW with mode 0600. Refused (rule 4): a symlink, a hard-linked file, a non-regular file (only the null device is
+# accepted, it discards), a file that is a CLI home entry, and any file whose parent directory is, or lies inside, a CLI home.
+sub open_outfile {
+    my ($f) = @_;
+    return unless defined $f && length $f && !has_ctl($f);
+    my ($dir, $base);
+    if ($f =~ m{\A(.*)/([^/]+)\z}s) { ($dir, $base) = ($1, $2); $dir = '/' unless length $dir; }
+    else { ($dir, $base) = (undef, $f); }
+    return if $base eq '.' || $base eq '..';
+    $CWD = Cwd::getcwd() unless defined $CWD;
+    my $pdir;
+    if (defined $dir) {
+        my $pr = resolve_phys($dir);
+        $pdir = $pr->{path} if $pr && $pr->{exists} && @{ $pr->{st} } && S_ISDIR($pr->{st}[2]);
+    } else {
+        $pdir = $CWD;
+    }
+    return unless defined $pdir;
+    my $pres = resolve_phys($pdir);
+    return unless $pres && $pres->{exists};
+    return if path_refused($pres);
+    my $full = ($pdir eq '/') ? "/$base" : "$pdir/$base";
+    my @nul = stat('/dev/null');
+    my @l = lstat($full);
+    my $is_null = 0;
+    if (@l) {
+        return if S_ISLNK($l[2]);
+        if (S_ISCHR($l[2])) {
+            return unless @nul && S_ISCHR($nul[2]) && $l[6] == $nul[6];
+            $is_null = 1;
+        } else {
+            return unless S_ISREG($l[2]) && $l[3] == 1;
+            my $fr = resolve_phys($full);
+            return if !$fr || path_refused($fr);
+        }
+    }
+    my $out;
+    sysopen($out, $full, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_NOCTTY, 0600) or return;
+    my @fs = stat($out);
+    my $good = 0;
+    if (@fs) {
+        if ($is_null)           { $good = (S_ISCHR($fs[2]) && @nul && $fs[6] == $nul[6]) ? 1 : 0; }
+        elsif (S_ISREG($fs[2])) { $good = ($fs[3] == 1 && (!@l || ident(@fs) eq ident(@l))) ? 1 : 0; }
+    }
+    unless ($good) { close $out; return; }
+    return $out;
+}
+
 sub child_env {
     my %e = (
         PATH   => def($IN{PATH},   '/usr/bin:/bin'),
-        HOME   => def($IN{HOME},   '/'),
+        HOME   => def(child_home(), '/'),
         TMPDIR => def($IN{TMPDIR}, '/tmp'),
         LANG   => def($IN{LANG},   'C'),
         TERM   => def($IN{TERM},   'dumb'),
@@ -859,6 +1123,8 @@ sub cmd_run {
     # The policy is enforced again here, in the process that executes.
     if ($mode eq 'live') {
         unless (defined $IN{LIVE} && $IN{LIVE} eq '1') { msg('run: live mode needs SPIKE_LIVE=1'); return 125; }
+        my ($v) = authorize('live', $vdir, $path, @args);
+        unless ($v eq 'ok') { msg('run: a pinned CLI name runs only as the current registered, hash-verified copy'); return 125; }
     } elsif ($mode eq 'ungated') {
         unless (ungated_ok($path, $path, $vdir, @args)) { msg('run: not ungated'); return 125; }
     } elsif ($mode eq 'status') {
@@ -870,8 +1136,10 @@ sub cmd_run {
     } else {
         return usage('run mode');
     }
-    my $out;
-    sysopen($out, $outfile, O_WRONLY | O_CREAT | O_APPEND, 0666) or do { msg("run: cannot open the output file: $!"); return 125; };
+    # Rule 2: the child's HOME is always the account's own home; a caller whose HOME is another directory is refused.
+    unless (defined child_home()) { msg('run: HOME is not the account home (the child never gets an alternate home)'); return 125; }
+    my $out = open_outfile($outfile);
+    unless ($out) { msg('run: the output file is refused (symlink, hard link, non-regular file, or inside a CLI home) or cannot be opened'); return 125; }
     my $orig_ppid = getppid();
     my %env = child_env();
 
@@ -957,10 +1225,19 @@ sub cmd_clihome {
     return path_refused($r) ? 0 : 1;
 }
 
-# tool-path <name> -> prints the physical path of a probe tool (jq, git, file) found on the caller's PATH.
+# clihome-new <path> -> like clihome, for a directory that may not exist yet (a capture or scratch root that mkdir -p will
+# create): 0 (refuse) if it would be, or lie inside, a CLI home, or cannot be resolved; 1 otherwise.
+sub cmd_clihome_new {
+    my ($p) = @_;
+    return 0 unless defined $p;
+    return under_cli_home_loose($p) ? 0 : 1;
+}
+
+# tool-path <name> -> prints the physical path of a probe tool (jq or git) found on the caller's PATH, if it passes the tool
+# identity checks (a native executable in a system or package-manager prefix); rc 1 otherwise.
 sub cmd_tool_path {
     my ($name) = @_;
-    my ($v, $path) = authorize('tool', '-', $name);
+    my ($v, $path) = tool_resolve($name);
     return 1 unless $v eq 'ok';
     print "$path\n";
     return 0;
@@ -974,9 +1251,12 @@ sub main {
     }
     %ENV = ();
     return usage('runner.pl <subcommand> ...') unless defined $sub;
+    # Fail closed: without a usable compliance/denylist.txt no operation of this helper runs.
+    unless (denylist_ok()) { msg(DENY_FAIL_MSG); return DENY_FAIL_RC; }
     return cmd_resolve(@a)    if $sub eq 'resolve';
     return cmd_magic(@a)      if $sub eq 'magic';
     return cmd_clihome(@a)    if $sub eq 'clihome';
+    return cmd_clihome_new(@a) if $sub eq 'clihome-new';
     return cmd_tool_path(@a)  if $sub eq 'tool-path';
     return cmd_gate(@a)       if $sub eq 'gate';
     return cmd_run(@a)        if $sub eq 'run';

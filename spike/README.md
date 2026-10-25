@@ -24,8 +24,27 @@ most Linux have it; only core modules are used).
     Ungated only when that resolved path is in `/bin`, `/usr/bin`, `/usr/sbin` or `/sbin`. A copy of any of those names in
     another directory, a relative path such as `./x`, a launcher, and every provider CLI (claude, codex, grok, gemini,
     kimi) needs the gate, whatever its name.
-    `jq`, `file` and `cat` are not on the list. `spike_run_timed` probes `jq`, `git` and `file` (display only, never with a
-    provider name in the arguments) with the same closed environment and watchdog.
+    `jq`, `file` and `cat` are not on the list. The words in the **arguments** of those ungated system commands (echo or
+    printf text, a path under a directory called `claude`) are not examined: identity is enforced, so they cannot launch
+    anything. A provider word in the **program name** (argv[0] or the resolved target) is never ungated.
+  - **`spike_run_timed` runs exactly `jq --version` or `git --version` and nothing else** (no other argument at all; `file`
+    is gone). The tool must be a native executable (not a `#!` script), owned by you or root and not group/world writable,
+    in `/bin /usr/bin /usr/sbin /sbin /usr/local /opt/homebrew`. A wrapper or copy first on `PATH` is refused and never run
+    (preflight then reports the tool MISSING and exits 1). The closed environment and watchdog are the same as for every run.
+  - **A pinned CLI name runs live only as the registered copy.** `spike_run_live` (and `spike_run_timeout` after its gate)
+    refuses, rc 3 and the script stops, a command whose basename or resolved basename is `claude` or `codex` (also
+    `claude.exe`, `claude-real`) unless it is the current registered, hash-verified copy (`$SPIKE_VERIFIED_COPY`).
+    `SPIKE_LIVE=1` does not lift that (rule 6). A renamed copy under another name cannot be recognised by name.
+  - **A run needs `HOME` to be the account home.** The child's `HOME` is always the password-database home. If the caller's
+    `HOME` is set and is not that directory (same device and inode) the run is refused with rc 125 and nothing starts.
+  - **The output file is opened `O_WRONLY|O_CREAT|O_APPEND|O_NOFOLLOW`, mode 0600.** A symlink, a hard-linked file, a
+    non-regular file (a FIFO, a directory; only `/dev/null` is accepted), a CLI home entry, and any file whose parent
+    resolves inside a CLI home are refused with rc 125 before the command starts.
+  - **Exit-code collisions.** The helper's own codes share numbers with a command's own exit status: 121 the CLI-home
+    denylist is unusable (nothing runs), 124 timeout, 125 refused at exec time (HOME, outfile or policy), 126 cannot
+    execute, 127 not found, 143/130/129 stopped by TERM/INT/HUP, 3 refused by the gate (the calling script is stopped), 2
+    usage. A command that itself exits with one of those numbers is indistinguishable by status alone; callers that must
+    tell them apart check the output file. These codes are kept on purpose.
   - **`spike_run_status` runs only the private copy that registration produced** (`$SPIKE_VERIFIED_COPY`), only while its
     content still has the sha256 recorded at registration, and only `--version`, `auth status` or `login status`. Any other
     path, a changed copy, and any other shape is refused (rc 3, nothing started). `SPIKE_LIVE=1` does not lift that refusal.
@@ -44,22 +63,28 @@ most Linux have it; only core modules are used).
   the watchdog is in the command's group and not in the caller's, **a SIGKILL to the caller, or to the caller's whole process
   group, cannot orphan the command**, and a SIGKILL to the helper's own group kills the command with it. The one case that
   can leave a command running is a SIGKILL sent to the helper process alone, by its pid (nothing is left to sweep): do not
-  do that. A command that exits but leaves children behind is swept. Timeouts are digits only, read as decimal (`08` and
+  do that. The `codesign` the helper starts for registration is watched the same way: TERM/INT/HUP to the helper, or the death of its direct parent, kills its group (no orphan under init). A command that exits but leaves children behind is swept. Timeouts are digits only, read as decimal (`08` and
   `010` are 8 and 10, never octal), 1 to 3600. Children get stdin from `/dev/null` and write to the outfile. They are not
   in a new session, so a CLI that opens the terminal device is out of scope: the spikes are headless only (rule 3).
 - **Binaries are verified before they are executed; registration checks identity, not strings.** `preflight.sh` asks the
   helper to look the CLI up on `PATH` and resolve it once, physically. The helper compares the **device and inode** of every
-  directory on the path and of the file against the CLI homes (the seven rule-4 entries) of both the account's
+  directory on the path and of the file against the CLI homes of both the account's
   password-database home and an absolute `$HOME`, so a symlink, a `..` spelling, a hard link, a case-insensitive spelling or a
-  firmlink cannot hide a home, and an `HOME` pointed away never lifts the check. A path inside a CLI home is never read,
-  except the provider binary itself, whose first four bytes are checked for a Mach-O magic (the ratified narrow exception).
+  firmlink cannot hide a home, and an `HOME` pointed away never lifts the check. **The list of CLI homes is the lead-owned
+  `compliance/denylist.txt`**, read at run time by `lib/runner.pl` (found from its own physical path, opened `O_NOFOLLOW`,
+  regular file; one `^\.[A-Za-z0-9._-]+$` entry per line, `#` comments, blank lines). If it is missing, empty or malformed
+  every operation is refused with rc 121 and one fixed message (fail closed). A path inside a CLI home is never read,
+  except the provider binary itself (the ratified narrow exception): it is lstat-ed first and must be a regular file with
+  the owner-execute bit and at least 1 MiB (credential files are small and 0600), else it is refused without being opened;
+  then the helper reads the magic, and for a Mach-O copies the whole binary (it IS the vendor binary) for verification.
+  Capture roots, scratch roots and the verify-directory parent inside a CLI home (also one that does not exist yet) are refused.
   A hard-linked file is refused before any read. The file is opened **once** (`O_NOFOLLOW`), checked with `fstat`, and a
   Mach-O is copied **from that descriptor** into a private directory (mode 700, `spike-verify.<id>` under the temporary
   directory, removed on exit) that the helper itself creates; `spike_verify_dir` only reads its name, nothing can point it
   elsewhere, and the helper re-validates it (owner, mode, name, not inside a CLI home) on every use. A stale one left by a
   killed run is swept at start. A temporary directory that others can write without the sticky bit, or that lies inside a CLI
   home, stops preflight (exit 1, needs human review). The COPY is checked with the fixed `codesign` (`--verify --strict`,
-  a `Developer ID Application` authority, the pinned team identifier for that CLI, and an `anchor apple generic` requirement
+  a `Developer ID Application` authority, the pinned team identifier for that CLI, and an `anchor apple generic` requirement that also demands the Developer ID Application leaf OID `1.2.840.113635.100.6.1.13` (Apple-documented; not run against a real `codesign` in this Linux sandbox)
   for that team); its sha256 is recorded, and `spike_run_status` re-hashes it before it executes it. Ad-hoc, unsigned,
   wrong-team, forged, non-Mach-O and script files are reported (`skipped (unverified)`) and never executed. A script
   launcher is never executed either: its SIGNATURE cell says `launcher only, not executed (needs human approval)`. A copy that

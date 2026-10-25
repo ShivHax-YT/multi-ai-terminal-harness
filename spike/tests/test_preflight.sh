@@ -66,8 +66,10 @@ EOF
 }
 for t in bash env perl jq git sed awk tr cut head cat grep sleep touch ls dirname ln chmod mkdir rm mv cp mktemp kill ps; do trip_add "$(command -v "$t")"; done
 
+MAIN_PID="${BASHPID:-$$}"
 finish() {
   local rc=$? viol=0
+  [ "${BASHPID:-$$}" = "$MAIN_PID" ] || return 0   # a forked subshell signalled before it execs must not remove the sandbox
   trip_check
   local trc=$?
   if [ -s "$VIOLATIONS" ]; then viol=1; printf 'FAIL the sandbox guard refused a write:\n'; cat "$VIOLATIONS"; fi
@@ -132,13 +134,21 @@ mkwrap() {
   printf '#!/bin/sh\nexec %s "$@"\n' "$real" | sbx_put "$1/$2"
   chmod +x "$1/$2"
 }
+# mklink <bindir> <tool>: jq and git are NATIVE tools and the tool policy refuses a script, so they are symlinks to the host tool
+# (made with sbx_ln: it replaces the link itself and never writes through one). The tripwire remembers their hashes.
+mklink() {
+  local real
+  real="$(command -v "$2")" || return 0
+  trip_add "$real"
+  sbx_ln "$real" "$1/$2"
+}
 # mkbin <dir> [with-jq] [with-git]: private bin dir with wrapper scripts for the helper tools.
 mkbin() {
   local d="$1" t
   sbx_mkdir "$d"
   for t in $TOOLS; do mkwrap "$d" "$t"; done
-  if [ "${2:-yes}" = yes ]; then mkwrap "$d" jq; fi
-  if [ "${3:-yes}" = yes ]; then mkwrap "$d" git; fi
+  if [ "${2:-yes}" = yes ]; then mklink "$d" jq; fi
+  if [ "${3:-yes}" = yes ]; then mklink "$d" git; fi
 }
 
 sbx_mkdir "$SANDBOX/home"
@@ -149,14 +159,18 @@ sbx_mkdir "$SANDBOX/home"
 CS="$SANDBOX/fakebin/codesign"
 sbx_mkdir "$SANDBOX/fakebin" "$SANDBOX/spike/lib"
 sbx_cp "$COMMON_REAL" "$SANDBOX/spike/lib/common.sh"
-sed "s|^use constant CODESIGN_BIN => .*|use constant CODESIGN_BIN => \"$CS\";|" "$RUNNER_REAL" | sbx_put "$SANDBOX/spike/lib/runner.pl"
+# Round 8: runner.pl reads compliance/denylist.txt from the repo layout around its own physical path, and a run needs HOME to be
+# the account home. The sandbox copy therefore carries a copy of the denylist and a one-line account_home pointing at $SANDBOX/home.
+sbx_mkdir "$SANDBOX/compliance" "$SANDBOX/home"
+sbx_put "$SANDBOX/compliance/denylist.txt" < "$HERE/../../compliance/denylist.txt"
+sed -e "s|^use constant CODESIGN_BIN => .*|use constant CODESIGN_BIN => \"$CS\";|" -e "s|^sub account_home .*|sub account_home { return \"$SANDBOX/home\"; }|" "$RUNNER_REAL" | sbx_put "$SANDBOX/spike/lib/runner.pl"
 sbx_cp "$PREFLIGHT" "$SANDBOX/spike/preflight.sh"
 PREFLIGHT_UT="$SANDBOX/spike/preflight.sh"
 has "the shipped runner.pl keeps the fixed codesign path" "$(cat "$RUNNER_REAL")" 'use constant CODESIGN_BIN => "/usr/bin/codesign";'
 lacks "the shipped common.sh defines no codesign constant" "$(cat "$COMMON_REAL")" "readonly CODESIGN_BIN"
 lacks "the shipped preflight.sh defines no codesign constant of its own" "$(cat "$PREFLIGHT")" "CODESIGN_BIN="
 has "the sandbox runner.pl points the codesign constant at the fake" "$(cat "$SANDBOX/spike/lib/runner.pl")" "use constant CODESIGN_BIN => \"$CS\";"
-eq "the sandbox runner.pl differs from the shipped one only in the codesign constant (2 changed lines)" "2" "$(diff "$RUNNER_REAL" "$SANDBOX/spike/lib/runner.pl" | grep -c '^[<>]')"
+eq "the sandbox runner.pl differs from the shipped one only in the codesign constant and the one-line account_home (4 changed lines)" "4" "$(diff "$RUNNER_REAL" "$SANDBOX/spike/lib/runner.pl" | grep -c '^[<>]')"
 eq "the sandbox common.sh is the shipped common.sh" "" "$(diff "$COMMON_REAL" "$SANDBOX/spike/lib/common.sh")"
 eq "preflight.sh starts with the /bin/bash shebang" "#!/bin/bash" "$(head -n 1 "$PREFLIGHT")"
 
@@ -247,7 +261,7 @@ has "scenario 1: claude was run with auth status" "$(cat "$LOG1")" "claude auth 
 has "scenario 1: codex was run with login status" "$(cat "$LOG1")" "codex login status"
 has "scenario 1: the commands ran from the private copy directory (not the original)" "$(cat "$LOG1")" "$SANDBOX/spike-verify."
 lacks "scenario 1: the original path was never executed" "$(cat "$LOG1")" "$B1/claude"
-has "scenario 1: the chain-to-Apple requirement for the pinned team was checked" "$(cat "$SANDBOX/codesign1.log")" 'anchor apple generic and certificate leaf[subject.OU] = "Q6L2SF6YDW"'
+has "scenario 1: the chain-to-Apple requirement for the pinned team was checked" "$(cat "$SANDBOX/codesign1.log")" 'anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "Q6L2SF6YDW"'
 lacks "scenario 1: no prompt was ever sent" "$(cat "$LOG1")" " -p "
 lacks "scenario 1: no exec subcommand was run" "$(cat "$LOG1")" "codex exec"
 eq "scenario 1: the private copy directory is removed on exit" "" "$(ls -d "$SANDBOX"/spike-verify.* 2>/dev/null)"
@@ -485,6 +499,9 @@ echo "RAN9B \$0 \$*" >> "$LOG9B"
 case "\$1" in --version) echo "v8.8.8"; exit 0 ;; esac
 exit 0
 EOF
+# Round 8, item 7: a binary inside a CLI home must look like a vendor binary BEFORE it is opened (regular, owner-execute, >= 1 MiB),
+# so this fixture is padded past 1 MiB (zero bytes after its "exit 0", never reached).
+head -c 1100000 /dev/zero >> "$SANDBOX/home/.claude/bin/claude-real"
 sbx_ln "$SANDBOX/home/.claude/bin/claude-real" "$B9B/claude"
 OUT9B="$(run_preflight "$B9B")"
 has "scenario 8b: the Mach-O provider binary inside a CLI home is allowed (kind mach-o)" "$(row "$OUT9B" claude)" "mach-o"
@@ -633,25 +650,40 @@ n=0
 while [ -n "$P13" ] && kill -0 "$P13" 2>/dev/null && [ "$n" -lt 30 ]; do sleep 0.1; n=$((n + 1)); done
 if [ -n "$P13" ] && kill -0 "$P13" 2>/dev/null; then bad "scenario 13: the command started by the run is gone after TERM"; kill -9 "$P13" 2>/dev/null; else ok "scenario 13: the command started by the run is gone after TERM"; fi
 
-# Scenario 14 (Opus finding 10): jq and git are probed with the closed environment, not the caller's.
+# Scenario 14 (round 8, item 1; replaces the round-7 scenario that ran a fake jq from PATH and read its environment): a jq
+# or git WRAPPER first on PATH is refused and never started, so preflight reports the tool as missing (exit 1). The closed
+# child environment is proven for every run mode by the "closed set" tests of test_common.sh.
 B14="$SANDBOX/b14"
 mkbin "$B14" no yes
-ENVLOG="$SANDBOX/jq14.env"
 sbx_put "$B14/jq" <<EOF
 #!/bin/sh
-/usr/bin/env > "$ENVLOG"
+touch "$SANDBOX/jq14-ran"
 echo "jq-1.7-fake"
 EOF
 chmod +x "$B14/jq"
 mkcodesign "$CS" good
-OUT14="$(env -i PATH="$B14" HOME="$SANDBOX/home" TMPDIR="$SANDBOX" USER=tester LOGNAME=tester FOO_API_KEY=k1 FOO_HOME=/h BAR_TOKEN=t2 PERL5OPT=-MFoo SPIKE_LIVE=1 /bin/bash "$PREFLIGHT_UT" 2>&1)"
-has "scenario 14: the jq probe ran and its version is shown" "$(row "$OUT14" jq)" "jq-1.7-fake"
-lacks "scenario 14: the jq probe saw no API-key variable" "$(cat "$ENVLOG")" "FOO_API_KEY"
-lacks "scenario 14: the jq probe saw no home-like variable" "$(cat "$ENVLOG")" "FOO_HOME"
-lacks "scenario 14: the jq probe saw no token variable" "$(cat "$ENVLOG")" "BAR_TOKEN"
-lacks "scenario 14: the jq probe saw no PERL5OPT" "$(cat "$ENVLOG")" "PERL5OPT"
-lacks "scenario 14: the jq probe saw no SPIKE_LIVE" "$(cat "$ENVLOG")" "SPIKE_LIVE"
-has "scenario 14: the jq probe saw the closed set (PATH)" "$(cat "$ENVLOG")" "PATH="
+OUT14="$(env -i PATH="$B14" HOME="$SANDBOX/home" TMPDIR="$SANDBOX" USER=tester LOGNAME=tester SPIKE_LIVE=1 /bin/bash "$PREFLIGHT_UT" 2>&1)"
+eq "scenario 14: a jq wrapper script on PATH makes preflight exit 1 (the tool is refused)" "1" "$?"
+has "scenario 14: the jq row says MISSING" "$(row "$OUT14" jq)" "MISSING"
+lacks "scenario 14: the wrapper's output is never shown" "$OUT14" "jq-1.7-fake"
+if [ -e "$SANDBOX/jq14-ran" ]; then bad "scenario 14: the jq wrapper was never started"; else ok "scenario 14: the jq wrapper was never started"; fi
+has "scenario 14: git (a native tool in a system prefix) is still probed" "$(row "$OUT14" git)" "git version"
+
+# Scenario 15 (round 8, item 6): a caller whose HOME is not the account home gets no child run at all (rc 125 from the helper);
+# preflight still prints its report and registers nothing as running.
+B15="$SANDBOX/b15"
+mkbin "$B15"
+MARK15="$SANDBOX/marker15"
+mkmacho "$B15/claude" <<EOF
+touch "$MARK15"
+exit 0
+EOF
+mkcodesign "$CS" good
+sbx_mkdir "$SANDBOX/elsewhere"
+OUT15="$(env -i PATH="$B15" HOME="$SANDBOX/elsewhere" TMPDIR="$SANDBOX" USER=tester LOGNAME=tester /bin/bash "$PREFLIGHT_UT" 2>&1)"
+if [ -e "$MARK15" ]; then bad "scenario 15: the CLI was not run with HOME pointed away"; else ok "scenario 15: the CLI was not run with HOME pointed away"; fi
+has "scenario 15: the report still lists claude" "$(row "$OUT15" claude)" "claude"
+has "scenario 15: the refused run shows rc=125 (not a version, not signed in)" "$(row "$OUT15" claude)" "rc=125"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
