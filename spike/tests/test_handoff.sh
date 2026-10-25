@@ -18,6 +18,15 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/handoff-test.XXXXXX") || exit 2
 trap 'rm -rf "$TMP"' EXIT
 TMP=$(cd "$TMP" && pwd -P) || exit 2
 
+# Test seams (the lax Encode stub, the lstat override) need PERL5OPT and PERL5LIB, which the real parser scrubs from
+# every perl call. They run from a sandbox copy of the parser, made from the real file with only the scrub prefix
+# removed (round 6). The copy is checked against the real file in the scrub tests.
+SCRUB_PREFIX='env -u PERL5OPT -u PERL5LIB -u PERLLIB -u PERL5DB -u PERL_UNICODE '
+SEAM_DIR="$TMP/seam"
+mkdir -p "$SEAM_DIR"
+sed "s/$SCRUB_PREFIX//g" "$PARSE" >"$SEAM_DIR/parse.sh"
+SEAM="$SEAM_DIR/parse.sh"
+
 PASS=0
 FAIL=0
 pass() { PASS=$((PASS + 1)); }
@@ -325,7 +334,7 @@ check "marker file still absent after all assertions" test ! -e "$MARKER"
 # 3) hostile file name: handled as data too
 cd "$scratch" || exit 2
 hostile="$TMP"'/$(touch pwned-name)`touch pwned-name`.md'
-cp "$FIX/good.md" "$hostile"
+cat "$FIX/good.md" >"$hostile"
 run_parse "$hostile"
 eq "hostile file name parses" "$RC" "0"
 eq "hostile file name did not execute" "$(ls -A "$scratch" | wc -l | tr -d ' ')" "0"
@@ -361,7 +370,7 @@ ESC_SUM=$'\033[2J\033]0;pwn\007 clear screen'
 mk "$ESC_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$TMP/esc-payload.md"
 dashdir="$TMP/dash"
 mkdir -p "$dashdir"
-for n in -n.md -q.md -e.md; do cp "$TMP/esc-payload.md" "$dashdir/$n"; done
+for n in -n.md -q.md -e.md; do cat "$TMP/esc-payload.md" >"$dashdir/$n"; done
 for n in -n.md -q.md -e.md; do
   expect_named_fail "ESC in file named $n (after --)" "$dashdir" "$n" "control character" --
   # round 5: "./" is a '.' component and is refused, so the ESC assertion for this name uses its absolute path
@@ -373,7 +382,7 @@ run_named "$dashdir" "-n.md"
 eq "option-looking name without -- is a usage error" "$RC" "2"
 eq "usage error leaves stdout empty" "$OUT" ""
 # a valid handoff with a dash name parses with -- and ./
-cp "$FIX/good.md" "$dashdir/-g.md"
+cat "$FIX/good.md" >"$dashdir/-g.md"
 run_named "$dashdir" "-g.md" --
 eq "good handoff named -g.md parses after --" "$RC" "0"
 run_named "$dashdir" "$dashdir/-g.md"
@@ -391,10 +400,10 @@ assigndir="$TMP/assign"
 mkdir -p "$assigndir"
 for n in max=1 max=99999999; do
   mkd "assign-src" "$(printf '%2100s' '' | tr ' ' q)" >/dev/null
-  cp "$TMP/assign-src.md" "$assigndir/$n"
+  cat "$TMP/assign-src.md" >"$assigndir/$n"
   expect_named_fail "2100-byte line in file named $n" "$assigndir" "$n" "line too long"
 done
-cp "$FIX/good.md" "$assigndir/max=1"
+cat "$FIX/good.md" >"$assigndir/max=1"
 run_named "$assigndir" "max=1"
 eq "good handoff named max=1 parses" "$RC" "0"
 
@@ -598,7 +607,7 @@ eq "relative path through a symlinked parent is refused (rc)" "$?" "1"
 eq "relative path through a symlinked parent: nothing copied" "$(count_tmp)" "0"
 
 # a '..' component is refused: bash resolves it lexically, so it could hide a symlinked directory
-cp "$FIX/good.md" "$r4/sandbox/good.md"
+cat "$FIX/good.md" >"$r4/sandbox/good.md"
 run_tmp "$r4/sandbox/../sandbox/good.md" "$r4/sandbox"
 eq "a '..' component in the input path is refused (rc)" "$RC" "1"
 check "a '..' component: the message names the rule" grep -q "must not contain a '..' component" "$TMP/err"
@@ -613,7 +622,7 @@ check "hard-linked file: message says hard link not allowed" test "${ERR#*hard l
 eq "hard-linked file: nothing copied to TMPDIR" "$(count_tmp)" "0"
 eq "hard-linked file: nothing on stdout" "$(cat "$TMP/out")" ""
 if grep -q CANARY-HARDLINK "$TMP/out" "$TMP/err"; then fail "hard-linked file: canary text leaked into output"; else pass; fi
-cp "$FIX/good.md" "$r4/sandbox/one.md"
+cat "$FIX/good.md" >"$r4/sandbox/one.md"
 ln "$r4/sandbox/one.md" "$r4/sandbox/two.md"
 run_tmp "$r4/sandbox/two.md" "$r4/sandbox"
 eq "a hard link whose other name is also inside the sandbox is refused (rc)" "$RC" "1"
@@ -776,15 +785,18 @@ check "a valid file inside the root gives JSON" jq -e . "$TMP/out"
 (cd "$TMP" && TMPDIR="$tdir" "$SH" "$PARSE" --root "$r4" "sandbox/good.md" >"$TMP/out" 2>"$TMP/err" </dev/null)
 eq "a relative path is relative to the root, not the working directory (rc 0)" "$?" "0"
 
-# a root given as a symlink is resolved once, with pwd -P: absolute inputs must use the physical path
+# round 6 (changed from round 5): a root given as a symlink is WALKED and refused, not resolved with pwd -P. Its physical
+# path and its logical path are both refused, and so is a relative input through it.
 ln -s "$r4/sandbox" "$TMP/rootlink"
 run_tmp "$r4/sandbox/good.md" "$TMP/rootlink"
-eq "root given as a symlink: an input under its physical path passes (rc 0)" "$RC" "0"
+eq "root given as a symlink: an input under its physical path is outside that root (rc 1)" "$RC" "1"
+check "root given as a symlink: the physical input gives outside root" grep -q 'outside root' "$TMP/err"
 run_tmp "$TMP/rootlink/good.md" "$TMP/rootlink"
-eq "root given as a symlink: an input under the logical path is outside the root (rc 1)" "$RC" "1"
-check "root given as a symlink: the logical path gives outside root" grep -q 'outside root' "$TMP/err"
+eq "root given as a symlink: an input under the logical path is refused (rc 1)" "$RC" "1"
+check "root given as a symlink: the logical path gives symlink not allowed" grep -q 'symlink not allowed' "$TMP/err"
 (cd "$TMP" && TMPDIR="$tdir" "$SH" "$PARSE" --root "$TMP/rootlink" "good.md" >"$TMP/out" 2>"$TMP/err" </dev/null)
-eq "root given as a symlink: a relative input resolves in the physical root (rc 0)" "$?" "0"
+eq "root given as a symlink: a relative input is refused too (rc 1)" "$?" "1"
+eq "root given as a symlink: nothing copied to TMPDIR" "$(count_tmp)" "0"
 
 # hard links are refused by the lstat, before the open (the message says so)
 ln "$r4/outside/secret.txt" "$r4/sandbox/hard2.md"
@@ -853,8 +865,8 @@ sub decode {
 }
 1;
 PM
-expect_shim_fail() { # <desc> <file> <substring>: the parser with the lax stub on PERL5LIB
-  PERL5LIB="$shim" "$SH" "$PARSE" --root "$TMP" "$2" >"$TMP/out" 2>"$TMP/err" </dev/null
+expect_shim_fail() { # <desc> <file> <substring>: the sandbox copy of the parser with the lax stub on PERL5LIB (round 6)
+  PERL5LIB="$shim" "$SH" "$SEAM" --root "$TMP" "$2" >"$TMP/out" 2>"$TMP/err" </dev/null
   local rc=$?
   ERR=$(cat "$TMP/err")
   if [ "$rc" -ne 1 ]; then fail "$1: expected exit 1, got $rc ($ERR)"
@@ -866,7 +878,7 @@ for hex in $nc_all; do
   expect_shim_fail "noncharacter U+$hex is refused by the regular expression alone" "$(mkd "ncs$hex" "x$(utf8_of "$hex")y")" "a noncharacter code point is refused"
 done
 mkd shimok >/dev/null
-PERL5LIB="$shim" "$SH" "$PARSE" --root "$TMP" "$TMP/shimok.md" >/dev/null 2>&1
+PERL5LIB="$shim" "$SH" "$SEAM" --root "$TMP" "$TMP/shimok.md" >/dev/null 2>&1
 eq "with the lax stub a valid handoff still parses (rc 0)" "$?" "0"
 for hex in FDCF FDF0 FFFD 1FFFD; do
   expect_ok "U+$hex (next to the noncharacters, not one) is accepted" "$(mkd "nm$hex" "x$(utf8_of "$hex")y")"
@@ -893,6 +905,7 @@ expect_internal "a failing wc (size check) is exit 3" "$TMP/fake-wc"
 # PERL5OPT) to report a real directory, while sub is in fact a symlink to an outside directory. That is the outcome
 # of a lost race. The walk enters the outside directory, its identity differs from the lstat, and it must refuse
 # before reading anything. Without the comparison, the outside canary would be read.
+# Round 6: the lie runs through the sandbox copy (SEAM), where PERL5OPT is not scrubbed.
 LIE="$TMP/lie"
 mkdir -p "$LIE/root" "$LIE/real-sub" "$LIE/outside" "$LIE/lib"
 mk "LIE-CANARY-OUTSIDE" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$LIE/outside/handoff.md"
@@ -911,12 +924,12 @@ no strict 'refs';
 1;
 PM
 HANDOFF_TEST_LIE_NAME=sub HANDOFF_TEST_LIE_AS="$LIE/real-sub" PERL5OPT="-I$LIE/lib -MLieStat" \
-  "$SH" "$PARSE" --root "$LIE/root" "$LIE/root/sub/handoff.md" >"$TMP/out" 2>"$TMP/err" </dev/null
+  "$SH" "$SEAM" --root "$LIE/root" "$LIE/root/sub/handoff.md" >"$TMP/out" 2>"$TMP/err" </dev/null
 eq "a parent swapped after its lstat is refused (rc 1)" "$?" "1"
 check "a swapped parent: the message says the path changed while it was resolved" grep -q 'input path changed while it was being resolved' "$TMP/err"
 eq "a swapped parent: stdout empty" "$(cat "$TMP/out")" ""
 if grep -q LIE-CANARY-OUTSIDE "$TMP/out" "$TMP/err"; then fail "a swapped parent: the outside canary was read"; else pass; fi
-PERL5OPT="-I$LIE/lib -MLieStat" "$SH" "$PARSE" --root "$LIE/root" "$LIE/root/sub/handoff.md" >/dev/null 2>"$TMP/err"
+PERL5OPT="-I$LIE/lib -MLieStat" "$SH" "$SEAM" --root "$LIE/root" "$LIE/root/sub/handoff.md" >/dev/null 2>"$TMP/err"
 eq "control: without the lie the symlinked parent is refused at the lstat (rc 1)" "$?" "1"
 check "control: the message names the symlinked parent" grep -q 'a parent directory of the input is a symbolic link' "$TMP/err"
 
@@ -955,6 +968,236 @@ done
 kill "$swap_pid" 2>/dev/null
 wait "$swap_pid" 2>/dev/null
 eq "race: 200 runs against a swapped parent directory, none printed the outside canary" "$race_bad" "0"
+
+# ---- round 6: the root is walked (no symlink in it), empty and relative roots, same device, CLI homes, env scrub -----------
+m6="$TMP/r6"
+mkdir -p "$m6/swap/real-root" "$m6/mid" "$m6/outside/sub" "$m6/probe/root" "$m6/probe/outside/moved" "$m6/home" "$m6/realdir"
+eq "round 6: the temp dir starts empty" "$(count_tmp)" "0"
+
+# roots that are usage errors (exit 2): empty, blank, relative, and with a '.' or '..' component
+"$SH" "$PARSE" --root "" "$FIX/good.md" >"$TMP/out" 2>"$TMP/err"
+eq "--root \"\" is a usage error (rc 2)" "$?" "2"
+check "--root \"\" names --root" grep -q -- '--root' "$TMP/err"
+eq "--root \"\" stdout empty" "$(cat "$TMP/out")" ""
+"$SH" "$PARSE" --root "   " "$FIX/good.md" >/dev/null 2>&1
+eq "a whitespace-only --root is a usage error (rc 2)" "$?" "2"
+(cd "$FIX" && "$SH" "$PARSE" --root . good.md >/dev/null 2>&1)
+eq "a relative --root is a usage error (rc 2)" "$?" "2"
+"$SH" "$PARSE" --root "$r4/./sandbox" "$r4/sandbox/good.md" >/dev/null 2>&1
+eq "a '.' component in --root is a usage error (rc 2)" "$?" "2"
+"$SH" "$PARSE" --root "$r4/../r4/sandbox" "$r4/sandbox/good.md" >/dev/null 2>&1
+eq "a '..' component in --root is a usage error (rc 2)" "$?" "2"
+
+# root swap: the root directory is moved aside and its path becomes a symlink to an outside directory with a valid
+# handoff in it. The root is walked, so both the relative and the absolute input are refused before anything is read.
+mk "SWAP-REAL" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$m6/swap/real-root/handoff.md"
+mk "SWAP-CANARY" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$m6/outside/handoff.md"
+mv "$m6/swap/real-root" "$m6/swap/moved-root"
+ln -s "$m6/outside" "$m6/swap/root"
+(cd "$m6/swap" && TMPDIR="$tdir" "$SH" "$PARSE" --root "$m6/swap/root" "handoff.md" >"$TMP/out" 2>"$TMP/err" </dev/null)
+eq "root swap: a relative input through a symlinked root is refused (rc 1)" "$?" "1"
+check "root swap (relative): symlink not allowed" grep -q 'symlink not allowed' "$TMP/err"
+TMPDIR="$tdir" "$SH" "$PARSE" --root "$m6/swap/root" "$m6/swap/root/handoff.md" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "root swap: an absolute input through a symlinked root is refused (rc 1)" "$?" "1"
+check "root swap (absolute): symlink not allowed" grep -q 'symlink not allowed' "$TMP/err"
+TMPDIR="$tdir" "$SH" "$PARSE" --root "$m6/swap/moved-root" "$m6/swap/root/handoff.md" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "root swap: the input through the replaced path is outside the moved root (rc 1)" "$?" "1"
+check "root swap (moved root): outside root" grep -q 'outside root' "$TMP/err"
+if grep -q 'SWAP-CANARY' "$TMP/out" "$TMP/err"; then fail "root swap: the outside file was read"; else pass; fi
+eq "root swap: nothing copied to TMPDIR" "$(count_tmp)" "0"
+
+# a symlink in the middle of the root path is refused as well
+mk "MID-CANARY" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$m6/outside/sub/handoff.md"
+ln -s "$m6/outside" "$m6/mid/link"
+TMPDIR="$tdir" "$SH" "$PARSE" --root "$m6/mid/link/sub" "$m6/mid/link/sub/handoff.md" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "a symlink in the middle of the root path is refused (rc 1)" "$?" "1"
+check "middle symlink: symlink not allowed" grep -q 'symlink not allowed' "$TMP/err"
+if grep -q 'MID-CANARY' "$TMP/out" "$TMP/err"; then fail "middle symlink: canary read"; else pass; fi
+eq "middle symlink: nothing copied to TMPDIR" "$(count_tmp)" "0"
+
+# trailing slashes and doubled slashes in the root are harmless
+run_tmp "$r4/sandbox/good.md" "$r4/sandbox/"
+eq "root with a trailing slash (rc 0)" "$RC" "0"
+run_tmp "$r4/sandbox/good.md" "$r4//sandbox//"
+eq "root with doubled slashes (rc 0)" "$RC" "0"
+run_tmp "$r4/sandbox/good.md" "/$r4/sandbox"
+eq "root with a leading doubled slash (rc 0)" "$RC" "0"
+(cd "$r4/sandbox" && TMPDIR="$tdir" "$SH" "$PARSE" --root "$r4/sandbox/" good.md >"$TMP/out" 2>"$TMP/err" </dev/null)
+eq "root with a trailing slash, relative input (rc 0)" "$?" "0"
+
+# "/" as the root. An input on the same device passes; on another device it is refused.
+if [ "$("$REAL_PERL" -e 'print((stat "/")[0] == (stat $ARGV[0])[0] ? 1 : 0)' "$FIX")" = 1 ]; then
+  run_tmp "$FIX/good.md" "/"
+  eq "/ as the root: an input on the same device passes (rc 0)" "$RC" "0"
+  check "/ as the root gives JSON" jq -e . "$TMP/out"
+else
+  printf 'NOTE: %s is on another device than /; the same-device pass case is replaced by the refusal case\n' "$FIX"
+  run_tmp "$FIX/good.md" "/"
+  eq "/ as the root, input on another device: refused (rc 1)" "$RC" "1"
+  check "/ as the root, another device: crosses a mount" grep -q 'crosses a mount' "$TMP/err"
+fi
+
+# same device: /proc is another device than /, so an input there is refused under --root /
+if [ -r /proc/self/status ]; then
+  run_tmp /proc/self/status "/"
+  eq "/proc under --root / is refused (rc 1)" "$RC" "1"
+  check "/proc under --root /: crosses a mount" grep -q 'crosses a mount' "$TMP/err"
+  eq "/proc under --root /: nothing copied to TMPDIR" "$(count_tmp)" "0"
+  eq "/proc under --root /: stdout empty" "$(cat "$TMP/out")" ""
+else
+  printf 'NOTE: no /proc here; the "crosses a mount" probe (--root / with /proc) is skipped\n'
+fi
+
+# the walk's branches: a parent that is missing, and a parent that the lstat shows as a directory but cannot be entered
+run_tmp "$r4/sandbox/nope/good.md" "$r4/sandbox"
+eq "a missing parent directory is refused (rc 1)" "$RC" "1"
+check "missing parent: a parent directory is missing or cannot be read" grep -q 'a parent directory is missing or cannot be read' "$TMP/err"
+HANDOFF_TEST_LIE_NAME=sub HANDOFF_TEST_LIE_AS="$m6/realdir" PERL5OPT="-I$LIE/lib -MLieStat" TMPDIR="$tdir" \
+  "$SH" "$SEAM" --root "$r4/sandbox" "$r4/sandbox/sub/good.md" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "a parent the lstat shows as a directory but that cannot be entered is refused (rc 1)" "$?" "1"
+check "cannot be entered: the message says so" grep -q 'cannot be entered' "$TMP/err"
+eq "cannot be entered: nothing copied to TMPDIR" "$(count_tmp)" "0"
+
+# the reviewer's move-out probe: a directory moved out of the root, a symlink left at its old name. With the honest lstat
+# the symlink is refused. Through the sandbox seam the lstat is told it is the moved directory: the walk enters it and the
+# identity matches, but the physical working directory is outside the root, so the walk refuses after the chdir.
+mk "PROBE-CANARY" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$m6/probe/outside/moved/handoff.md"
+ln -s "$m6/probe/outside/moved" "$m6/probe/root/sub"
+TMPDIR="$tdir" "$SH" "$PARSE" --root "$m6/probe/root" "$m6/probe/root/sub/handoff.md" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "move-out probe, honest lstat: refused (rc 1)" "$?" "1"
+check "move-out probe, honest lstat: symlink not allowed" grep -q 'symlink not allowed' "$TMP/err"
+HANDOFF_TEST_LIE_NAME=sub HANDOFF_TEST_LIE_AS="$m6/probe/outside/moved" PERL5OPT="-I$LIE/lib -MLieStat" TMPDIR="$tdir" \
+  "$SH" "$SEAM" --root "$m6/probe/root" "$m6/probe/root/sub/handoff.md" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "move-out probe through the seam (lstat lied): refused (rc 1)" "$?" "1"
+check "move-out probe through the seam: input path changed (the working directory left the root)" grep -q 'input path changed while it was being resolved' "$TMP/err"
+if grep -q 'PROBE-CANARY' "$TMP/out" "$TMP/err"; then fail "move-out probe: the outside canary was read"; else pass; fi
+eq "move-out probe: nothing copied to TMPDIR" "$(count_tmp)" "0"
+
+# provider CLI homes are refused before any open (hard rule 4). The names are built from parts, as in the parser, so no
+# literal credential path appears in this file. HOME is a fake home with canaries in it.
+FAKE="$m6/home"
+cli_name() { printf '.%s' "$1"; }
+cli_home() { printf '%s/%s' "$FAKE" "$(cli_name "$1")"; }
+cli_json() { printf '%s/.%s' "$FAKE" "claude.json"; }
+for n in claude codex grok kimi-code kimi gemini; do
+  mkdir -p "$(cli_home "$n")"
+  mk "CLI-CANARY-$n" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$(cli_home "$n")/handoff.md"
+done
+mk "CLI-CANARY-JSON" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$(cli_json)"
+
+# home_run <root> <file> [cwd]: runs the parser with HOME set to the fake home and a private TMPDIR; sets RC and ERR
+home_run() {
+  if [ -n "${3-}" ]; then
+    (cd "$3" && HOME="$FAKE" TMPDIR="$tdir" "$SH" "$PARSE" --root "$1" "$2" >"$TMP/out" 2>"$TMP/err" </dev/null)
+  else
+    HOME="$FAKE" TMPDIR="$tdir" "$SH" "$PARSE" --root "$1" "$2" >"$TMP/out" 2>"$TMP/err" </dev/null
+  fi
+  RC=$?
+  ERR=$(cat "$TMP/err")
+}
+# home_refused <desc> <root> <file> [cwd]: exit 1, the CLI refusal, empty stdout, no canary, nothing in TMPDIR
+home_refused() {
+  home_run "$2" "$3" "${4-}"
+  if [ "$RC" -ne 1 ]; then fail "$1: expected exit 1, got $RC ($ERR)"
+  elif [ -n "$(cat "$TMP/out")" ]; then fail "$1: stdout must be empty"
+  elif [[ $ERR != *"refused: provider CLI directory"* ]]; then fail "$1: expected the CLI refusal, got: $ERR"
+  elif grep -q 'CLI-CANARY' "$TMP/out" "$TMP/err"; then fail "$1: canary text leaked"
+  elif [ "$(count_tmp)" -ne 0 ]; then fail "$1: something was left in TMPDIR"
+  else pass; fi
+}
+home_refused "the codex home itself as the root" "$(cli_home codex)" "$(cli_home codex)/handoff.md"
+home_refused "an input in the codex home, under a valid root (absolute)" "$m6" "$(cli_home codex)/handoff.md"
+home_refused "an input in the codex home, under a valid root (relative)" "$m6" "home/$(cli_name codex)/handoff.md"
+home_refused "an input in the codex home, relative, from the working directory" "$m6" "home/$(cli_name codex)/handoff.md" "$m6"
+home_refused "the Claude JSON file, with HOME as the root" "$FAKE" "$(cli_json)"
+home_refused "the Claude JSON file, relative to HOME" "$FAKE" "$(cli_name claude.json)"
+for n in claude codex grok kimi-code kimi gemini; do
+  home_refused "CLI home $n as the root" "$(cli_home "$n")" "$(cli_home "$n")/handoff.md"
+  home_refused "CLI home $n under a valid root" "$m6" "home/$(cli_name "$n")/handoff.md"
+done
+ln -s "$(cli_home codex)" "$m6/link-codex"
+home_run "$m6" "$m6/link-codex/handoff.md"
+eq "a symlink into the codex home is refused (rc 1)" "$RC" "1"
+check "a symlink into the codex home: symlink not allowed" grep -q 'symlink not allowed' "$TMP/err"
+if grep -q 'CLI-CANARY' "$TMP/out" "$TMP/err"; then fail "a symlink into the codex home: canary read"; else pass; fi
+# near misses are not CLI homes
+mkdir -p "$FAKE/$(cli_name codex)-notes" "$FAKE/codex"
+mk "NEAR-OK" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$FAKE/$(cli_name codex)-notes/handoff.md"
+mk "NEAR-OK" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$FAKE/codex/handoff.md"
+home_run "$m6" "home/$(cli_name codex)-notes/handoff.md"
+eq "a near miss of a CLI home name (dot name with a suffix) is not refused (rc 0)" "$RC" "0"
+home_run "$m6" "home/codex/handoff.md"
+eq "a directory named like a CLI home without the dot is not refused (rc 0)" "$RC" "0"
+# HOME given as a symlink: the physical home is refused too
+mkdir -p "$m6/realhome/$(cli_name codex)"
+mk "CLI-CANARY-REALHOME" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" "$D_CONF" >"$m6/realhome/$(cli_name codex)/handoff.md"
+ln -s "$m6/realhome" "$m6/homelink"
+HOME="$m6/homelink" TMPDIR="$tdir" "$SH" "$PARSE" --root "$m6/realhome/$(cli_name codex)" "$m6/realhome/$(cli_name codex)/handoff.md" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "HOME as a symlink: the resolved CLI home is refused (rc 1)" "$?" "1"
+check "HOME as a symlink: the CLI refusal" grep -q 'refused: provider CLI directory' "$TMP/err"
+if grep -q 'CLI-CANARY' "$TMP/out" "$TMP/err"; then fail "HOME as a symlink: canary leaked"; else pass; fi
+# HOME unset or relative: the check cannot be made, so it is an internal error
+(unset HOME; TMPDIR="$tdir" "$SH" "$PARSE" --root "$FIX" "$FIX/good.md" >"$TMP/out" 2>"$TMP/err" </dev/null)
+eq "HOME unset is an internal error (rc 3)" "$?" "3"
+HOME=relative/dir TMPDIR="$tdir" "$SH" "$PARSE" --root "$FIX" "$FIX/good.md" >"$TMP/out" 2>"$TMP/err" </dev/null
+eq "HOME relative is an internal error (rc 3)" "$?" "3"
+eq "HOME relative: stdout empty" "$(cat "$TMP/out")" ""
+
+# environment scrub: PERL5OPT and PERL5LIB do not reach the real parser's perl (a marker module proves it)
+shim6="$m6/shim"
+mkdir -p "$shim6"
+cat >"$shim6/MarkStub.pm" <<'PM'
+package MarkStub;
+# Test stub: loading it writes a marker file, so a test can tell whether PERL5OPT reached perl.
+if (defined $ENV{HANDOFF_TEST_MARK}) {
+  open(my $fh, '>', $ENV{HANDOFF_TEST_MARK}) or die "mark";
+  close($fh);
+}
+1;
+PM
+ncf=$(mkd scrubnc "x$(utf8_of FFFE)y")
+rm -f "$m6/mark-real"
+PERL5OPT="-I$shim6 -MMarkStub" PERL5LIB="$shim" HANDOFF_TEST_MARK="$m6/mark-real" TMPDIR="$tdir" \
+  "$SH" "$PARSE" --root "$TMP" "$ncf" >"$TMP/out" 2>"$TMP/err" </dev/null
+REAL_RC=$?
+REAL_ERR=$(cat "$TMP/err")
+eq "PERL5OPT and PERL5LIB with a lax Encode stub: the real parser still refuses the noncharacter (rc 1)" "$REAL_RC" "1"
+check "PERL5OPT and PERL5LIB: the message is the UTF-8 refusal" test "${REAL_ERR#*invalid UTF-8}" != "$REAL_ERR"
+check "PERL5OPT and PERL5LIB: the stub module never ran (no marker file)" test ! -e "$m6/mark-real"
+"$SH" "$PARSE" --root "$TMP" "$ncf" >/dev/null 2>"$TMP/err0" </dev/null
+eq "the same refusal with and without the variables (stderr)" "$(cat "$TMP/err0")" "$REAL_ERR"
+rm -f "$m6/mark-seam"
+PERL5OPT="-I$shim6 -MMarkStub" PERL5LIB="$shim" HANDOFF_TEST_MARK="$m6/mark-seam" TMPDIR="$tdir" \
+  "$SH" "$SEAM" --root "$TMP" "$ncf" >"$TMP/out" 2>"$TMP/err" </dev/null
+check "control: the sandbox copy (scrub prefix removed) does load the stub (marker file exists)" test -e "$m6/mark-seam"
+check "control: with the lax stub the sandbox copy takes the noncharacter to the regex refusal" grep -q 'a noncharacter code point is refused' "$TMP/err"
+scrub_n=$(grep -v '^[[:space:]]*#' "$PARSE" | grep -c 'env -u PERL5OPT -u PERL5LIB -u PERLLIB -u PERL5DB -u PERL_UNICODE perl ')
+perl_n=$(grep -v '^[[:space:]]*#' "$PARSE" | grep -c 'perl -e')
+eq "every perl call in the parser carries the scrub prefix" "$scrub_n" "$perl_n"
+eq "the sandbox copy changes exactly the scrubbed lines" "$(diff "$PARSE" "$SEAM" | grep -c '^<')" "$scrub_n"
+eq "the sandbox copy has no scrub prefix left" "$(grep -c 'env -u PERL5OPT' "$SEAM")" "0"
+
+# nits: the temp dir is created with INT, HUP, TERM and QUIT ignored, and the traps are restored after mktemp
+ign_line=$(grep -v '^[[:space:]]*#' "$PARSE" | grep -n "trap '' INT HUP TERM QUIT" | head -1 | cut -d: -f1)
+mk_line=$(grep -v '^[[:space:]]*#' "$PARSE" | grep -n 'mktemp -d' | head -1 | cut -d: -f1)
+restore_line=$(grep -v '^[[:space:]]*#' "$PARSE" | grep -n "trap 'exit 131' QUIT" | tail -1 | cut -d: -f1)
+check "the temp dir is created with the signals ignored (ignore, then mktemp, then restore)" test -n "$ign_line" -a -n "$mk_line" -a -n "$restore_line" -a "$ign_line" -lt "$mk_line" -a "$mk_line" -lt "$restore_line"
+
+# nits: blanks before the confidence level are tolerated (ASCII space and tab); the reason is kept
+expect_ok "confidence: leading spaces before the level are tolerated" "$(mkd cw1 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" '   high, sure')"
+eq "confidence: leading spaces, level parsed as high" "$(jq -r .confidence.level "$TMP/out")" "high"
+eq "confidence: leading spaces, reason kept" "$(jq -r .confidence.why "$TMP/out")" "sure"
+expect_ok "confidence: a leading tab is tolerated" "$(mkd cw2 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" $'\tmedium, sure')"
+eq "confidence: a leading tab, level parsed as medium" "$(jq -r .confidence.level "$TMP/out")" "medium"
+expect_fail "confidence: leading spaces then 'highly' is still a bad level" "$(mkd cw3 "$D_SUM" "$D_FILES" "$D_TESTS" "$D_RULES" "$D_RISKS" '   highly sure')" "bad confidence level"
+
+# the spec and the parser text: no resolve-once trust, no pwd -P on the root, no chdir to the root by string
+SPEC="$(cd "$SPIKE/.." && pwd -P)/docs/spec/handoff.md"
+check "the spec no longer says the root is resolved once or trusted" test "$(grep -c -e 'resolved once' -e 'root and its parents are trusted' "$SPEC")" = "0"
+check "the parser does not resolve the root with pwd -P" test "$(grep -v '^[[:space:]]*#' "$PARSE" | grep -c 'pwd -P')" = "0"
+check "perl walks from the filesystem root (chdir to /)" grep -q 'chdir("/")' "$PARSE"
+check "no chdir to the root by string" test "$(grep -c 'chdir(\$root)' "$PARSE")" = "0"
+check "the walk checks the physical working directory with Cwd::getcwd" grep -q 'Cwd::getcwd()' "$PARSE"
 
 printf 'test_handoff: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

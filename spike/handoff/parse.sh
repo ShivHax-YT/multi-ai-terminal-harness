@@ -3,9 +3,10 @@
 #
 #   {task_id, summary, files_changed:[{path,note}], tests_run, hard_rules:[..], risks, confidence:{level,why}}
 #
-# Exit codes: 0 valid; 1 invalid handoff or refused input (message on stderr, nothing on stdout); 2 usage error, missing
-#             --root or missing jq/perl, or --root is not a directory; 3 internal error (temp dir, perl, wc, tr, awk, jq
-#             or cat failure; the input was not judged).
+# Exit codes: 0 valid; 1 invalid handoff or refused input (message on stderr, nothing on stdout); 2 usage error:
+#             --root missing, empty, relative, not a directory, or with a '.' or '..' component; a missing jq or perl;
+#             3 internal error (temp dir, perl, wc, tr, awk, jq or cat failure, HOME not absolute; the input was not
+#             judged).
 #             A signal: INT exits 130, HUP 129, QUIT 131, TERM 143; the private temp dir is removed and nothing is
 #             printed. A signal during the final write (see "Output") can still cut the JSON short.
 #
@@ -13,16 +14,22 @@
 # expands file content. Content only ever sits inside quoted "$variables" and reaches jq through --arg or stdin.
 # Error messages never echo file content (only section names, line numbers and limits).
 #
-# The input path is resolved by ONE perl process (PERL_WALK), the only process that receives it:
-#   - the path must be inside --root: a relative path is relative to --root, an absolute one must start with the
-#     physical root path followed by "/". Components ".", ".." and empty ones are refused;
-#   - each parent directory is lstat'ed and refused if it is a symlink or not a directory, entered, and then its
-#     (dev, ino) is compared with the lstat, so a directory swapped for a symlink in between is refused;
+# The root and the input path are resolved by ONE perl process (PERL_WALK), the only process that receives them:
+#   - the root is not resolved by this script (no pwd -P). perl walks it from "/": every component is lstat'ed and
+#     refused if it is a symlink or not a directory, entered, and its (dev, ino) compared with the lstat. A symlink
+#     anywhere in the root path is therefore refused: the root must be a physical absolute path;
+#   - the input must be inside the root: a relative path is relative to the root, an absolute one must start with the
+#     root followed by "/". Components ".", ".." and empty ones are refused;
+#   - each parent directory below the root is walked the same way, and after every step the physical working
+#     directory (Cwd::getcwd) must be the directory the walk expects, outside every provider CLI home;
+#   - every directory on the walk and the input must be on the device of the root's final directory;
+#   - a root or input that is, or is under, a provider CLI home (under HOME, as typed and as resolved) is refused
+#     before any open;
 #   - the leaf is lstat'ed (regular file, not a symlink, exactly one link), opened with O_NOFOLLOW, O_NONBLOCK and
 #     O_NOCTTY relative to the directory the process stands in, checked again on the open handle, and copied (at most
 #     MAX_BYTES+1 bytes). The process holds its working directory, so renaming a parent name cannot redirect the open.
-# The root is resolved once with pwd -P. The root and its parents are trusted (the caller chooses them); everything
-# below the root is walked as described. Everything after the copy reads only the private copy.
+# Every perl call runs with PERL5OPT, PERL5LIB, PERLLIB, PERL5DB and PERL_UNICODE removed from its environment.
+# Everything after the copy reads only the private copy.
 # Targets bash 3.2 (macOS /bin/bash): no associative arrays, no mapfile.
 
 set -f
@@ -49,7 +56,13 @@ internal() {
 }
 
 usage() {
-  printf 'usage: parse.sh --root <dir> [--] <HANDOFF.md>  (the file must be inside <dir>; use "--" before a name that starts with "-")\n' >&2
+  printf 'usage: parse.sh --root <dir> [--] <HANDOFF.md>  (the root is an absolute physical path; the file must be inside it; use "--" before a name that starts with "-")\n' >&2
+  exit 2
+}
+
+# Root problems are usage errors (exit 2): the root is not checked by resolution here, the walk refuses symlinks.
+root_error() {
+  printf 'handoff: %s\n' "$*" >&2
   exit 2
 }
 
@@ -95,35 +108,90 @@ for tool in jq perl; do
     exit 2
   fi
 done
-if ! (cd -- "$ROOT_ARG") >/dev/null 2>&1; then
-  printf 'handoff: --root is not a directory\n' >&2
-  exit 2
+
+# Root checks: not empty or blank, absolute, no '.' or '..' component, and a directory. The root is not resolved here:
+# a trailing slash or doubled slashes are harmless (perl drops empty components), a symlink anywhere in it is refused.
+root_blank=${ROOT_ARG//[[:space:]]/}
+if [ -z "$root_blank" ]; then
+  root_error "--root must not be empty"
 fi
-ROOT=$(cd -- "$ROOT_ARG" && pwd -P) || internal "cannot resolve --root"
+case $ROOT_ARG in
+  /*) ;;
+  *) root_error "--root must be an absolute path to a physical directory (no symbolic link in it)" ;;
+esac
+case "$ROOT_ARG/" in
+  */./* | */../*) root_error "--root must not contain a '.' or '..' component" ;;
+esac
+if [ ! -d "$ROOT_ARG" ]; then
+  root_error "--root is not a directory"
+fi
+
+# The provider CLI homes are refused under HOME. HOME must be absolute, or the check cannot be made.
+case ${HOME:-} in
+  /*) ;;
+  *) internal "HOME must be an absolute path (the provider CLI home check needs it)" ;;
+esac
 
 file=$1
 
-# ---- the one open: path rules, the walk and the copy (one perl process) -----------------------------------------------
-# Strings are checked before the filesystem is touched. The copy file is created before the process enters the root,
-# so a relative TMPDIR still resolves. Every refusal exits 1 before any read of the input. Program text is a
-# single-quoted constant: no single quote inside it, and the input reaches perl only as @ARGV.
+# ---- the one open: root walk, path rules, the input walk and the copy (one perl process) -------------------------------
+# Strings are checked before the filesystem is touched. The copy file is created before the process walks, so a
+# relative TMPDIR still resolves. Every refusal exits 1 before any read of the input. Program text is a single-quoted
+# constant: no single quote inside it (double quotes only), and the input reaches perl only as @ARGV.
 PERL_WALK='
 use strict;
 use warnings;
 use Errno qw(ELOOP);
 use Fcntl qw(:mode O_RDONLY O_WRONLY O_CREAT O_EXCL O_NOFOLLOW O_NONBLOCK O_NOCTTY);
-exit 3 unless @ARGV == 4;
-my ($root, $file, $dst, $max) = @ARGV;
+use Cwd ();
+exit 3 unless @ARGV == 5;
+my ($root, $file, $dst, $max, $home) = @ARGV;
 exit 3 unless defined $max && $max =~ /\A[0-9]+\z/;
+exit 3 unless defined $home && $home =~ m{\A/};
 sub refuse {
   print STDERR "handoff: $_[0]\n";
   exit 1;
 }
-my $pref = $root =~ m{/\z} ? $root : "$root/";
+# Provider CLI homes, named without the leading dot (the dot is added here, so no literal credential path appears in
+# this program text). Each one under HOME, as typed and as resolved, is refused.
+my @cli_names = ("claude", "claude.json", "codex", "grok", "kimi-code", "kimi", "gemini");
+my @homes = ($home);
+my $phome = Cwd::abs_path($home);
+push @homes, $phome if defined $phome && $phome ne $home;
+my @deny;
+for my $h (@homes) {
+  (my $b = $h) =~ s{/+\z}{};
+  for my $n (@cli_names) {
+    push @deny, "$b/.$n";
+  }
+}
+my $cli_msg = "refused: provider CLI directory (the path is, or is under, a provider CLI home; nothing is read)";
+sub in_cli {
+  my ($p) = @_;
+  for my $d (@deny) {
+    return 1 if $p eq $d || index($p, "$d/") == 0;
+  }
+  return 0;
+}
+my $moved = "input path changed while it was being resolved: a directory on the path was replaced or moved (refused; nothing is copied)";
+my $moved_root = "--root changed while it was being resolved (refused; nothing is copied)";
+# at_dir: the physical working directory must be the one the walk expects, and not inside a provider CLI home.
+sub at_dir {
+  my ($want, $msg) = @_;
+  my $here = Cwd::getcwd();
+  refuse($msg) unless defined $here && $here eq $want;
+  refuse($cli_msg) if in_cli($here);
+  return;
+}
+# The root in string form (empty components dropped), and the string checks made before anything is touched.
+my @rc = grep { length } split m{/}, $root, -1;
+my $nroot = "/" . join("/", @rc);
+my $pref = $nroot eq "/" ? "/" : "$nroot/";
+refuse($cli_msg) if in_cli($nroot);
 my $rel = $file;
 if (substr($file, 0, 1) eq "/") {
   refuse("outside root: the input is not inside --root (refused before any open; nothing is copied)")
-    unless substr($file, 0, length($pref)) eq $pref;
+    unless index($file, $pref) == 0;
   $rel = substr($file, length($pref));
 }
 refuse("input path must name a file inside --root") if $rel eq "";
@@ -132,29 +200,61 @@ for my $c (split m{/}, $rel, -1) {
   refuse("input path must not contain a \x27.\x27 component") if $c eq ".";
   refuse("input path must not contain an empty component") if $c eq "";
 }
+my $abs_in = $nroot eq "/" ? "/$rel" : "$nroot/$rel";
+refuse($cli_msg) if in_cli($abs_in);
+# The copy file is created before the walk (a relative TMPDIR still resolves from the start directory).
 my $out;
 exit 3 unless sysopen($out, $dst, O_WRONLY | O_CREAT | O_EXCL, 0600);
-exit 3 unless chdir($root);
+# Root walk: from "/", every component of the root path, the same rules as the parents below it.
+exit 3 unless chdir("/");
+at_dir("/", $moved_root);
+my $cur = "/";
+for my $c (@rc) {
+  my @l = lstat($c);
+  refuse("cannot read --root: a directory of the root path is missing or cannot be read") unless @l;
+  refuse("symlink not allowed: a directory of --root is a symbolic link (refused; nothing is copied)") if S_ISLNK($l[2]);
+  refuse("--root is not a directory") unless S_ISDIR($l[2]);
+  refuse("cannot read --root: a directory of the root path cannot be entered") unless chdir($c);
+  my @s = stat(".");
+  exit 3 unless @s;
+  refuse($moved_root) unless $s[0] == $l[0] && $s[1] == $l[1];
+  $cur = $cur eq "/" ? "/$c" : "$cur/$c";
+  at_dir($cur, $moved_root);
+}
+exit 3 unless $cur eq $nroot;
+my @rs = stat(".");
+exit 3 unless @rs;
+my $root_dev = $rs[0];
+# Input walk: the parents below the root, then the leaf.
 my @comp = split m{/}, $rel, -1;
 my $leaf = pop @comp;
+my $dir = $nroot;
 for my $c (@comp) {
   my @l = lstat($c);
   refuse("cannot read input file: a parent directory is missing or cannot be read") unless @l;
   refuse("symlink not allowed: a parent directory of the input is a symbolic link (refused before open; nothing is copied)")
     if S_ISLNK($l[2]);
   refuse("cannot read input file: a parent of the input is not a directory") unless S_ISDIR($l[2]);
+  refuse("crosses a mount: a parent directory of the input is on another device than --root (refused; nothing is copied)")
+    unless $l[0] == $root_dev;
   refuse("cannot read input file: a parent directory cannot be entered") unless chdir($c);
   my @s = stat(".");
   exit 3 unless @s;
   refuse("input path changed while it was being resolved: a parent directory was replaced (refused; nothing is copied)")
     unless $s[0] == $l[0] && $s[1] == $l[1];
+  $dir = $dir eq "/" ? "/$c" : "$dir/$c";
+  at_dir($dir, $moved);
 }
 my @ll = lstat($leaf);
 refuse("cannot read input file") unless @ll;
 refuse("symlink not allowed: the input is a symbolic link (refused before open; nothing is copied)") if S_ISLNK($ll[2]);
 refuse("not a regular file: the input must be a regular file (refused before open; nothing is copied)") unless S_ISREG($ll[2]);
 refuse("hard link not allowed: the input must have exactly one link (refused before open; nothing is copied)") unless $ll[3] == 1;
+refuse("crosses a mount: the input is on another device than --root (refused; nothing is copied)") unless $ll[0] == $root_dev;
 refuse("oversize: file is larger than $max bytes") if $ll[7] > $max;
+at_dir($dir, $moved);
+my $phys_leaf = $dir eq "/" ? "/$leaf" : "$dir/$leaf";
+refuse($cli_msg) if in_cli($phys_leaf);
 my $in;
 unless (sysopen($in, $leaf, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)) {
   refuse("symlink not allowed: the input is a symbolic link (refused at open; nothing is copied)") if $! == ELOOP;
@@ -166,6 +266,7 @@ refuse("not a regular file: the opened input is not a regular file (nothing is c
 refuse("hard link not allowed: the opened input has more than one link (nothing is copied)") unless $fs[3] == 1;
 refuse("input changed between the lstat and the open (refused; nothing is copied)") unless $fs[0] == $ll[0] && $fs[1] == $ll[1];
 refuse("oversize: file is larger than $max bytes") if $fs[7] > $max;
+at_dir($dir, $moved);
 binmode($in);
 binmode($out);
 my $left = $max + 1;
@@ -188,9 +289,23 @@ close($in);
 exit 0;
 '
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/handoff-parse.XXXXXX") || internal "cannot create temp dir"
+# The temp dir. mktemp runs with INT, HUP, TERM and QUIT ignored (an ignored disposition is inherited by mktemp), so no
+# signal can land between the creation of the directory and the assignment of WORK. A signal in that short window is
+# dropped; the traps are restored right after.
+WORK=''
+trap '' INT HUP TERM QUIT
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/handoff-parse.XXXXXX")
+made=$?
+trap 'exit 130' INT
+trap 'exit 129' HUP
+trap 'exit 143' TERM
+trap 'exit 131' QUIT
+if [ "$made" -ne 0 ]; then
+  WORK=''
+  internal "cannot create temp dir"
+fi
 copy="$WORK/copy"
-perl -e "$PERL_WALK" -- "$ROOT" "$file" "$copy" "$MAX_BYTES"
+env -u PERL5OPT -u PERL5LIB -u PERLLIB -u PERL5DB -u PERL_UNICODE perl -e "$PERL_WALK" -- "$ROOT_ARG" "$file" "$copy" "$MAX_BYTES" "$HOME"
 rc=$?
 case $rc in
   0) ;;
@@ -247,7 +362,7 @@ if ($text =~ /[\p{Cf}\x{01}-\x{08}\x{0B}-\x{1F}\x{7F}-\x{9F}\x{AD}\x{34F}\x{600}
 }
 exit 0;
 '
-perl -e "$PERL_CHECK" <"$copy"
+env -u PERL5OPT -u PERL5LIB -u PERLLIB -u PERL5DB -u PERL_UNICODE perl -e "$PERL_CHECK" <"$copy"
 rc=$?
 case $rc in
   0) ;;
@@ -521,10 +636,14 @@ load_lines "$S4" "Open risks / questions" 60
 join_lines
 risks=$J
 
-# Confidence: the level is case-insensitive and is output in lowercase.
+# Confidence: the level is case-insensitive and is output in lowercase. Blanks before the level are ignored (ASCII
+# space and tab only).
 CONF_RE='^([A-Za-z]+)([[:space:],:;.]|$)(.*)$'
 load_lines "$S5" "Confidence" 10
-if ! [[ ${L[0]} =~ $CONF_RE ]]; then
+first_line=${L[0]}
+lead=${first_line%%[![:space:]]*}
+first_line=${first_line#"$lead"}
+if ! [[ $first_line =~ $CONF_RE ]]; then
   die "bad confidence level: the Confidence section must start with low, medium or high"
 fi
 word=${BASH_REMATCH[1]}
