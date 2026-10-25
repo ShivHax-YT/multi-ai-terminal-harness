@@ -35,6 +35,15 @@ alive() {
   return 0
 }
 
+# ours <pid> <pattern>: 0 if <pid> is alive and not a zombie AND its command line contains <pattern>. A reused pid, whose
+# command line differs, does not count.
+ours() {
+  [ -n "$1" ] || return 1
+  alive "$1" || return 1
+  case "$(ps -o args= -p "$1" 2>/dev/null)" in *"$2"*) return 0 ;; esac
+  return 1
+}
+
 # child <code>: run code in a fresh /bin/bash with common.sh sourced and SPIKE_LIVE unset unless the caller exported it.
 child() {
   /bin/bash -c '. "$1"; eval "$2"' _ "$COMMON" "$1"
@@ -175,13 +184,18 @@ eq "run_timeout also guards a claude.exe name (rc)" "3" "$?"
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/codex" exec hi' _ "$COMMON" "$FAKE" 2>/dev/null
 eq "run_timeout refuses codex exec without SPIKE_LIVE (rc)" "3" "$?"
 eq "refused CLIs were not started" "0" "$(ran)"
+# Round 4 (decision 1d): an UNVERIFIED claude/codex is refused by spike_run_timeout even for its status shapes. Only
+# spike_run_status runs those, and only for a private copy that preflight registered (see the status tests below).
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/claude" --version' _ "$COMMON" "$FAKE" 2>/dev/null
-eq "run_timeout allows claude --version without SPIKE_LIVE" "0" "$?"
+eq "run_timeout refuses an unverified claude --version without SPIKE_LIVE (rc)" "3" "$?"
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/claude" auth status' _ "$COMMON" "$FAKE" 2>/dev/null
-eq "run_timeout allows claude auth status without SPIKE_LIVE" "0" "$?"
+eq "run_timeout refuses an unverified claude auth status without SPIKE_LIVE (rc)" "3" "$?"
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/codex" login status' _ "$COMMON" "$FAKE" 2>/dev/null
-eq "run_timeout allows codex login status without SPIKE_LIVE" "0" "$?"
-eq "allowed calls did start the CLIs" "3" "$(ran)"
+eq "run_timeout refuses an unverified codex login status without SPIKE_LIVE (rc)" "3" "$?"
+eq "refused unverified status calls did not start the CLIs" "0" "$(ran)"
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" && spike_mark_verified "$2/codex" && spike_run_status 5 /dev/null "$2/claude" --version && spike_run_status 5 /dev/null "$2/claude" auth status && spike_run_status 5 /dev/null "$2/codex" login status' _ "$COMMON" "$FAKE" 2>/dev/null
+eq "status runner runs registered verified copies (claude --version, claude auth status, codex login status) without SPIKE_LIVE (rc)" "0" "$?"
+eq "allowed status calls did start the verified copies" "3" "$(ran)"
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/claude" --version extra' _ "$COMMON" "$FAKE" 2>/dev/null
 eq "run_timeout refuses --version with extra args (rc)" "3" "$?"
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/claude" auth login' _ "$COMMON" "$FAKE" 2>/dev/null
@@ -235,18 +249,110 @@ okrun() { # okrun <name> <code>: must not be stopped by the gate
 okrun "true" 'spike_run_timeout 5 /dev/null true'
 okrun "echo hello" 'spike_run_timeout 5 /dev/null echo hello'
 okrun "sleep" 'spike_run_timeout 5 /dev/null sleep 0'
-okrun "jq --version" 'spike_run_timeout 5 /dev/null jq --version'
+# Round 4 (decision 1a): jq is no longer a harmless identity; it is called directly by preflight, never through the runner.
+denied "jq --version needs the gate (jq left the ungated list, rule 1)" "spike_run_timeout 5 /dev/null jq --version"
 okrun "git --version" 'spike_run_timeout 5 /dev/null git --version'
-okrun "codesign --verify --strict <provider path>" "spike_run_timeout 5 /dev/null codesign --verify --strict '$FAKE/claude'"
-okrun "codesign -dv --verbose=2 <provider path>" "spike_run_timeout 5 /dev/null codesign -dv --verbose=2 '$FAKE/claude'"
-okrun "spike_run_status of a renamed binary with --version" "spike_run_status 5 /dev/null '$FAKE/renamed' --version"
-okrun "spike_run_status of a renamed binary with login status" "spike_run_status 5 /dev/null '$FAKE/renamed' login status"
-okrun "upper-case CLAUDE with --version" "spike_run_timeout 5 /dev/null '$FAKE/CLAUDE' --version"
+# Round 4 (decision 1c): codesign is ungated only for the exact read-only shapes and only from a system directory.
+# Without a system codesign (Linux) the identity check fails, so the shapes need the gate there.
+if [ -x /usr/bin/codesign ]; then
+  okrun "codesign --verify --strict <provider path> (system codesign)" "spike_run_timeout 5 /dev/null codesign --verify --strict '$FAKE/claude'"
+  okrun "codesign -dv --verbose=2 <provider path> (system codesign)" "spike_run_timeout 5 /dev/null codesign -dv --verbose=2 '$FAKE/claude'"
+else
+  denied "codesign verify needs the gate when there is no system codesign (identity, rule 6)" "spike_run_timeout 5 /dev/null codesign --verify --strict '$FAKE/claude'"
+fi
+okrun "spike_run_status of a renamed binary with --version (registered as a verified copy first)" "spike_mark_verified '$FAKE/renamed'; spike_run_status 5 /dev/null '$FAKE/renamed' --version"
+okrun "spike_run_status of a renamed binary with login status (registered as a verified copy first)" "spike_mark_verified '$FAKE/renamed'; spike_run_status 5 /dev/null '$FAKE/renamed' login status"
+# Round 4 (decision 1d): the upper-case CLAUDE name no longer gets the status-shape exception in spike_run_timeout.
+rm -f "$FAKE"/ran-*
+denied "upper-case CLAUDE --version through spike_run_timeout (unverified provider CLI, rule 6)" "spike_run_timeout 5 /dev/null '$FAKE/CLAUDE' --version"
 rm -f "$FAKE"/ran-*
 SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live 5 /dev/null "$2/renamed" -p hi' _ "$COMMON" "$FAKE" 2>/dev/null
 eq "spike_run_live runs when SPIKE_LIVE=1 (rc)" "0" "$?"
 eq "spike_run_live started the command" "1" "$(ran)"
 rm -f "$FAKE"/ran-*
+
+# --- identity, not name (rule 1, decision 1a/1b): copies of harmless programs are refused outside a system directory ---
+SHADOW="$SANDBOX/shadow"
+mkdir -p "$SHADOW/marks"
+for n in cat printf echo true codesign jq; do
+  printf '#!/bin/sh\ntouch "%s/marks/%s-$$"\nexit 0\n' "$SHADOW" "$n" > "$SHADOW/$n"
+  chmod +x "$SHADOW/$n"
+done
+marks() { ls "$SHADOW/marks" | grep -c . ; }
+# shadow_denied <label> <path-prefix or -> <code>: with SPIKE_LIVE unset, <code> must exit 3, never reach the next
+# statement, and start no copy (the copy would leave a marker file).
+shadow_denied() {
+  local name="$1" pfx="$2" code="$3" o rc
+  rm -f "$SHADOW"/marks/* 2>/dev/null
+  if [ "$pfx" = "-" ]; then
+    o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; eval "$2"; echo CONTINUED' _ "$COMMON" "$code" 2>/dev/null)"
+  else
+    o="$(env -u SPIKE_LIVE PATH="$pfx:$PATH" /bin/bash -c '. "$1"; eval "$2"; echo CONTINUED' _ "$COMMON" "$code" 2>/dev/null)"
+  fi
+  rc=$?
+  eq "identity: $name (rc 3)" "3" "$rc"
+  lacks "identity: $name (caller stopped)" "$o" "CONTINUED"
+  eq "identity: $name (nothing started)" "0" "$(marks)"
+}
+for n in cat printf echo true codesign jq; do
+  shadow_denied "copy of $n by absolute path, with a prompt" - "spike_run_timeout 5 /dev/null '$SHADOW/$n' -p hello"
+  shadow_denied "copy of $n by ./relative path, with a prompt" - "cd '$SHADOW' && spike_run_timeout 5 /dev/null './$n' -p hello"
+  shadow_denied "copy of $n shadowing PATH, with a prompt" "$SHADOW" "spike_run_timeout 5 /dev/null $n -p hello"
+done
+shadow_denied "copy of codesign shadowing PATH, verify shape" "$SHADOW" "spike_run_timeout 5 /dev/null codesign --verify --strict /x"
+denied "codesign --sign - x is not ungated (rc 3)" "spike_run_timeout 5 /dev/null codesign --sign - x"
+denied "codesign --remove-signature is not ungated (rc 3)" "spike_run_timeout 5 /dev/null codesign --remove-signature x"
+okrun "absolute /usr/bin/true is a system binary and runs" 'spike_run_timeout 5 /dev/null /usr/bin/true'
+
+# cs_shape <label> <1 = allowed | 0 = refused> <args...>: the codesign shape check on its own (platform independent).
+cs_shape() {
+  local name="$1" want="$2" rc got
+  shift 2
+  /bin/bash -c '. "$1"; shift; _spike_codesign_shape "$@"' _ "$COMMON" "$@" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -eq 0 ]; then got=1; else got=0; fi
+  eq "codesign shape: $name" "$want" "$got"
+}
+cs_shape "--verify --strict <path> is a read-only shape" 1 --verify --strict /x/claude
+cs_shape "-dv --verbose=2 <path> is a read-only shape" 1 -dv --verbose=2 /x/claude
+cs_shape "--verify --strict with the pinned -R requirement is a read-only shape" 1 --verify --strict '-R=anchor apple generic and certificate leaf[subject.OU] = "Q6L2SF6YDW"' /x/claude
+cs_shape "--sign - is refused" 0 --sign - x
+cs_shape "--remove-signature is refused" 0 --remove-signature x
+cs_shape "--verify --strict --remove-signature is refused" 0 --verify --strict --remove-signature
+cs_shape "--verify --strict <path> --remove-signature is refused" 0 --verify --strict /x --remove-signature
+cs_shape "-dv --verbose=2 with an option where the path goes is refused" 0 -dv --verbose=2 --remove-signature
+
+# --- spike_run_status (decision 2): only a registered verified copy, and only the three status shapes -------------------
+SRS="$SANDBOX/srs.out"
+o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_status 5 "$2" /bin/sh auth status; echo CONTINUED' _ "$COMMON" "$SRS" 2>/dev/null)"
+eq "spike_run_status with /bin/sh auth status is refused (rc 3)" "3" "$?"
+lacks "spike_run_status with /bin/sh stops the caller" "$o" "CONTINUED"
+eq "spike_run_status with /bin/sh started nothing (no output in the outfile)" "" "$(cat "$SRS" 2>/dev/null)"
+o="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_status 5 "$2" /bin/sh auth status; echo CONTINUED' _ "$COMMON" "$SRS" 2>/dev/null)"
+eq "spike_run_status with /bin/sh is refused even with SPIKE_LIVE=1 (rc 3)" "3" "$?"
+lacks "spike_run_status with /bin/sh and SPIKE_LIVE=1 stops the caller" "$o" "CONTINUED"
+denied "spike_run_status with the original (unregistered) claude --version" "spike_run_status 5 /dev/null '$FAKE/claude' --version"
+denied "spike_run_status with the original (unregistered) claude auth status" "spike_run_status 5 /dev/null '$FAKE/claude' auth status"
+denied "spike_run_status of an unregistered renamed copy with --version" "spike_run_status 5 /dev/null '$FAKE/renamed' --version"
+mkdir -p "$SANDBOX/launch"
+cp "$FAKE/claude" "$SANDBOX/launch/sh"
+ln -s "$FAKE/claude" "$SANDBOX/launch/linked"
+rm -f "$FAKE"/ran-*
+o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/sh"; spike_run_status 5 /dev/null "$2/sh" --version; echo CONTINUED' _ "$COMMON" "$SANDBOX/launch" 2>/dev/null)"
+eq "spike_run_status refuses a registered copy whose name is a launcher (rc 3)" "3" "$?"
+lacks "spike_run_status refuses a registered launcher-named copy: caller stopped" "$o" "CONTINUED"
+eq "spike_run_status refused the launcher-named copy: nothing started" "0" "$(ran)"
+rm -f "$FAKE"/ran-*
+o="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_mark_verified "$2/claude"; spike_run_status 5 /dev/null "$2/claude" -p hi; echo CONTINUED' _ "$COMMON" "$FAKE" 2>/dev/null)"
+eq "spike_run_status with a prompt is refused even for a registered copy and SPIKE_LIVE=1 (rc 3)" "3" "$?"
+lacks "spike_run_status with a prompt stops the caller" "$o" "CONTINUED"
+eq "spike_run_status with a prompt started nothing" "0" "$(ran)"
+/bin/bash -c '. "$1"; spike_mark_verified relative/claude' _ "$COMMON" >/dev/null 2>&1
+eq "spike_mark_verified refuses a relative path (rc 2)" "2" "$?"
+/bin/bash -c '. "$1"; spike_mark_verified "$2/linked"' _ "$COMMON" "$SANDBOX/launch" >/dev/null 2>&1
+eq "spike_mark_verified refuses a symlink (rc 2)" "2" "$?"
+/bin/bash -c '. "$1"; spike_mark_verified "$2"' _ "$COMMON" "$SANDBOX/launch" >/dev/null 2>&1
+eq "spike_mark_verified refuses a directory (rc 2)" "2" "$?"
 
 # --- require_live: documented top-level use, and the fail-safe for a caller that overrode TERM ---------------------
 cat > "$SANDBOX/toplevel.sh" <<EOF
@@ -494,6 +600,87 @@ EOF
   lacks "SIG$sig to the caller: nothing ran afterwards" "$(cat "$SANDBOX/sig.out")" "AFTER"
   check "SIG$sig to the caller: exit status is a signal status" test "$RC" -gt 128
 done
+
+# Orphan sweep (decision 4): the caller is killed with SIGKILL, so no trap can run. The runner must notice that its caller
+# is gone and kill the command's group: the CLI and its grandchild must be gone within 2 s.
+cat > "$SANDBOX/orphan.sh" <<EOF
+#!/bin/sh
+sleep 33 &
+echo "\$\$ \$!" > "$SANDBOX/orphan.pids.tmp"
+mv "$SANDBOX/orphan.pids.tmp" "$SANDBOX/orphan.pids"
+wait
+EOF
+chmod +x "$SANDBOX/orphan.sh"
+rm -f "$SANDBOX/orphan.pids"
+SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live 60 /dev/null "$2"; echo AFTER' _ "$COMMON" "$SANDBOX/orphan.sh" > "$SANDBOX/orphan.out" 2>/dev/null &
+ORPHAN_CALLER=$!
+n=0
+while [ ! -s "$SANDBOX/orphan.pids" ] && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+OLPID=""
+OGPID=""
+read -r OLPID OGPID < "$SANDBOX/orphan.pids" 2>/dev/null
+if [ -n "$OLPID" ] && [ -n "$OGPID" ] && alive "$OLPID" && alive "$OGPID"; then
+  ok "orphan fixture: the launcher and its grandchild run before the caller is killed"
+else
+  bad "orphan fixture: the launcher and its grandchild run before the caller is killed"
+fi
+kill -9 "$ORPHAN_CALLER" 2>/dev/null
+n=0
+while { alive "$OLPID" || alive "$OGPID"; } && [ "$n" -lt 20 ]; do sleep 0.1; n=$((n + 1)); done
+if alive "$OLPID"; then bad "orphan sweep: the CLI launcher is gone within 2 s of kill -9 of its caller"; kill -9 "$OLPID" 2>/dev/null; else ok "orphan sweep: the CLI launcher is gone within 2 s of kill -9 of its caller"; fi
+if alive "$OGPID"; then bad "orphan sweep: the grandchild is gone within 2 s of kill -9 of its caller"; kill -9 "$OGPID" 2>/dev/null; else ok "orphan sweep: the grandchild is gone within 2 s of kill -9 of its caller"; fi
+{ wait "$ORPHAN_CALLER"; } 2>/dev/null
+lacks "orphan sweep: the killed caller ran no further statement" "$(cat "$SANDBOX/orphan.out")" "AFTER"
+
+# Signal race (decision 5). The window between `&` and `$!` is a few microseconds, so the handler is tested directly:
+# a signal that arrives before the pid is known is recorded and nothing exits; once the pid is known, the group is killed
+# and the handler exits with the signal status.
+out="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; _SPIKE_CHILD_PID=""; _spike_signal 143; echo "PENDING=$_SPIKE_PENDING"; echo CONTINUED' _ "$COMMON" 2>/dev/null)"
+eq "signal before the pid is known: the handler does not exit (rc)" "0" "$?"
+has "signal before the pid is known: it is recorded for the handoff" "$out" "PENDING=143"
+has "signal before the pid is known: execution continues to the handoff" "$out" "CONTINUED"
+out="$(/bin/bash -c '. "$1"; sleep 30 & _SPIKE_CHILD_PID=$!; echo "PID=$_SPIKE_CHILD_PID"; _spike_signal 143; echo LATE' _ "$COMMON" 2>/dev/null)"
+eq "signal after the pid is known: exits with the signal status (rc)" "143" "$?"
+lacks "signal after the pid is known: nothing runs after the handler" "$out" "LATE"
+SIGPID="$(printf '%s\n' "$out" | sed -n 's/^PID=//p')"
+sleep 0.3
+if [ -n "$SIGPID" ] && alive "$SIGPID"; then bad "signal after the pid is known: the command is gone"; kill -9 "$SIGPID" 2>/dev/null; else ok "signal after the pid is known: the command is gone"; fi
+out="$(/bin/bash -c '. "$1"; _spike_forward 143; echo "PEND=$_SPIKE_BG_PENDING"' _ "$COMMON" 2>/dev/null)"
+has "caller: a signal before the runner exists is recorded for the handoff" "$out" "PEND=143"
+
+# Stress (decision 5): TERM or HUP sent right after the start of a live run leaves no command running. This exercises the
+# path; it does not prove the few-microsecond window is hit on every run.
+cat > "$SANDBOX/strl.sh" <<EOF
+#!/bin/sh
+sleep 33 &
+echo "\$\$ \$!" > "$SANDBOX/strl.pids.tmp"
+mv "$SANDBOX/strl.pids.tmp" "$SANDBOX/strl.pids"
+wait
+EOF
+chmod +x "$SANDBOX/strl.sh"
+STRESS_BAD=0
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  rm -f "$SANDBOX/strl.pids"
+  if [ $((i % 2)) -eq 0 ]; then sig=HUP; else sig=TERM; fi
+  SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live 30 /dev/null "$2"' _ "$COMMON" "$SANDBOX/strl.sh" >/dev/null 2>&1 &
+  STC=$!
+  kill -s "$sig" "$STC" 2>/dev/null
+  wait "$STC" 2>/dev/null
+  sleep 0.3
+  # Reset first: read leaves the variables alone when the file is missing (the launcher had not started yet).
+  SL=""
+  SG=""
+  read -r SL SG < "$SANDBOX/strl.pids" 2>/dev/null
+  n=0
+  while [ "$n" -lt 20 ] && { ours "$SL" strl.sh || ours "$SG" "sleep 33"; }; do sleep 0.1; n=$((n + 1)); done
+  if ours "$SL" strl.sh || ours "$SG" "sleep 33"; then
+    STRESS_BAD=$((STRESS_BAD + 1))
+    echo "stress survivor (iteration $i, signal $sig): launcher=$SL grandchild=$SG"
+    ps -o pid,ppid,pgid,stat,args -p "$SL" -p "$SG" 2>/dev/null
+    kill -9 "$SL" "$SG" 2>/dev/null
+  fi
+done
+eq "stress: no command survives a TERM or HUP sent right after the start (bad runs of 10)" "0" "$STRESS_BAD"
 
 # The caller's own TERM trap is restored after a run.
 out="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; trap "echo MYTRAP" TERM; spike_run_live 5 /dev/null true; trap -p TERM' _ "$COMMON" 2>/dev/null)"
