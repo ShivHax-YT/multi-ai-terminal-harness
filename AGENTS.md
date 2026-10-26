@@ -55,7 +55,8 @@ If a task seems to require breaking a rule, **stop and ask the human**. Never di
 - `scripts/ci/compliance-scan.sh`: hard-rule static checks (credential paths, config-home overrides, Keychain access,
   logos/trademarks, bundled provider binaries, PTY-write boundary)
 
-## HANDOFF.md format (write this in your worktree when done)
+## HANDOFF format (write it in your worktree as `docs/handoffs/T-###.md` when done, never as a root `HANDOFF.md`,
+## so branches never conflict on merge)
 
 ```
 # HANDOFF T-###

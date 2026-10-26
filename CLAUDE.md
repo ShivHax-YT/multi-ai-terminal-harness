@@ -64,7 +64,7 @@ Phase 0 spike scripts go in `spike/`.
 3. **Worktree.** Implement in a worktree (`claude --worktree T-###`, or a subagent with `isolation: worktree`).
    Touch only the files the brief owns. Two tasks that touch the same file run one after the other.
 4. **Tests.** `make check-fast` must pass (the Stop hook enforces it). Add the compliance tests the brief requires.
-5. **Handoff.** Write `HANDOFF.md` in the worktree (format in AGENTS.md).
+5. **Handoff.** Write `docs/handoffs/T-###.md` in the worktree (format in AGENTS.md; never a root `HANDOFF.md`).
 6. **Review.** Run the `reviewer` subagent, the `compliance-auditor` subagent, and `/xreview` (a second vendor's review via Codex).
 7. **Merge.** Only the human merges, after CI is green.
 
@@ -76,10 +76,10 @@ Helpers live in `.claude/agents/` (details and how to add more: `docs/AGENT_TEAM
 | Agent | Model | Writes code? | Use |
 |---|---|---|---|
 | architect | opus, xhigh | no (docs/ only) | big designs, ADRs, task briefs |
-| implementer | sonnet, medium (lead passes model=opus for Swift/PTY/signals/concurrency) | yes, own worktree | one brief each, max 3 in parallel, max 1 on opus |
+| implementer | sonnet, high (lead passes model=opus for Swift/PTY/signals/concurrency) | yes, own worktree | one brief each, max 3 in parallel, max 1 on opus |
 | scout | haiku | no | read-only fact finding, up to 4 in parallel |
 | test-runner | haiku | no | runs `make check-fast` in a worktree |
-| compliance-auditor | sonnet, medium | no | hard-rule merge gate |
+| compliance-auditor | sonnet, high | no | hard-rule merge gate |
 | reviewer | opus, high | no | final review per branch |
 | docs | haiku | Markdown only | after merge |
 

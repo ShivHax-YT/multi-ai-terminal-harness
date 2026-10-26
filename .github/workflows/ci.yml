@@ -4,7 +4,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: ["**"] # phase-0, main and every feature branch run the full check (human, 2026-10-26)
 
 permissions:
   contents: read
