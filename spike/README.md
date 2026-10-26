@@ -32,11 +32,12 @@ most Linux have it; only core modules are used).
     in `/bin /usr/bin /usr/sbin /sbin /usr/local /opt/homebrew`. A wrapper or copy first on `PATH` is refused and never run
     (preflight then reports the tool MISSING and exits 1). The closed environment and watchdog are the same as for every run.
   - **`spike_run_live_split` (T-008)** is `spike_run_live` with stdout and stderr in separate files. Same gate,
-    verified-copy rule, environment, watchdog and signals. The errfile gets the outfile policy (O_NOFOLLOW, 0600; no
+    verified-binary rule, environment, watchdog and signals. The errfile gets the outfile policy (O_NOFOLLOW, 0600; no
     symlink, hard link, FIFO or CLI-home parent), and an errfile that resolves to the outfile is refused.
-  - **A pinned CLI name runs live only as the registered copy.** `spike_run_live` (and `spike_run_timeout` after its gate)
+  - **A pinned CLI name runs live only as the registered binary.** `spike_run_live` (and `spike_run_timeout` after its gate)
     refuses, rc 3 and the script stops, a command whose basename or resolved basename is `claude` or `codex` (also
-    `claude.exe`, `claude-real`) unless it is the current registered, hash-verified copy (`$SPIKE_VERIFIED_COPY`).
+    `claude.exe`, `claude-real`) unless it is the current registered, hash-verified binary (`$SPIKE_VERIFIED_BIN`; the
+    historical name `$SPIKE_VERIFIED_COPY` holds the same value, see "Verify in place" below).
     `SPIKE_LIVE=1` does not lift that (rule 6). A renamed copy under another name cannot be recognised by name, and neither can a launcher (`env claude`, `sh -c`, a version-number basename such as `2.1.0`): names are not identity. The Phase 1 runner (T-115/T-119) decides by identity.
   - **A run needs `HOME` to be the account home.** The child's `HOME` is always the password-database home. If the caller's
     `HOME` is set and is not that directory (same device and inode) the run is refused with rc 125 and nothing starts.
@@ -48,9 +49,10 @@ most Linux have it; only core modules are used).
     execute, 127 not found, 143/130/129 stopped by TERM/INT/HUP, 3 refused by the gate (the calling script is stopped), 2
     usage. A command that itself exits with one of those numbers is indistinguishable by status alone; callers that must
     tell them apart check the output file. These codes are kept on purpose.
-  - **`spike_run_status` runs only the private copy that registration produced** (`$SPIKE_VERIFIED_COPY`), only while its
-    content still has the sha256 recorded at registration, and only `--version`, `auth status` or `login status`. Any other
-    path, a changed copy, and any other shape is refused (rc 3, nothing started). `SPIKE_LIVE=1` does not lift that refusal.
+  - **`spike_run_status` runs only the binary that registration verified** (`$SPIKE_VERIFIED_BIN`, the installed CLI's real
+    path), only while its content still has the sha256 recorded at registration, and only `--version`, `auth status` or
+    `login status`. Any other path, a changed binary, and any other shape is refused (rc 3, nothing started).
+    `SPIKE_LIVE=1` does not lift that refusal.
 - **One helper makes every security decision: `lib/runner.pl`.** `lib/common.sh` starts it only as
   `/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C SPIKE_IN_*=... /usr/bin/perl lib/runner.pl <subcommand> ...`: the
   interpreter, `env` and the helper are constant absolute paths, so no `perl`, `env` or `bash` found on `PATH` can stand in
@@ -79,23 +81,41 @@ most Linux have it; only core modules are used).
   every operation is refused with rc 121 and one fixed message (fail closed). A path inside a CLI home is never read,
   except the provider binary itself (the ratified narrow exception): it is lstat-ed first and must be a regular file with
   the owner-execute bit and at least 1 MiB (credential files are small and 0600), else it is refused without being opened;
-  then the helper reads the magic, and for a Mach-O copies the whole binary (it IS the vendor binary) for verification.
+  then the helper reads the magic, and for a Mach-O hashes and codesign-checks the whole binary in place (it IS the vendor
+  binary; the exception covers resolving, codesign-checking and executing the CLI binary path itself).
   Capture roots, scratch roots and the verify-directory parent inside a CLI home (also one that does not exist yet) are refused.
-  A hard-linked file is refused before any read. The file is opened **once** (`O_NOFOLLOW`), checked with `fstat`, and a
-  Mach-O is copied **from that descriptor** into a private directory (mode 700, `spike-verify.<id>` under the temporary
-  directory, removed on exit) that the helper itself creates; `spike_verify_dir` only reads its name, nothing can point it
-  elsewhere, and the helper re-validates it (owner, mode, name, not inside a CLI home) on every use. A stale one left by a
-  killed run is swept at start. A temporary directory that others can write without the sticky bit, or that lies inside a CLI
-  home, stops preflight (exit 1, needs human review). The COPY is checked with the fixed `codesign` (`--verify --strict`,
+  A hard-linked file is refused before any read. The file is opened **once** (`O_NOFOLLOW`) and checked with `fstat`. The
+  helper creates a private directory (mode 700, `spike-verify.<id>` under the temporary directory, removed on exit) that holds
+  only the **registry** of verified hashes (and preflight's one scratch output file), never a copy of a binary;
+  `spike_verify_dir` only reads its name, nothing can point it elsewhere, and the helper re-validates it (owner, mode, name,
+  not inside a CLI home) on every use. A stale one left by a killed run is swept at start. A temporary directory that others
+  can write without the sticky bit, or that lies inside a CLI home, stops preflight (exit 1, needs human review). The binary
+  is checked IN PLACE with the fixed `codesign` (`--verify --strict`,
   a `Developer ID Application` authority, the pinned team identifier for that CLI, and an `anchor apple generic` requirement that also demands the Developer ID Application leaf OID `1.2.840.113635.100.6.1.13` (Apple-documented; not run against a real `codesign` in this Linux sandbox)
-  for that team); its sha256 is recorded, and `spike_run_status` re-hashes it before it executes it. Ad-hoc, unsigned,
-  wrong-team, forged, non-Mach-O and script files are reported (`skipped (unverified)`) and never executed. A script
-  launcher is never executed either: its SIGNATURE cell says `launcher only, not executed (needs human approval)`. A copy that
-  cannot run is reported `needs human review`; the original path is never used as a fallback. The codesign path is the fixed
+  for that team); its sha256 is recorded, and every run re-hashes it before it executes it (see "Verify in place"). Ad-hoc,
+  unsigned, wrong-team, forged, non-Mach-O and script files are reported (`skipped (unverified)`) and never executed. A script
+  launcher is never executed either: its SIGNATURE cell says `launcher only, not executed (needs human approval)`. A binary that
+  cannot run is reported `needs human review`; no other path is tried as a fallback. The codesign path is the fixed
   constant `CODESIGN_BIN` (`/usr/bin/codesign`) inside `lib/runner.pl`; no environment variable or flag changes it. Without
   that tool every CLI is `skipped (unverified)`. The pinned team ids sit in one labeled block in `lib/runner.pl`;
   **the human must confirm them against vendor-published values before release.** A process of the same account that can
   write the private directory or the install directory is outside this threat model.
+- **Verify in place; `lib/runner.pl` is FROZEN (ShivHax-YT, 2026-10-26).** Registration (`spike_register_cli`,
+  `spike_mark_verified`) no longer copies the provider binary anywhere. The helper resolves the installed CLI to its real
+  physical path, verifies **that file** in place (`/usr/bin/codesign --verify --strict`, Developer ID authority, pinned
+  TeamIdentifier, chain-to-Apple `-R` requirement, exactly as before), records its sha256, and the runner then executes **that
+  same real path** after re-hashing it (a changed or replaced binary is refused before exec). The verified real path is in
+  `$SPIKE_VERIFIED_BIN`; `$SPIKE_VERIFIED_COPY` is a **historical alias with the same value** (no copy exists any more; the
+  name is kept so the T-002/T-003 scripts work unchanged). The live gate, the default-deny tool policy, the CLI-home denylist,
+  the environment allowlist, the account-home rule, the outfile/errfile policy, the watchdog and the signals are unchanged.
+  The re-hash of a registered path that lies inside a CLI home first applies the same vendor-binary test (regular, single
+  link, owner-execute, at least 1 MiB) so a credential-like file swapped in there is never opened.
+  - **Accepted trade-off (Phase 0):** a process of the same user that replaces the binary between the hash check and the
+    `exec` can still win that race. A private copy narrowed this; verify-in-place does not, by decision. Phase 1 T-115
+    (binary verifier) and T-119 (runner) own it, in Rust.
+  - **No new hardening rounds on `runner.pl`.** The header says so: Phase 1 T-115 and T-119 replace it in Rust.
+  - **TODO (T-115):** compare the recorded sha256 with vendor-published checksums. There is no pinned-checksum file here (it
+    needs a signed source and a place in the repo that this task does not own).
 - **Scratch repos live outside this repo**, under `${TMPDIR:-/tmp}/harness-spike/<run-id>/`, so this repo's CLAUDE.md,
   hooks and settings never load into a spiked CLI session. `spike_cleanup` refuses to delete anything outside that root.
 - **Captures are gitignored** (`spike/captures/<cli>/<UTC timestamp>/`). Run captured output through `spike_redact`
@@ -120,9 +140,9 @@ most Linux have it; only core modules are used).
 
 | Path | Status | Purpose |
 |---|---|---|
-| `lib/common.sh` | done (T-001) | sourced helpers: `spike_scratch_repo`, `spike_worktree_add`, `spike_cleanup`, `spike_require_live`, `spike_capture_dir`, `spike_redact`, `spike_resolve_path`, `spike_run_timeout`, `spike_run_live`, `spike_run_live_split <seconds> <outfile> <errfile> <cmd> ...` (T-008: stderr to its own file under the outfile policy), `spike_run_status <seconds> <out> "$SPIKE_VERIFIED_COPY" ...`, `spike_run_timed`, `spike_mark_verified <path> <cli>`, `spike_register_cli <name>`, `spike_under_cli_home`, `spike_verify_init`, `spike_verify_dir`, `spike_verify_cleanup`, `spike_tool_path` |
-| `lib/runner.pl` | done (T-001) | the one Perl helper behind `common.sh` (resolve, CLI-home identity check, registration, gate, run with an in-group watchdog); not called directly |
-| `preflight.sh` | done (T-001) | table of install path, version, code-signature result and sign-in state for each CLI; verifies and runs only a private copy |
+| `lib/common.sh` | done (T-001) | sourced helpers: `spike_scratch_repo`, `spike_worktree_add`, `spike_cleanup`, `spike_require_live`, `spike_capture_dir`, `spike_redact`, `spike_resolve_path`, `spike_run_timeout`, `spike_run_live`, `spike_run_live_split <seconds> <outfile> <errfile> <cmd> ...` (T-008: stderr to its own file under the outfile policy), `spike_run_status <seconds> <out> "$SPIKE_VERIFIED_BIN" ...` (`$SPIKE_VERIFIED_COPY` is its historical alias), `spike_run_timed`, `spike_mark_verified <path> <cli>`, `spike_register_cli <name>`, `spike_under_cli_home`, `spike_verify_init`, `spike_verify_dir`, `spike_verify_cleanup`, `spike_tool_path` |
+| `lib/runner.pl` | done (T-001), FROZEN 2026-10-26 | the one Perl helper behind `common.sh` (resolve, CLI-home identity check, in-place registration, gate, run with an in-group watchdog); not called directly |
+| `preflight.sh` | done (T-001) | table of install path, version, code-signature result and sign-in state for each CLI; verifies the resolved real binary in place and runs only that verified path |
 | `tests/test_common.sh` | done (T-001) | offline tests for `lib/common.sh` and `lib/runner.pl` |
 | `tests/test_preflight.sh` | done (T-001) | offline tests for `preflight.sh` using fake CLIs on a private PATH |
 | `plan/hash.sh`, `plan/check.jq`, `tests/test_plan.sh` | planned (T-005) | plan hash and approval-binding checker |
@@ -151,7 +171,7 @@ of `lib/runner.pl`).
 `preflight.sh` exits 0 when it printed a report (a missing or signed-out CLI is reported, not an error) and 1 when `jq` or
 `git` is missing, or when the temporary directory is unsafe for the private verify directory (writable by others without the
 sticky bit, or inside a CLI home): that is a "needs human review" stop. Its `SIGNATURE` column comes from
-`codesign --verify --strict` on the private copy of the resolved binary, plus the signer (first Authority line) and team id
-from `codesign -dv` on that same copy. In the PATH column the home directory is shown as `~` and any at-sign in a path is
+`codesign --verify --strict` on the resolved real binary, in place, plus the signer (first Authority line) and team id
+from `codesign -dv` on that same file. In the PATH column the home directory is shown as `~` and any at-sign in a path is
 shown as `%` (scoped package directories contain one); this is display only, and the report footer says so. Version text is
 filtered to printable characters so a CLI cannot inject terminal escape sequences.

@@ -28,14 +28,15 @@
 #   - Children run headless: stdin is /dev/null, output goes to the outfile, and they are not in a new session. A CLI
 #     that opens the terminal device is out of scope (rule 3).
 #   - SPIKE_LIVE=1 is a guard against accidents, not an approval. Only the human sets it.
-#   - Registration (spike_mark_verified / spike_register_cli) opens the file once, copies from that descriptor into a
-#     private 0700 directory the helper creates, runs the fixed codesign on the COPY and records the copy's sha256.
-#     spike_run_status re-hashes the copy before it runs it (rule 6). The verify directory cannot be chosen by the caller.
+#   - Registration (spike_mark_verified / spike_register_cli) VERIFIES IN PLACE (2026-10-26): the helper resolves the installed
+#     CLI to its real physical path, opens the file once, runs the fixed codesign on THAT file and records its sha256 in the
+#     registry of a private 0700 directory the helper creates. No copy of the binary is made. A run re-hashes the same file
+#     and then executes that same real path (rule 6). The verify directory cannot be chosen by the caller.
 #   - Round 8 policy: the CLI-home names come from compliance/denylist.txt at run time (every operation fails closed, rc 121,
 #     if it is unusable). A run refuses (rc 125) unless HOME is the account's password-database home, and the child's HOME
 #     is always that home. The outfile is opened O_NOFOLLOW|O_APPEND, mode 0600, and a symlink, a hard link, a non-regular
 #     file (the null device excepted) or a parent inside a CLI home is refused. spike_run_timed runs exactly `jq --version`
-#     or `git --version`. A pinned CLI name (claude, codex) runs live only as the registered, hash-verified copy.
+#     or `git --version`. A pinned CLI name (claude, codex) runs live only as the registered, hash-verified binary.
 
 # Load-once guard (round 8): the library is "loaded" only if its own function exists in THIS shell. An inherited variable
 # cannot make a fresh shell skip loading (and so skip the live gate and the TERM trap).
@@ -501,11 +502,14 @@ spike_verify_cleanup() {
 
 # ---- registration (rule 6) ---------------------------------------------------------------------------------------------------
 # SPIKE_SIG_TEXT          signature column text of the last registration
-# SPIKE_VERIFIED_COPY     path of the registered private copy (the ONLY path spike_run_status accepts)
-# SPIKE_REG_STATUS        verified | notfound | unresolvable | clihome | hardlink | script | other | signer | copyfail | badpath | badcli | error
+# SPIKE_VERIFIED_BIN      the verified REAL physical path of the installed CLI (the ONLY path spike_run_status accepts)
+# SPIKE_VERIFIED_COPY     historical name, always the same value as SPIKE_VERIFIED_BIN (no copy is made any more; kept so
+#                         T-002/T-003 keep working unchanged)
+# SPIKE_REG_STATUS        verified | notfound | unresolvable | clihome | hardlink | script | other | signer | recordfail | badpath | badcli | error
 # SPIKE_REG_KIND          mach-o | script | other | refused | -
 # SPIKE_REG_PATH          the resolved original (or the PATH hit when it could not be resolved)
 SPIKE_SIG_TEXT=""
+SPIKE_VERIFIED_BIN=""
 SPIKE_VERIFIED_COPY=""
 SPIKE_REG_STATUS=""
 SPIKE_REG_KIND=""
@@ -516,6 +520,7 @@ _spike_register() {
   local cli="$1" mode="$2" src="$3" out rc rest tab
   tab="$(printf '\t')"
   SPIKE_SIG_TEXT=""
+  SPIKE_VERIFIED_BIN=""
   SPIKE_VERIFIED_COPY=""
   SPIKE_REG_STATUS="error"
   SPIKE_REG_KIND="-"
@@ -538,19 +543,22 @@ _spike_register() {
   # shellcheck disable=SC2034 # public API: read by callers that source this file
   SPIKE_REG_PATH="${rest%%"$tab"*}"
   rest="${rest#*"$tab"}"
-  SPIKE_VERIFIED_COPY="${rest%%"$tab"*}"
+  SPIKE_VERIFIED_BIN="${rest%%"$tab"*}"
+  SPIKE_VERIFIED_COPY="$SPIKE_VERIFIED_BIN"
   SPIKE_SIG_TEXT="${rest#*"$tab"}"
   case "$SPIKE_REG_STATUS" in
     verified) return 0 ;;
     notfound) return 4 ;;
   esac
   # shellcheck disable=SC2034 # public API: read by callers that source this file
+  SPIKE_VERIFIED_BIN=""
+  # shellcheck disable=SC2034 # public API: read by callers that source this file
   SPIKE_VERIFIED_COPY=""
   return 2
 }
 
-# spike_mark_verified <absolute path> <cli>: copy a regular executable Mach-O into the private verify directory, check the
-# COPY with the pinned signer of <cli> (claude or codex), and register it. Sets SPIKE_VERIFIED_COPY: pass THAT path to
+# spike_mark_verified <absolute path> <cli>: verify a regular executable Mach-O IN PLACE (no copy): check that file with the pinned
+# signer of <cli> (claude or codex), record its sha256, and register its real path. Sets SPIKE_VERIFIED_BIN (and the historical alias SPIKE_VERIFIED_COPY): pass THAT path to
 # spike_run_status. Returns 2 and registers nothing for anything else (relative path, symlink, directory, control character,
 # hard link, CLI-home file that is not a Mach-O, non-Mach-O, wrong signer). Preflight only.
 spike_mark_verified() {
@@ -584,8 +592,8 @@ spike_register_cli() {
 #                      resolved path). Anything else needs SPIKE_LIVE=1, including every provider CLI, whatever its name.
 #   spike_run_live     always needs SPIKE_LIVE=1. Every real prompt or session goes through here. A command whose basename (or
 #                      resolved basename) is a pinned CLI name (claude, codex) runs ONLY as the current registered,
-#                      hash-verified copy (SPIKE_VERIFIED_COPY); SPIKE_LIVE does not lift that (rule 6).
-#   spike_run_status   only a private verified copy that registration produced (SPIKE_VERIFIED_COPY), only if its content
+#                      hash-verified binary (SPIKE_VERIFIED_BIN, alias SPIKE_VERIFIED_COPY); SPIKE_LIVE does not lift that (rule 6).
+#   spike_run_status   only the verified binary that registration produced (SPIKE_VERIFIED_BIN), only if its content
 #                      still has the recorded sha256, and only the three status shapes. SPIKE_LIVE does not lift this.
 #   spike_run_timed    exactly `jq --version` and `git --version` (display only), nothing else: closed environment.
 # Exit codes: the command's own; 124 timeout; 2 usage / cannot resolve; 3 refused by the gate (the calling SCRIPT is
@@ -686,7 +694,7 @@ _spike_denylist_fail() {
 
 # _spike_run_live_policy <seconds> <outfile> <cmd> [args...]: the live path shared by spike_run_timeout (after its gate) and
 # spike_run_live. SPIKE_LIVE=1 is already required. The helper refuses (rc 3) a command whose basename or resolved basename is
-# a pinned CLI name (claude, codex) unless it is the current registered, hash-verified copy; that stops the calling SCRIPT.
+# a pinned CLI name (claude, codex) unless it is the current registered, hash-verified binary; that stops the calling SCRIPT.
 _spike_run_live_policy() {
   local secs="$1" out="$2" cmd="$3" res rc
   shift 3
@@ -694,7 +702,7 @@ _spike_run_live_policy() {
   rc=$?
   if [ "$rc" -eq 121 ]; then _spike_denylist_fail; return 121; fi
   if [ "$rc" -eq 3 ]; then
-    _spike_stop_script "refusing: $cmd is named like a pinned CLI and is not the current registered, hash-verified copy (rule 6); pass \"\$SPIKE_VERIFIED_COPY\" after preflight registration"
+    _spike_stop_script "refusing: $cmd is named like a pinned CLI and is not the current registered, hash-verified binary (rule 6); pass \"\$SPIKE_VERIFIED_BIN\" after preflight registration"
   fi
   if [ "$rc" -ne 0 ]; then
     spike_err "cannot resolve command: $cmd"
@@ -708,7 +716,7 @@ _spike_run_live_policy() {
 # path inside the private verify directory, true, false, sleep, echo, printf, each only from a system directory). The words
 # in the ARGUMENTS of those commands are not examined (they cannot launch anything once the identity is enforced); a provider
 # word in the program name is never ungated. Everything else needs SPIKE_LIVE=1, and a pinned CLI name needs the registered
-# copy even then. The command is resolved once and the resolved path is what runs.
+# binary even then. The command is resolved once and the resolved path is what runs.
 spike_run_timeout() {
   local secs out cmd res rc
   _spike_run_args_ok "$@" || return 2
@@ -734,7 +742,7 @@ spike_run_timeout() {
 # spike_run_live <seconds> <outfile> <cmd> [args...]
 # The runner for every real prompt or session. Always checks the live gate first (SPIKE_LIVE=1, set by the human). A command
 # named like a pinned CLI (claude, codex; by argv[0] or by the resolved target) runs only as the current registered,
-# hash-verified copy: pass "$SPIKE_VERIFIED_COPY" (rule 6).
+# hash-verified binary: pass "$SPIKE_VERIFIED_BIN" (rule 6).
 spike_run_live() {
   local secs out cmd
   _spike_run_args_ok "$@" || return 2
@@ -745,7 +753,7 @@ spike_run_live() {
 }
 
 # spike_run_live_split <seconds> <outfile> <errfile> <cmd> [args...]
-# Exactly spike_run_live (same live gate, same verified-copy rule, same environment, watchdog and signal handling), except
+# Exactly spike_run_live (same live gate, same verified-binary rule, same environment, watchdog and signal handling), except
 # that the command's stdout goes to <outfile> and its stderr to <errfile>, so a caller can tell event lines (stdout) from
 # diagnostics (stderr). <errfile> gets the outfile policy: O_NOFOLLOW|O_APPEND, mode 0600, and a symlink, a hard link, a
 # non-regular file (the null device excepted) or a parent inside a CLI home is refused (rc 125). The two files must be
@@ -765,8 +773,8 @@ spike_run_live_split() {
   _spike_run_live_policy "$secs" "$out" "$cmd" "$@"
 }
 
-# spike_run_status <seconds> <outfile> <copy> [args...]
-# Only the copy that registration produced (pass "$SPIKE_VERIFIED_COPY"), only while its content still has the sha256
+# spike_run_status <seconds> <outfile> <verified-bin> [args...]
+# Only the binary that registration verified (pass "$SPIKE_VERIFIED_BIN"), only while its content still has the sha256
 # recorded at registration, and only --version, auth status or login status. Any other path, any changed content and any
 # other shape is refused (rc 3, nothing started), with or without SPIKE_LIVE.
 spike_run_status() {
@@ -777,7 +785,7 @@ spike_run_status() {
   res="$(_spike_helper gate status "${_SPIKE_VERIFY_DIR:--}" "$cmd" "$@" 2>/dev/null)"
   rc=$?
   if [ "$rc" -ne 0 ]; then
-    _spike_stop_script "refusing: $cmd is not an unchanged verified copy registered by preflight, or the arguments are not a status shape; spike_run_status runs only those"
+    _spike_stop_script "refusing: $cmd is not the unchanged verified binary registered by preflight, or the arguments are not a status shape; spike_run_status runs only those"
   fi
   _spike_exec status "$secs" "$out" "$_SPIKE_VERIFY_DIR" "$res" "$@"
 }
