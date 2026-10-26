@@ -8,12 +8,12 @@
 # What it does, once, with no retry and no loop (rules 1 and 10):
 #   1. registers the claude on PATH as a hash-verified private copy (rule 6); anything else is refused
 #   2. makes a scratch repo + worktree "claude-1" under $TMPDIR/harness-spike/ (outside this repo)
-#   3. with cwd = the worktree, runs through spike_run_live (closed environment, 120 s watchdog):
+#   3. with cwd = the worktree, runs through spike_run_live_split (closed environment, 120 s watchdog):
 #        claude -p "<TASK>" --output-format stream-json --verbose --permission-mode acceptEdits --max-turns 5
 #      --max-turns is a documented print-mode option (https://code.claude.com/docs/en/cli-reference), but `claude --help`
 #      (2.1.295) does NOT list it: the flag is hidden from help (hideHelp) and still defined in the binary. So the turn cap is
 #      5 (rule 1 ceiling: 40) and the live run must confirm it is honoured. The 120 s runner watchdog is a second, independent limit.
-#   4. splits the output (split.jq) into raw.jsonl (JSON object lines) and stderr.txt (everything else), runs parse.jq, prints a summary
+#   4. the runner writes stdout to raw.jsonl and stderr to stderr.txt (spike_run_live_split), then parse.jq runs and a summary prints
 # Capture files are private: umask 077 below, so nothing in the capture directory is group- or world-readable.
 # Headless -p only (rule 3). No config-home variable is named or set (rule 2); no credential file is read (rule 4).
 set -u
@@ -24,7 +24,7 @@ case "$_here" in
   */*) _here="${_here%/*}" ;;
   *) _here="." ;;
 esac
-HERE="$(CDPATH= cd -P -- "$_here" && pwd -P)"
+HERE="$(CDPATH="" cd -P -- "$_here" && pwd -P)"
 unset _here
 # shellcheck disable=SC1091
 . "$HERE/../lib/common.sh"
@@ -120,20 +120,17 @@ printf '%s\n' "$RUN_DIR" > "$CAP/rundir.path"
 printf '%s\n' "$TASK" > "$CAP/task.txt"
 
 # ---- 3. the one run -----------------------------------------------------------------------------------------------------------------
-# The runner has no cwd option, so the script changes directory itself. The runner puts stdout AND stderr of the child into
-# the one output file, so the output is split afterwards (step 4).
+# The runner has no cwd option, so the script changes directory itself. spike_run_live_split puts the child's stdout in raw.jsonl
+# and its stderr in stderr.txt; no text-based splitting happens afterwards.
 cd "$WT" || exit 1
-# combined.txt is created by the runner itself (mode 0600), not pre-created here.
-spike_run_live "$WATCHDOG_SECS" "$CAP/combined.txt" "$COPY" \
+# raw.jsonl and stderr.txt are created by the runner itself (mode 0600), not pre-created here.
+spike_run_live_split "$WATCHDOG_SECS" "$CAP/raw.jsonl" "$CAP/stderr.txt" "$COPY" \
   -p "$TASK" --output-format stream-json --verbose --permission-mode acceptEdits --max-turns "$MAX_TURNS"
 rc=$?
 cd "$HERE" || exit 1
 
-# ---- 4. split, parse, summarise ---------------------------------------------------------------------------------------------------
-# A line that is a JSON object goes to raw.jsonl; everything else (stderr text, a startup warning) goes to stderr.txt.
-# Both files are always created by the redirects (a missing combined.txt, e.g. a refused run, gives two empty files).
-jq -R -r --arg part raw -f "$HERE/split.jq" "$CAP/combined.txt" > "$CAP/raw.jsonl" 2>/dev/null
-jq -R -r --arg part other -f "$HERE/split.jq" "$CAP/combined.txt" > "$CAP/stderr.txt" 2>/dev/null
+# ---- 4. parse, summarise ------------------------------------------------------------------------------------------------------------
+# A refused run may leave no raw.jsonl: parse.jq then fails, the summary becomes {} and the verdict is FAIL.
 jq -Rs -f "$HERE/parse.jq" "$CAP/raw.jsonl" > "$CAP/summary.json" 2>/dev/null
 PARSE_RC=$?
 [ "$PARSE_RC" -eq 0 ] || printf '{}\n' > "$CAP/summary.json"
@@ -157,7 +154,7 @@ printf 'verdict       : %s\n' "$verdict"
 printf 'capture       : %s\n' "$CAP"
 printf 'worktree      : %s\n' "$WT"
 printf 'hello.txt ok  : %s\n' "$hello"
-printf 'stderr lines  : %s\n' "$(wc -l < "$CAP/stderr.txt" | tr -d ' ')"
+printf 'stderr lines  : %s\n' "$(cat -- "$CAP/stderr.txt" 2>/dev/null | wc -l | tr -d ' ')"
 printf -- '-- summary (bounded fields only; text is untrusted data) --\n'
 jq . "$CAP/summary.json" | tr -cd '[:print:]\n'
 printf -- '-- next --\n'

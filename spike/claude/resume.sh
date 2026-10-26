@@ -6,7 +6,7 @@
 # Without SPIKE_LIVE=1 this exits 3 before anything else happens (arguments are not even looked at, nothing is read or run).
 #
 # Reads session_id from <capture-dir>/raw.jsonl (through parse.jq), then with cwd = the same scratch worktree runs, through
-# spike_run_live (registered hash-verified copy, closed environment, 120 s watchdog):
+# spike_run_live_split (registered hash-verified copy, closed environment, 120 s watchdog):
 #   claude -p "<follow-up>" --resume <session_id> --output-format stream-json --verbose --permission-mode acceptEdits --max-turns 5
 # and records whether the session id was reused and whether hello.txt has both lines.
 # Differences from the brief's sketch, on purpose: the prompt comes before --resume (the form the headless docs show:
@@ -23,7 +23,7 @@ case "$_here" in
   */*) _here="${_here%/*}" ;;
   *) _here="." ;;
 esac
-HERE="$(CDPATH= cd -P -- "$_here" && pwd -P)"
+HERE="$(CDPATH="" cd -P -- "$_here" && pwd -P)"
 unset _here
 # shellcheck disable=SC1091
 . "$HERE/../lib/common.sh"
@@ -131,7 +131,7 @@ for f in raw.jsonl worktree.path; do
   safe_input_file "$CAP/$f" || { spike_err "capture file $f is missing or refused (not a plain single-link file outside the CLI homes): $CAP"; exit 2; }
 done
 # resume.sh writes these names into the capture; a pre-existing entry (a hard link or symlink would be written through) is refused.
-for f in resume-combined.txt resume-raw.jsonl resume-stderr.txt resume-summary.json resume-result.json; do
+for f in resume-raw.jsonl resume-stderr.txt resume-summary.json resume-result.json; do
   if [ -e "$CAP/$f" ] || [ -L "$CAP/$f" ]; then spike_err "capture already holds $f: refusing (one resume per capture)"; exit 2; fi
 done
 
@@ -172,14 +172,12 @@ COPY="$SPIKE_VERIFIED_COPY"
 cd "$WT" || exit 1
 # Atomic one-resume guard, right before the one run. A second (or racing) resume of this capture is refused here.
 reserve_resume || { spike_err "this capture has already been resumed (or a resume is running): one resume per capture, refusing (rule 10)"; exit 1; }
-# resume-combined.txt is created by the runner itself (mode 0600), not pre-created here.
-spike_run_live "$WATCHDOG_SECS" "$CAP/resume-combined.txt" "$COPY" \
+# resume-raw.jsonl and resume-stderr.txt are created by the runner itself (mode 0600), not pre-created here.
+spike_run_live_split "$WATCHDOG_SECS" "$CAP/resume-raw.jsonl" "$CAP/resume-stderr.txt" "$COPY" \
   -p "$PROMPT" --resume "$SID" --output-format stream-json --verbose --permission-mode acceptEdits --max-turns "$MAX_TURNS"
 rc=$?
 cd "$HERE" || exit 1
 
-jq -R -r --arg part raw -f "$HERE/split.jq" "$CAP/resume-combined.txt" > "$CAP/resume-raw.jsonl" 2>/dev/null
-jq -R -r --arg part other -f "$HERE/split.jq" "$CAP/resume-combined.txt" > "$CAP/resume-stderr.txt" 2>/dev/null
 jq -Rs -f "$HERE/parse.jq" "$CAP/resume-raw.jsonl" > "$CAP/resume-summary.json" 2>/dev/null
 PARSE_RC=$?
 [ "$PARSE_RC" -eq 0 ] || printf '{}\n' > "$CAP/resume-summary.json"

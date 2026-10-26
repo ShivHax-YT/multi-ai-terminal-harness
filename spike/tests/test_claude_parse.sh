@@ -9,7 +9,6 @@ unset CDPATH
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 SPIKE="$(cd "$HERE/.." && pwd -P)"
 PARSE="$SPIKE/claude/parse.jq"
-SPLIT="$SPIKE/claude/split.jq"
 SCRUB="$SPIKE/claude/scrub-init.jq"
 RUN="$SPIKE/claude/run.sh"
 RESUME="$SPIKE/claude/resume.sh"
@@ -44,7 +43,6 @@ for f in "$RUN" "$RESUME" "$HERE/test_claude_parse.sh"; do
   check "bash -n ${f##*/}" /bin/bash -n "$f"
 done
 check "jq compiles parse.jq" jq -n -f "$PARSE" --argjson x 1
-check "jq compiles split.jq" jq -n -f "$SPLIT" --arg part raw
 check "jq compiles scrub-init.jq" jq -n -f "$SCRUB"
 check "scripts are executable" test -x "$RUN" -a -x "$RESUME"
 
@@ -201,43 +199,24 @@ for f in "$RUN" "$RESUME"; do
   first_run="$(grep -n 'spike_run_live\|spike_register_cli\|spike_scratch_repo' "$f" | grep -v '^[0-9]*:#' | head -1 | cut -d: -f1)"
   if [ -n "$first_stmt" ] && [ -n "$first_run" ] && [ "$first_stmt" -lt "$first_run" ]; then ok; else bad "$n: spike_require_live comes before any other spike action"; fi
   check "$n: sources the T-001 library" grep -q 'lib/common.sh' "$f"
-  check "$n: starts the CLI only through spike_run_live with the verified copy" grep -q 'spike_run_live .*"\$COPY"' "$f"
+  check "$n: starts the CLI only through spike_run_live_split with the verified copy" grep -q 'spike_run_live_split [^ ]* "\$CAP/[a-z-]*raw.jsonl" "\$CAP/[a-z-]*stderr.txt" "\$COPY"' "$f"
   if calls_cli_directly "$f"; then bad "$n: calls claude directly"; else ok; fi
   if grep -nE 'bypass|dangerously|CONFIG_DIR|[A-Z]+_HOME|expect|send-keys|tmux|script -q' "$f" | grep -v '^[0-9]*:[[:space:]]*#' >/dev/null; then bad "$n: forbidden word"; else ok; fi
   if grep -nE '(^|[^a-z_])(while|until)([^a-z_]|$)|seq |retry_|retries' "$f" | grep -v '^[0-9]*:[[:space:]]*#' | grep -v 'for f in' >/dev/null; then bad "$n: loop or retry"; else ok; fi
   # every non-comment line that mentions spike_run_live, indented or not: exactly one
   check "$n: only one run call" test "$(grep -v '^[[:space:]]*#' "$f" | grep -c 'spike_run_live')" -eq 1
+  check "$n: exactly one spike_run_live_split call" test "$(grep -v '^[[:space:]]*#' "$f" | grep -c 'spike_run_live_split')" -eq 1
+  check "$n: no plain spike_run_live call" test "$(grep -v '^[[:space:]]*#' "$f" | grep -cE 'spike_run_live([^_]|$)')" -eq 0
+  if grep -v '^[[:space:]]*#' "$f" | grep -qE 'split\.jq|combined|fromjson|startswith\("\{"\)'; then bad "$n: heuristic stdout/stderr split remains"; else ok; fi
   check "$n: sets umask 077 before anything else runs" test "$(grep -v '^[[:space:]]*#' "$f" | grep -v '^[[:space:]]*$' | sed -n '1,3p' | grep -c '^umask 077$')" -eq 1
   check "$n: umask 077 comes before spike_require_live" test "$(grep -n '^umask 077$' "$f" | head -1 | cut -d: -f1)" -lt "$(grep -n '^spike_require_live$' "$f" | head -1 | cut -d: -f1)"
   if grep -v '^[[:space:]]*#' "$f" | grep -qE ':[[:space:]]*>[[:space:]]*"?\$CAP/'; then bad "$n: pre-creates a capture file with a default-mode redirect"; else ok; fi
-  check "$n: splits output through split.jq" grep -q -e '-f "\$HERE/split.jq"' "$f"
-  if grep -v '^[[:space:]]*#' "$f" | grep -q "fromjson"; then bad "$n: inline stdout split instead of split.jq"; else ok; fi
   check "$n: says --max-turns is hidden from help" grep -q 'hideHelp' "$f"
   check "$n: handles runner status 121" grep -q '121)' "$f"
   check "$n: passes a turn cap" grep -q -e '--max-turns' "$f"
   check "$n: uses acceptEdits" grep -q -e '--permission-mode acceptEdits' "$f"
   check "$n: uses headless -p" grep -q -e ' -p ' "$f"
 done
-
-# ---- split.jq: every line lands in exactly one output; only JSON OBJECT lines are raw ----------------------------------------------
-COMB="$TMP/combined.txt"
-{
-  printf '%s\n' '{"type":"system","subtype":"init","session_id":"abcdefgh-1"}'
-  printf '%s\n' '42' '"a string"' '[1,2]' 'null' 'true' 'plain stderr text' '{"half":' ''
-  printf '%s\n' '  {"type":"result","subtype":"success"}'
-  printf '%s\n' 'warning: {"type":"assistant"} inside text'
-  printf '%s\n' '{"type":"result","subtype":"success","is_error":false}'
-} > "$COMB"
-RAWOUT="$(jq -R -r --arg part raw -f "$SPLIT" "$COMB")"
-OTHEROUT="$(jq -R -r --arg part other -f "$SPLIT" "$COMB")"
-check "split raw: only the three object lines" test "$(printf '%s\n' "$RAWOUT" | wc -l | tr -d ' ')" -eq 3
-check "split raw: every kept line is a JSON object" test "$(printf '%s\n' "$RAWOUT" | jq -s 'all(type == "object")')" = "true"
-check "split other: has the non-object JSON lines" test "$(printf '%s\n' "$OTHEROUT" | grep -cxE '42|"a string"|\[1,2\]|null|true')" -eq 5
-check "split other: has the text, half-line and blank lines" test "$(printf '%s\n' "$OTHEROUT" | grep -cE 'plain stderr text|^\{"half":$|inside text|^$')" -eq 4
-check "split: raw + other = all lines" test "$(( $(printf '%s\n' "$RAWOUT" | wc -l) + $(printf '%s\n' "$OTHEROUT" | wc -l) ))" -eq "$(wc -l < "$COMB" | tr -d ' ')"
-check "split raw output parses cleanly with parse.jq" test "$(printf '%s\n' "$RAWOUT" | parse | jq -r '(.unknown | length | tostring) + "/" + (.malformed | length | tostring)')" = "0/0"
-check "split.jq refuses a missing part argument" test "$(jq -R -r -f "$SPLIT" "$COMB" 2>&1 | grep -c 'needs --arg part\|not defined')" -ge 1
-check "split of an empty file is empty" test -z "$(jq -R -r --arg part raw -f "$SPLIT" /dev/null)"
 
 # ---- scrub-init.jq: personal configuration is removed from the init event ----------------------------------------------------------
 PERSONAL='{"type":"system","subtype":"init","session_id":"abcdefgh-1","cwd":"<WORKTREE>","tools":["Bash","mcp__acme_corp_vpn__connect"],"mcp_servers":[{"name":"acme-corp-vpn","status":"connected"}],"plugins":[{"name":"acme-plugin","path":"/x"}],"skills":["acme-deploy","review"],"slash_commands":["/acme-secret","/help"],"agents":["acme-agent"],"model":"claude-model-example","permissionMode":"acceptEdits","output_style":"default"}'
@@ -366,8 +345,8 @@ check "reserve_resume: 16 parallel racers produce exactly one winner" test "$(ca
 check "reserve_resume: and 15 losers" test "$(cat "$RACE"/out/* | grep -c '^lose$')" -eq 15
 # the refusal is in place and comes before the run
 res_line="$(grep -n '^reserve_resume || ' "$RESUME" | head -1 | cut -d: -f1)"
-run_line="$(grep -n '^spike_run_live ' "$RESUME" | head -1 | cut -d: -f1)"
-if [ -n "$res_line" ] && [ -n "$run_line" ] && [ "$res_line" -lt "$run_line" ]; then ok; else bad "resume.sh: the reservation line ($res_line) must precede the spike_run_live line ($run_line)"; fi
+run_line="$(grep -n '^spike_run_live_split ' "$RESUME" | head -1 | cut -d: -f1)"
+if [ -n "$res_line" ] && [ -n "$run_line" ] && [ "$res_line" -lt "$run_line" ]; then ok; else bad "resume.sh: the reservation line ($res_line) must precede the spike_run_live_split line ($run_line)"; fi
 check "resume.sh: the reservation is right before the run (only comments between)" test "$(sed -n "$((res_line + 1)),$((run_line - 1))p" "$RESUME" | grep -v '^[[:space:]]*#' | grep -c '[^[:space:]]')" -eq 0
 check "resume.sh: reserve_resume uses mkdir on resume.lock" grep -qF 'mkdir "$CAP/resume.lock"' "$RESUME"
 check "resume.sh: the lock is never removed" test -z "$(grep -v '^[[:space:]]*#' "$RESUME" | grep -E 'rmdir|rm -|resume\.lock.*(rm|rmdir)')"
@@ -465,7 +444,7 @@ read1_line="$(grep -n 'parse.jq" "\$CAP/raw.jsonl"' "$RESUME" | head -1 | cut -d
 read2_line="$(grep -n 'head -n 1 "\$CAP/worktree.path"' "$RESUME" | head -1 | cut -d: -f1)"
 if [ -n "$san_line" ] && [ -n "$read1_line" ] && [ -n "$read2_line" ] && [ "$san_line" -lt "$read1_line" ] && [ "$san_line" -lt "$read2_line" ]; then ok; else bad "safe_input_file runs before raw.jsonl and worktree.path are read ($san_line/$read1_line/$read2_line)"; fi
 check "the loop covers raw.jsonl and worktree.path" grep -qF 'for f in raw.jsonl worktree.path; do' "$RESUME"
-check "resume.sh refuses pre-existing resume output names" grep -qF 'for f in resume-combined.txt resume-raw.jsonl resume-stderr.txt resume-summary.json resume-result.json; do' "$RESUME"
+check "resume.sh refuses pre-existing resume output names" grep -qF 'for f in resume-raw.jsonl resume-stderr.txt resume-summary.json resume-result.json; do' "$RESUME"
 # every read of a capture file in resume.sh is of a name the loop checked, or of a file this script wrote itself
 reads="$(grep -v '^[[:space:]]*#' "$RESUME" | grep -o '< *"\$CAP/[A-Za-z.-]*"\|cat *"\$CAP/[A-Za-z.-]*"\|head [^|]*"\$CAP/[A-Za-z.-]*"' | grep -o '"\$CAP/[A-Za-z.-]*"' | sort -u | tr '\n' ' ')"
 check "resume.sh reads only the two checked capture files by redirect/cat/head ($reads)" test -z "$(printf '%s\n' "$reads" | tr ' ' '\n' | grep -v '^$' | grep -v 'raw.jsonl\|worktree.path')"

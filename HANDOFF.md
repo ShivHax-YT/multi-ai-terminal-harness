@@ -1,27 +1,27 @@
 # HANDOFF T-002
 
 ## Summary
-Added the Claude Code headless spike: run.sh (one `claude -p` stream-json run in a scratch worktree, turn cap 5, 120 s runner watchdog), resume.sh (one atomic-guarded resume by session id), parse.jq, split.jq and scrub-init.jq. Without SPIKE_LIVE=1 both live scripts exit 3 and do nothing; the CLI runs only as the hash-verified copy through spike_run_live.
+Added the Claude Code headless spike: run.sh (one `claude -p` stream-json run in a scratch worktree, turn cap 5, 120 s runner watchdog), resume.sh (one atomic-guarded resume by session id), parse.jq and scrub-init.jq. Without SPIKE_LIVE=1 both live scripts exit 3 and do nothing; the CLI runs only as the hash-verified copy through spike_run_live_split (T-008: stdout to raw.jsonl, stderr to stderr.txt, no post-hoc split).
 Success is decided by `completion_verdict` (CLI exit 0, parse.jq exit 0, result event with is_error false, usable session id; fixed reason strings); hello.txt is checked byte-exact by `hello_ok` and never rescues a failure. resume.sh reserves the resume with an atomic mkdir lock and reads capture files only after `safe_input_file` (regular, no symlink, one link, outside the CLI homes).
 EVENTS.md documents each event type (from docs, or seen in the binary and not observed); fixtures are hand-written, personal init config is scrubbed by scrub-init.jq before a capture is promoted. The live run is the human's job; this branch never set SPIKE_LIVE and never ran the real binary.
 
 ## Files changed
-- spike/claude/run.sh - one live run: register verified copy, scratch repo + worktree claude-1, spike_run_live, split output, parse, print summary
+- spike/claude/run.sh - one live run: register verified copy, scratch repo + worktree claude-1, spike_run_live_split, parse, print summary
 - spike/claude/resume.sh - one live resume of a capture's session id; reports id reuse and whether hello.txt has both lines
-- spike/claude/split.jq - splits the runner's combined output into raw.jsonl (JSON objects only) and stderr.txt (everything else); used by run.sh and resume.sh
+- spike/claude/split.jq - REMOVED (T-008 adoption: the runner now separates stderr itself)
 - spike/claude/scrub-init.jq - replaces the system/init lists (mcp_servers, plugins, skills, slash_commands, agents, tools) with ["<redacted>"] plus counts; run before spike_redact when promoting a capture
 - spike/claude/parse.jq - event summariser (accepts raw text with -Rs or an array with -s; never fails on unknown or malformed input)
 - spike/claude/EVENTS.md - table of every type/subtype with source, fixtures and a one-line example; limit and error shapes from docs; flag facts with sources
 - spike/fixtures/claude/sample.jsonl - hand-written normal run
 - spike/fixtures/claude/limits.jsonl - hand-written limit and error shapes
 - spike/fixtures/claude/README.md - what the fixtures are and the pending observed.jsonl
-- spike/tests/test_claude_parse.sh - offline tests (291 checks)
+- spike/tests/test_claude_parse.sh - offline tests (284 checks)
 - HANDOFF.md - this file
 
 ## Tests run
-- /bin/bash spike/tests/test_claude_parse.sh - 291 passed, 0 failed (session_id found; numeric usage; injected unknown/malformed lines handled; run.sh and resume.sh exit 3 without SPIKE_LIVE with a fake claude marker still absent; fixtures have no at-sign, /Users/ or /home/; EVENTS.md covers every fixture type/subtype)
+- /bin/bash spike/tests/test_claude_parse.sh - 284 passed, 0 failed (session_id found; numeric usage; injected unknown/malformed lines handled; run.sh and resume.sh exit 3 without SPIKE_LIVE with a fake claude marker still absent; fixtures have no at-sign, /Users/ or /home/; EVENTS.md covers every fixture type/subtype)
 - make -s check-fast - PASS (compliance scan clean)
-- make -s spike-test - NOT CLEAN in this sandbox: it stops in T-001's test_common.sh with "sandbox guard refused: no parent for <fake home file>" (an environment issue; that suite and spike/lib are untouched here); it passed in the original T-002 commit. test_claude_parse.sh alone passes (291). The test_common failure is the known macOS sandbox-guard bug that T-008 fixes
+- make -s spike-test - NOT CLEAN in this sandbox: it stops in T-001's test_common.sh with "sandbox guard refused: no parent for <fake home file>" (an environment issue; that suite and spike/lib are untouched here); it passed in the original T-002 commit. test_claude_parse.sh alone passes (284). The test_common failure is the known macOS sandbox-guard bug that T-008 fixes
 - scripts/ci/compliance-scan.sh - clean
 - bash -n on run.sh, resume.sh and the test - clean
 - spike/handoff/parse.sh --root of this worktree - parses this file, exit 0
@@ -48,9 +48,9 @@ EVENTS.md documents each event type (from docs, or seen in the binary and not ob
 - safe_input_file is checked offline by extracting it and sourcing the T-001 library (resume.sh itself needs SPIKE_LIVE=1, which tests never set). A capture whose worktree.path or raw.jsonl was ever hard-linked elsewhere (link count > 1) is refused even if harmless; re-run run.sh. The check is not race-free against a file swapped between the check and the read (the capture directory is the user's own, mode 0700).
 - Not testable offline (needs SPIKE_LIVE=1, which tests never set): the trailing-slash handling and the `unknown`/rc 121 branches of resume.sh are covered by source checks plus a test of the same shell idiom, not by running the script.
 - Deviation from the brief: resume.sh puts the prompt before `--resume <id>` (the form in the headless docs) and adds `--permission-mode acceptEdits --max-turns 5`; the brief's sketch had neither.
-- The T-001 runner writes the child's stdout and stderr to the same output file, so run.sh splits afterwards: JSON-object lines go to raw.jsonl, other lines to stderr.txt. A stderr line that is itself a JSON object would land in raw.jsonl (parse.jq would then list it under unknown). The split lives in spike/claude/split.jq and is tested offline, including non-object JSON lines. If CLI stderr and stdout interleave mid-line, such a line is reported as malformed, never fatal.
+- T-008 adoption: run.sh and resume.sh call `spike_run_live_split <secs> <capture>/raw.jsonl <capture>/stderr.txt "$SPIKE_VERIFIED_COPY" ...` once each, so stdout and stderr are separate files from the start. split.jq and the "line starts with {" heuristic are gone (a stderr line that looks like JSON can no longer land in raw.jsonl). A refused run (rc 125) may leave no raw.jsonl: parse.jq then fails, the summary becomes {}, the verdict is FAIL. Static tests now require exactly one spike_run_live_split call per script and no remaining combined/split.jq/fromjson split. Also changed `CDPATH= cd` to `CDPATH="" cd` for shellcheck SC1007. Not run live.
 - Rule 6 limitation: the runner executes a private COPY of the binary. A claude that needs files next to itself may not start from the copy (exit 126 or 127, reported as "needs human review", no fallback to the original path).
-- Follow-ups for shared files (lead): (1) spike/lib: add an option for a separate stderr file and one for the child's working directory to spike_run_live (workaround now: `cd` to the worktree before the call, and a post-hoc split); (2) spike/README.md: change the script index row for claude/* and tests/test_claude_parse.sh from planned to done (T-002); (3) no Makefile change is needed, `make spike-test` already globs spike/tests/*.sh.
+- Follow-ups for shared files (lead): (1) spike/lib: an option for the child's working directory in the runner (workaround now: `cd` to the worktree before the call); the stderr-file part is done by T-008; (2) spike/README.md: change the script index row for claude/* and tests/test_claude_parse.sh from planned to done (T-002); (3) no Makefile change is needed, `make spike-test` already globs spike/tests/*.sh.
 
 ## Confidence
 medium, the parser, split, scrub and gates are covered by 166 offline checks and the other suites still pass, but every event shape is from docs and the live path (registration, runner, flags, resume) has never run against the real CLI.
