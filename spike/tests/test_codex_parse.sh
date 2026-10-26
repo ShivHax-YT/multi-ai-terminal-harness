@@ -209,17 +209,17 @@ done
 check "the fake codex is first on the sandbox PATH" test "$(PATH="$SB/bin:/usr/bin:/bin" command -v codex)" = "$SB/bin/codex"
 
 # ---- static checks on run.sh and resume.sh -----------------------------------------------------------------------------------
-# The allow-list: the exact spike_run_live line (watchdog, capture file, registered copy, then the codex arguments).
+# The allow-list: the exact spike_run_live_split line (watchdog, capture file, registered copy, then the codex arguments).
 # `-C` and `--sandbox` are options of `codex exec` only (verified with --help, codex-cli 0.162.0): they come before `resume`.
-EXPECT_RUN='spike_run_live "$WATCHDOG_SECS" "$CAP/combined.txt" "$SPIKE_VERIFIED_COPY" exec --json --sandbox workspace-write -C "$WT" "$TASK"'
-EXPECT_RESUME='spike_run_live "$WATCHDOG_SECS" "$CAP/resume.combined.txt" "$SPIKE_VERIFIED_COPY" exec --json --sandbox workspace-write -C "$WT" resume "$THREAD_ID" "$PROMPT"'
+EXPECT_RUN='spike_run_live_split "$WATCHDOG_SECS" "$CAP/raw.jsonl" "$CAP/stderr.txt" "$SPIKE_VERIFIED_COPY" exec --json --sandbox workspace-write -C "$WT" "$TASK"'
+EXPECT_RESUME='spike_run_live_split "$WATCHDOG_SECS" "$CAP/resume.raw.jsonl" "$CAP/resume.stderr.txt" "$SPIKE_VERIFIED_COPY" exec --json --sandbox workspace-write -C "$WT" resume "$THREAD_ID" "$PROMPT"'
 for s in run.sh resume.sh; do
   f="$CODEX/$s"
-  # rules 2 and 3: the exact argument vector on the single spike_run_live line is the allow-list; nothing may be appended
+  # rules 2 and 3: the exact argument vector on the single spike_run_live_split line is the allow-list; nothing may be appended
   # (the call is one line on purpose: the whole call, including the last argument, is compared)
   case "$s" in run.sh) EXPECT=$EXPECT_RUN ;; *) EXPECT=$EXPECT_RESUME ;; esac
-  eq "$s: exactly one spike_run_live line" "$(grep -cE '^[[:space:]]*spike_run_live ' "$f")" "1"
-  eq "$s: the spike_run_live line is exactly the allow-listed argument vector" "$(grep -E '^[[:space:]]*spike_run_live ' "$f")" "$EXPECT"
+  eq "$s: exactly one spike_run_live_split line" "$(grep -cE '^[[:space:]]*spike_run_live_split ' "$f")" "1"
+  eq "$s: the spike_run_live_split line is exactly the allow-listed argument vector" "$(grep -E '^[[:space:]]*spike_run_live_split ' "$f")" "$EXPECT"
   # explicit rejections (defense in depth; the whole file is searched, comments included)
   for flag in --config --profile --dangerously --oss --local-provider --approve-for-me --enable --disable \
     --ignore-user-config --strict-config --ignore-rules; do
@@ -242,12 +242,12 @@ for s in run.sh resume.sh; do
   eq "$s: spike_require_live follows the library source" "$FIRST" "spike_require_live"
   check "$s: no TERM trap override" test "$(grep -cE "^[[:space:]]*trap .*TERM" "$f")" = "0"
   # rules 1 and 10: exactly one live call, no loops, no retry, no eval
-  eq "$s: exactly one spike_run_live call" "$(grep -cE '^[[:space:]]*spike_run_live ' "$f")" "1"
+  eq "$s: exactly one spike_run_live_split call" "$(grep -cE '^[[:space:]]*spike_run_live_split ' "$f")" "1"
   check "$s: no loop keywords" test "$(grep -cE '^[[:space:]]*(while|until|for|select)[[:space:]]' "$f")" = "0"
   check "$s: no eval" test "$(grep -cE '(^|[[:space:];])eval[[:space:]]' "$f")" = "0"
   check "$s: no retry or sleep wording in code" test "$(grep -vE '^[[:space:]]*#' "$f" | grep -ciE 'retry|sleep')" = "0"
   # the pinned runner API: the registered copy is the only thing started, with the watchdog
-  check "$s: runs the registered copy" grep -q 'spike_run_live "\$WATCHDOG_SECS" .* "\$SPIKE_VERIFIED_COPY"' "$f"
+  check "$s: runs the registered copy" grep -q 'spike_run_live_split "\$WATCHDOG_SECS" .* "\$SPIKE_VERIFIED_COPY"' "$f"
   check "$s: watchdog is 120 s" grep -q '^WATCHDOG_SECS=120$' "$f"
   check "$s: registers codex through the runner" grep -q '^spike_register_cli codex$' "$f"
   check "$s: sign-in by status exit code only" grep -q 'spike_run_status 30 /dev/null "\$SPIKE_VERIFIED_COPY" login status' "$f"
@@ -262,17 +262,17 @@ check "resume.sh prompt is the brief's" grep -qF "PROMPT='Append a second line t
 check "parse.jq has no input/env/ltrimstr surprises: no \$ENV, no env, no input_filename" test "$(grep -vE '^[[:space:]]*#' "$CODEX/parse.jq" | grep -cE '\$ENV|\benv\b|input_filename|\$__prog')" = "0"
 
 # ---- the allow-list check itself catches an appended or inserted argument ----------------------------------------------------
-argv_line_ok() { # file expected-line: passes only when the single spike_run_live line equals the expectation exactly
-  [ "$(grep -cE '^[[:space:]]*spike_run_live ' "$1")" = "1" ] && [ "$(grep -E '^[[:space:]]*spike_run_live ' "$1")" = "$2" ]
+argv_line_ok() { # file expected-line: passes only when the single spike_run_live_split line equals the expectation exactly
+  [ "$(grep -cE '^[[:space:]]*spike_run_live_split ' "$1")" = "1" ] && [ "$(grep -E '^[[:space:]]*spike_run_live_split ' "$1")" = "$2" ]
 }
 check "allow-list self-test: the real run.sh passes" argv_line_ok "$CODEX/run.sh" "$EXPECT_RUN"
 check "allow-list self-test: the real resume.sh passes" argv_line_ok "$CODEX/resume.sh" "$EXPECT_RESUME"
 for extra in '--enable foo' '--disable foo' '--ignore-user-config' '--strict-config' '--ignore-rules' '-ckey=value' '-c key=value' '--profile x' '--yolo'; do
-  sed -e "s|^\(spike_run_live .*-C \"\$WT\"\)|\1 $extra|" "$CODEX/run.sh" > "$TMP/mut_run.sh"
+  sed -e "s|^\(spike_run_live_split .*-C \"\$WT\"\)|\1 $extra|" "$CODEX/run.sh" > "$TMP/mut_run.sh"
   if argv_line_ok "$TMP/mut_run.sh" "$EXPECT_RUN"; then fail "allow-list self-test: run.sh with [$extra] after -C was accepted"; else pass; fi
-  sed -e "s|^\(spike_run_live .*-C \"\$WT\"\)|\1 $extra|" "$CODEX/resume.sh" > "$TMP/mut_resume.sh"
+  sed -e "s|^\(spike_run_live_split .*-C \"\$WT\"\)|\1 $extra|" "$CODEX/resume.sh" > "$TMP/mut_resume.sh"
   if argv_line_ok "$TMP/mut_resume.sh" "$EXPECT_RESUME"; then fail "allow-list self-test: resume.sh with [$extra] after -C was accepted"; else pass; fi
-  sed -e "s|^\(spike_run_live .*\)\$|\1 $extra|" "$CODEX/run.sh" > "$TMP/mut_run2.sh"
+  sed -e "s|^\(spike_run_live_split .*\)\$|\1 $extra|" "$CODEX/run.sh" > "$TMP/mut_run2.sh"
   if argv_line_ok "$TMP/mut_run2.sh" "$EXPECT_RUN"; then fail "allow-list self-test: run.sh with [$extra] at the end was accepted"; else pass; fi
 done
 
@@ -410,19 +410,17 @@ done
 wait
 eq "six racing reservations: exactly one wins" "$(cat "$RD"/race.* | grep -c '^won$')" "1"
 RLINE=$(grep -n '^reserve_resume "\$CAP"' "$CODEX/resume.sh" | head -n 1 | cut -d: -f1)
-LLINE=$(grep -nE '^[[:space:]]*spike_run_live ' "$CODEX/resume.sh" | head -n 1 | cut -d: -f1)
+LLINE=$(grep -nE '^[[:space:]]*spike_run_live_split ' "$CODEX/resume.sh" | head -n 1 | cut -d: -f1)
 check "the reservation call comes before the live CLI call" test -n "$RLINE" -a -n "$LLINE" -a "${RLINE:-999999}" -lt "${LLINE:-0}"
 check "resume.sh never removes the reservation (no rm/rmdir)" test "$(grep -vE '^[[:space:]]*#' "$CODEX/resume.sh" | grep -cE '(^|[[:space:];|&])(rm|rmdir)[[:space:]]')" = "0"
 check "resume.sh refuses an existing lock early" grep -q 'resume.lock' "$CODEX/resume.sh"
 
-# ---- the split used by run.sh and resume.sh (same awk program) ------------------------------------------------------------------
-printf '{"type":"turn.started"}\nWARN something on stderr\n{"type":"turn.completed","usage":{"input_tokens":1}}\nmore text\n' > "$TMP/comb.txt"
-SPLIT_AWK=$(grep -m1 "awk -v raw=" "$CODEX/run.sh" | sed -e "s/.*'\\(\\/.*\\)' .*/\\1/")
-awk -v raw="$TMP/r.jsonl" -v err="$TMP/e.txt" "$SPLIT_AWK" "$TMP/comb.txt"
-eq "split: two JSON lines to raw.jsonl" "$(wc -l < "$TMP/r.jsonl" | tr -d ' ')" "2"
-eq "split: two text lines to stderr.txt" "$(wc -l < "$TMP/e.txt" | tr -d ' ')" "2"
-SPLIT_AWK2=$(grep -m1 "awk -v raw=" "$CODEX/resume.sh" | sed -e "s/.*'\\(\\/.*\\)' .*/\\1/")
-eq "split: run.sh and resume.sh use the same awk program" "$SPLIT_AWK" "$SPLIT_AWK2"
+# ---- no heuristic split: stdout and stderr go to separate files through the runner, nothing is split afterwards -----------------
+for s in run.sh resume.sh; do
+  check "$s: no awk split of a combined file" test "$(grep -vE '^[[:space:]]*#' "$CODEX/$s" | grep -cE 'awk -v|combined')" = "0"
+  check "$s: plain spike_run_live is not called" test "$(grep -vE '^[[:space:]]*#' "$CODEX/$s" | grep -cE '(^|[^_[:alnum:]])spike_run_live[[:space:]]')" = "0"
+  check "$s: the split call names separate stdout and stderr files" grep -qE '^spike_run_live_split "\$WATCHDOG_SECS" "\$CAP/(resume\.)?raw\.jsonl" "\$CAP/(resume\.)?stderr\.txt" ' "$CODEX/$s"
+done
 
 printf 'test_codex_parse: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

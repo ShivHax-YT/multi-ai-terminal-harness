@@ -14,7 +14,7 @@
 #      Flag placement (verified with `--help`, codex-cli 0.162.0): `-C` and `--sandbox` are options of `codex exec` only and
 #      must come BEFORE the `resume` word; `codex exec resume -C ...` fails with "unexpected argument". `--json` is accepted
 #      by both `exec` and `exec resume`. Nothing may be added after `resume <id> <prompt>` (see EVENTS.md, "CLI facts").
-#   5. Writes resume.combined.txt, resume.raw.jsonl, resume.stderr.txt, resume.parsed.json, resume.exit_code.txt and
+#   5. Writes resume.raw.jsonl (stdout), resume.stderr.txt (stderr), resume.parsed.json, resume.exit_code.txt and
 #      resume.observed.redacted.jsonl next to the first capture.
 # Everything the child printed is untrusted data: counted and parsed with jq only.
 set -u
@@ -24,7 +24,7 @@ case "$_here" in
   */*) _here="${_here%/*}" ;;
   *) _here="." ;;
 esac
-HERE="$(CDPATH= cd -P -- "$_here" && pwd -P)"
+HERE="$(CDPATH="" cd -P -- "$_here" && pwd -P)"
 unset _here
 # shellcheck disable=SC1091
 . "$HERE/../lib/common.sh"
@@ -70,7 +70,7 @@ safe_input "$CAP/raw.jsonl" && safe_input "$CAP/worktree.txt" \
 reserve_resume() {
   mkdir "$1/resume.lock" 2>/dev/null
 }
-# any name starting with resume. (the lock, a combined file, or a planted file or link where an output will be written)
+# any name starting with resume. (the lock, an output file, or a planted file or link where an output will be written)
 if compgen -G "$CAP/resume.*" >/dev/null; then
   spike_err "this capture was already resumed once (or is being resumed); one resume per capture"
   exit 2
@@ -112,16 +112,11 @@ fi
 reserve_resume "$CAP" || { spike_err "this capture was already resumed once (or is being resumed); one resume per capture"; exit 2; }
 
 # ---- the one invocation (no retry, no loop) ------------------------------------------------------------------------------------
-spike_run_live "$WATCHDOG_SECS" "$CAP/resume.combined.txt" "$SPIKE_VERIFIED_COPY" exec --json --sandbox workspace-write -C "$WT" resume "$THREAD_ID" "$PROMPT"
+spike_run_live_split "$WATCHDOG_SECS" "$CAP/resume.raw.jsonl" "$CAP/resume.stderr.txt" "$SPIKE_VERIFIED_COPY" exec --json --sandbox workspace-write -C "$WT" resume "$THREAD_ID" "$PROMPT"
 RUN_RC=$?
 printf '%s\n' "$RUN_RC" > "$CAP/resume.exit_code.txt"
 
-# ---- split, parse, redact (data only) ---------------------------------------------------------------------------------------
-: > "$CAP/resume.raw.jsonl"
-: > "$CAP/resume.stderr.txt"
-if [ -f "$CAP/resume.combined.txt" ]; then
-  awk -v raw="$CAP/resume.raw.jsonl" -v err="$CAP/resume.stderr.txt" '/^\{/ { print > raw; next } { print > err }' "$CAP/resume.combined.txt"
-fi
+# ---- parse, redact (data only) ---------------------------------------------------------------------------------------
 jq -n -R -f "$HERE/parse.jq" < "$CAP/resume.raw.jsonl" > "$CAP/resume.parsed.json" 2> "$CAP/resume.parse.err"
 PARSE_RC=$?
 spike_redact < "$CAP/resume.raw.jsonl" > "$CAP/resume.observed.redacted.jsonl"

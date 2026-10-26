@@ -30,7 +30,7 @@ confirm on the Mac" at the end.
 | A thread has many turns; each `exec` or `exec resume` call is one turn (`turn.started` ... `turn.completed` or `turn.failed`) | from docs | S1 |
 | A resumed run is expected to report the same `thread_id` in its own `thread.started` | to confirm | `resume.sh` prints whether it did |
 | Exit status: success 0; a failed turn is expected to give a non-zero status | to confirm | not in S1 |
-| stderr: the runner merges stderr into the one output file; `run.sh` splits lines starting with `{` (events) from the rest (stderr text) | design | `spike/lib/runner.pl` dup2 of both descriptors |
+| stderr: `spike_run_live_split` (T-008) writes stdout to `raw.jsonl` and stderr to `stderr.txt` as separate files | design | `spike/lib/common.sh` |
 
 ## Top-level events
 

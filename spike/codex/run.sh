@@ -12,12 +12,12 @@
 #   5. Runs: codex exec --json --sandbox workspace-write -C <worktree> "<task>"   under a 120 s watchdog (the runner kills
 #      the child's whole process group on timeout). Default configuration and login only: no profile, no config
 #      overrides, no alternate home. `codex exec` is the documented headless mode; the interactive TUI is never started.
-#   6. Captures to spike/captures/codex/<UTC time>/ (gitignored): combined.txt (everything the child wrote), raw.jsonl
-#      (the JSON lines), stderr.txt (the other lines), parsed.json (parse.jq output), observed.redacted.jsonl (for a
+#   6. Captures to spike/captures/codex/<UTC time>/ (gitignored): raw.jsonl
+#      (the child's stdout, JSON lines), stderr.txt (the child's stderr), parsed.json (parse.jq output), observed.redacted.jsonl (for a
 #      fixture, after the human reads it), worktree.txt (input for resume.sh).
 #
-# The runner gives the child one output file for stdout and stderr together, so the split into raw.jsonl and stderr.txt
-# is done afterwards: a line that starts with "{" is a JSON event line, every other line is stderr text.
+# spike_run_live_split (T-008) gives the child separate files for stdout (raw.jsonl) and stderr (stderr.txt); there is no
+# after-the-fact guessing of which line came from which stream.
 # Everything the child printed is untrusted data: it is only counted and parsed with jq, never evaluated.
 set -u
 
@@ -26,7 +26,7 @@ case "$_here" in
   */*) _here="${_here%/*}" ;;
   *) _here="." ;;
 esac
-HERE="$(CDPATH= cd -P -- "$_here" && pwd -P)"
+HERE="$(CDPATH="" cd -P -- "$_here" && pwd -P)"
 unset _here
 # shellcheck disable=SC1091
 . "$HERE/../lib/common.sh"
@@ -67,16 +67,11 @@ printf '%s\n' "$WT" > "$CAP/worktree.txt"
 printf '%s\n' "$TASK" > "$CAP/task.txt"
 
 # ---- the one invocation (no retry, no loop) ------------------------------------------------------------------------------------
-spike_run_live "$WATCHDOG_SECS" "$CAP/combined.txt" "$SPIKE_VERIFIED_COPY" exec --json --sandbox workspace-write -C "$WT" "$TASK"
+spike_run_live_split "$WATCHDOG_SECS" "$CAP/raw.jsonl" "$CAP/stderr.txt" "$SPIKE_VERIFIED_COPY" exec --json --sandbox workspace-write -C "$WT" "$TASK"
 RUN_RC=$?
 printf '%s\n' "$RUN_RC" > "$CAP/exit_code.txt"
 
-# ---- split, parse, redact (data only) ---------------------------------------------------------------------------------------
-: > "$CAP/raw.jsonl"
-: > "$CAP/stderr.txt"
-if [ -f "$CAP/combined.txt" ]; then
-  awk -v raw="$CAP/raw.jsonl" -v err="$CAP/stderr.txt" '/^\{/ { print > raw; next } { print > err }' "$CAP/combined.txt"
-fi
+# ---- parse, redact (data only) ---------------------------------------------------------------------------------------
 jq -n -R -f "$HERE/parse.jq" < "$CAP/raw.jsonl" > "$CAP/parsed.json" 2> "$CAP/parse.err"
 PARSE_RC=$?
 spike_redact < "$CAP/raw.jsonl" > "$CAP/observed.redacted.jsonl"
