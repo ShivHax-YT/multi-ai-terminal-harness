@@ -1,37 +1,162 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
+/* Harness tokens. Source of truth: docs/design/tokens.md (src/styles/tokens.test.ts recomputes every ratio).
+   Graphite neutrals plus one accent (orchid). No blue, teal-green or clay-orange anywhere (rule 8).
+   Accent = shadcn --primary; shadcn --accent stays a neutral hover surface. */
+
 @custom-variant dark (&:is(.dark *));
 
 :root {
-    --sidebar: hsl(0 0% 98%);
-    --sidebar-foreground: hsl(240 5.3% 26.1%);
-    --sidebar-primary: hsl(240 5.9% 10%);
-    --sidebar-primary-foreground: hsl(0 0% 98%);
-    --sidebar-accent: hsl(240 4.8% 95.9%);
-    --sidebar-accent-foreground: hsl(240 5.9% 10%);
-    --sidebar-border: hsl(220 13% 91%);
-    --sidebar-ring: hsl(217.2 91.2% 59.8%);
+  color-scheme: light;
+  --background: #f7f7f8;
+  --foreground: #17171b;
+  --card: #ffffff;
+  --card-foreground: #17171b;
+  --popover: #ffffff;
+  --popover-foreground: #17171b;
+  --primary: #9c1f6e;
+  --primary-foreground: #ffffff;
+  --secondary: #efeff1;
+  --secondary-foreground: #17171b;
+  --muted: #efeff1;
+  --muted-foreground: #5b5b66;
+  --accent: #efeff1;
+  --accent-foreground: #17171b;
+  --destructive: #b42335;
+  --destructive-foreground: #ffffff;
+  --success: #3f6212;
+  --warning: #8a5a00;
+  --border: #dcdce0;
+  --input: #8e8e99;
+  --ring: #9c1f6e;
+  --terminal-bg: #0e0e11;
+  --terminal-fg: #e4e4ea;
+  --sidebar: #efeff1;
+  --sidebar-foreground: #17171b;
+  --sidebar-primary: #9c1f6e;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #ffffff;
+  --sidebar-accent-foreground: #17171b;
+  --sidebar-border: #dcdce0;
+  --sidebar-ring: #9c1f6e;
+
+  --radius: 10px;
+  --radius-card: 14px;
+  --radius-control: 10px;
+  --radius-chip: 9999px;
+
+  --duration-fast: 150ms;
+  --duration-base: 220ms;
+  --duration-slow: 300ms;
+  --duration-entrance: 600ms;
 }
 
 .dark {
-    --sidebar: hsl(240 5.9% 10%);
-    --sidebar-foreground: hsl(240 4.8% 95.9%);
-    --sidebar-primary: hsl(224.3 76.3% 48%);
-    --sidebar-primary-foreground: hsl(0 0% 100%);
-    --sidebar-accent: hsl(240 3.7% 15.9%);
-    --sidebar-accent-foreground: hsl(240 4.8% 95.9%);
-    --sidebar-border: hsl(240 3.7% 15.9%);
-    --sidebar-ring: hsl(217.2 91.2% 59.8%);
+  color-scheme: dark;
+  --background: #111114;
+  --foreground: #ececf1;
+  --card: #18181c;
+  --card-foreground: #ececf1;
+  --popover: #18181c;
+  --popover-foreground: #ececf1;
+  --primary: #f08bc8;
+  --primary-foreground: #17171b;
+  --secondary: #222228;
+  --secondary-foreground: #ececf1;
+  --muted: #222228;
+  --muted-foreground: #a1a1ad;
+  --accent: #222228;
+  --accent-foreground: #ececf1;
+  --destructive: #ff8f8f;
+  --destructive-foreground: #17171b;
+  --success: #a3c76a;
+  --warning: #d8b35e;
+  --border: #2e2e36;
+  --input: #6b6b78;
+  --ring: #f08bc8;
+  --terminal-bg: #0e0e11;
+  --terminal-fg: #e4e4ea;
+  --sidebar: #18181c;
+  --sidebar-foreground: #ececf1;
+  --sidebar-primary: #f08bc8;
+  --sidebar-primary-foreground: #17171b;
+  --sidebar-accent: #222228;
+  --sidebar-accent-foreground: #ececf1;
+  --sidebar-border: #2e2e36;
+  --sidebar-ring: #f08bc8;
 }
 
 @theme inline {
-    --color-sidebar: var(--sidebar);
-    --color-sidebar-foreground: var(--sidebar-foreground);
-    --color-sidebar-primary: var(--sidebar-primary);
-    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
-    --color-sidebar-accent: var(--sidebar-accent);
-    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
-    --color-sidebar-border: var(--sidebar-border);
-    --color-sidebar-ring: var(--sidebar-ring);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-terminal-bg: var(--terminal-bg);
+  --color-terminal-fg: var(--terminal-fg);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --radius-sm: 6px;
+  --radius-md: var(--radius-control);
+  --radius-lg: var(--radius-control);
+  --radius-xl: var(--radius-card);
+  --radius-2xl: 18px;
+
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+
+}
+
+/* Entrances ease out; overrides Tailwind's default so `ease-out` utilities use it too. */
+@theme {
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    font-size: 16px;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    line-height: 1.55;
+  }
+  code,
+  kbd,
+  pre,
+  samp {
+    @apply font-mono;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
 }

@@ -1,0 +1,67 @@
+{
+  "format_version": 1,
+  "plan_id": "plan-2026-10-25-002",
+  "created_at": "2026-10-25T09:05:00Z",
+  "lead": {
+    "provider": "claude",
+    "auth_mode": "subscription"
+  },
+  "request_summary": "Rewrite the session manager in one pass.",
+  "summary_budget_tokens": 200,
+  "tasks": [
+    {
+      "id": "t1",
+      "title": "Rewrite the session manager",
+      "role": "backend",
+      "provider": "claude",
+      "auth_mode": "subscription",
+      "owned_files": [
+        "src-tauri/crates/harness-core/src/sessions.rs"
+      ],
+      "acceptance": [
+        "All session tests pass"
+      ],
+      "depends_on": [],
+      "estimated_usage": {
+        "prompts": 20,
+        "turns": 55
+      },
+      "fallback_providers": [
+        {
+          "provider": "kimi",
+          "auth_mode": "subscription"
+        }
+      ]
+    },
+    {
+      "id": "t2",
+      "title": "Port the session tests",
+      "role": "tester",
+      "provider": "codex",
+      "auth_mode": "subscription",
+      "owned_files": [
+        "src-tauri/crates/harness-core/tests/sessions.rs"
+      ],
+      "acceptance": [
+        "Tests cover spawn, idle, rate-limited, exited and killed"
+      ],
+      "depends_on": [
+        "t1"
+      ],
+      "estimated_usage": {
+        "prompts": 8,
+        "turns": 30
+      },
+      "fallback_providers": [
+        {
+          "provider": "claude",
+          "auth_mode": "subscription"
+        },
+        {
+          "provider": "claude",
+          "auth_mode": "subscription"
+        }
+      ]
+    }
+  ]
+}
