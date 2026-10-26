@@ -27,7 +27,7 @@ case "$_here" in
   */*) _here="${_here%/*}" ;;
   *) _here="." ;;
 esac
-HERE="$(CDPATH= cd -P -- "$_here" && pwd -P)"
+HERE="$(CDPATH='' cd -P -- "$_here" && pwd -P)"
 unset _here
 # shellcheck disable=SC1091
 . "$HERE/lib/common.sh"
@@ -60,6 +60,7 @@ clean() { tr -cd '[:print:]'; }
 show_path() {
   local p="$1"
   if [ -n "${HOME:-}" ] && [ "$HOME" != "/" ]; then
+    # shellcheck disable=SC2088 # the literal "~/" is intentional display text, never used as a path
     case "$p" in "$HOME"/*) p="~/${p#"$HOME"/}" ;; esac
   fi
   printf '%s' "$p" | tr '@' '%' | clean

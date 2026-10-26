@@ -4,7 +4,7 @@ description: Read-only merge gate for the 12 hard rules in docs/HARD_RULES.md (c
 tools: Read, Grep, Glob, Bash
 disallowedTools: Edit, Write, NotebookEdit
 model: sonnet
-effort: high
+effort: medium
 maxTurns: 30
 color: red
 ---

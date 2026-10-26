@@ -3,7 +3,7 @@ name: implementer
 description: Implements exactly one approved brief from docs/tasks/ in its own worktree. Default worker for Rust and TypeScript. Dispatch with model=opus for Swift, PTY, signal or concurrency briefs.
 tools: Read, Edit, Write, Bash, Grep, Glob
 model: sonnet
-effort: high
+effort: medium
 isolation: worktree
 maxTurns: 80
 color: blue

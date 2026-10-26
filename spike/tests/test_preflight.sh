@@ -13,7 +13,7 @@
 
 set -o noclobber
 
-HERE="$(CDPATH= cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+HERE="$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PREFLIGHT="$HERE/../preflight.sh"
 COMMON_REAL="$HERE/../lib/common.sh"
 RUNNER_REAL="$HERE/../lib/runner.pl"
@@ -36,7 +36,7 @@ $2)" ;; *) ok "$1" ;; esac; }
 row() { printf '%s\n' "$1" | grep "^$2 " | head -n 1; }
 
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/spikepre.XXXXXX")" || exit 1
-SANDBOX="$(CDPATH= cd -P -- "$SANDBOX" && pwd -P)"
+SANDBOX="$(CDPATH='' cd -P -- "$SANDBOX" && pwd -P)"
 VIOLATIONS="$SANDBOX/.violations"
 TRIP_LIST=""
 
@@ -87,7 +87,7 @@ sbx_parent_ok() { # the PHYSICAL parent directory must be inside the sandbox
   case "$f" in /*) ;; *) sbx_refuse "relative path $f"; return 1 ;; esac
   dir="${f%/*}"
   [ -n "$dir" ] || dir="/"
-  phys="$(CDPATH= cd -P -- "$dir" 2>/dev/null && pwd -P)" || { sbx_refuse "no parent for $f"; return 1; }
+  phys="$(CDPATH='' cd -P -- "$dir" 2>/dev/null && pwd -P)" || { sbx_refuse "no parent for $f"; return 1; }
   case "$phys/" in "$SANDBOX"/*) ;; *) sbx_refuse "parent of $f is outside the sandbox ($phys)"; return 1 ;; esac
   return 0
 }
@@ -109,7 +109,7 @@ sbx_mkdir() { # sbx_mkdir <dir>...: mkdir -p, but the nearest EXISTING ancestor 
       anc="${anc%/*}"
       [ -n "$anc" ] || anc="/"
     done
-    phys="$(CDPATH= cd -P -- "$anc" 2>/dev/null && pwd -P)" || { sbx_refuse "no ancestor for $d"; return 1; }
+    phys="$(CDPATH='' cd -P -- "$anc" 2>/dev/null && pwd -P)" || { sbx_refuse "no ancestor for $d"; return 1; }
     case "$phys/" in "$SANDBOX"/*) ;; *) sbx_refuse "directory $d resolves outside the sandbox ($phys)"; return 1 ;; esac
     mkdir -p -- "$d"
   done
@@ -563,13 +563,16 @@ sbx_mkdir "$LIVE"
 sleep 60 &
 LIVEPID=$!
 printf '%s\n' "$LIVEPID" | sbx_put "$LIVE/.owner"
-OUT11="$(env -i PATH="$B4" HOME="$SANDBOX/home" TMPDIR="$SW" USER=tester LOGNAME=tester /bin/bash "$PREFLIGHT_UT" 2>&1)"
+env -i PATH="$B4" HOME="$SANDBOX/home" TMPDIR="$SW" USER=tester LOGNAME=tester /bin/bash "$PREFLIGHT_UT" >/dev/null 2>&1
 eq "scenario 10: preflight exits 0 in the sweep directory" "0" "$?"
 if [ ! -e "$STALE" ]; then ok "scenario 10: the stale directory (dead owner) was swept"; else bad "scenario 10: the stale directory (dead owner) was swept"; fi
 if [ -d "$LIVE" ]; then ok "scenario 10: a directory whose owner is alive is left alone"; else bad "scenario 10: a directory whose owner is alive is left alone"; fi
 kill "$LIVEPID" 2>/dev/null
 wait "$LIVEPID" 2>/dev/null
-leftovers="$(ls -d "$SW"/spike-verify.* 2>/dev/null | grep -v "$LIVE")"
+leftovers=''
+for d in "$SW"/spike-verify.*; do
+  if [ "$d" != "$LIVE" ] && { [ -e "$d" ] || [ -L "$d" ]; }; then leftovers="${leftovers}${leftovers:+$'\n'}$d"; fi
+done
 eq "scenario 10: the run's own private directory is removed on exit" "" "$leftovers"
 
 # Scenario 11: non-Mach-O files are refused by the helper's magic check on the opened file and never executed: an ELF

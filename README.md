@@ -90,7 +90,7 @@ frontmatter (`model`, `effort`, `isolation: worktree`, `maxTurns`, `disallowedTo
 Not verified / check yourself:
 - `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: "0"`: docs say teams are off by default and "set to 1 to enable"; that "0"
   reads as off is assumed. Deleting the line also keeps teams off.
-- Effort levels depend on the model; docs say an unsupported level falls back to the highest supported one (verified), but which levels each 5.5 model supports wasn't checked.
+- Effort levels: verified 2026-10-25 in the model-config docs. Opus 5.5, Sonnet 5.5 and Haiku 5.5 support all five levels (low, medium, high, xhigh, max), so no fallback applies. An unsupported level falls back to the highest supported level at or below it.
 - The macOS Keychain service name the scan looks for ("Claude Code-credentials") comes from community reports.
 - GitHub Actions versions (`actions/checkout@v4`, etc.) weren't re-checked; pin SHAs before release.
 - Context7 uses the API-key header from its README (an OAuth endpoint also exists); GitHub MCP needs a PAT in
