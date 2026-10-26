@@ -1261,8 +1261,12 @@ PATH="$SANDBOX/probebin2:$PATH" spike_run_timed 5 "$PROBE" jq --version >/dev/nu
 eq "spike_run_timed refuses a native copy named jq in a user directory (rc 2)" "2" "$?"
 # tool-path (preflight's presence check) applies the same identity test.
 eq "spike_tool_path finds no wrapper first on PATH" "" "$(PATH="$SANDBOX/probebin:$PATH" spike_tool_path jq)"
-case "$JQ_PHYS" in
-  /bin/*|/usr/*|/opt/homebrew/*) eq "spike_tool_path finds the real jq" "$JQ_PHYS" "$(spike_tool_path jq)" ;;
+# The expected value is the physical path of the FIRST jq on this suite's own PATH (on macOS runners /usr/bin/jq can precede
+# the Homebrew jq that JQ_BIN names), not necessarily JQ_PHYS.
+JQ_FIRST="$(type -P jq)"
+JQ_FIRST_PHYS="$(spike_resolve_path "$JQ_FIRST")"
+case "$JQ_FIRST_PHYS" in
+  /bin/*|/usr/*|/opt/homebrew/*) eq "spike_tool_path finds the real jq" "$JQ_FIRST_PHYS" "$(spike_tool_path jq)" ;;
 esac
 
 # --- spike_resolve_path / spike_run_timeout --------------------------------------------------------------------------
