@@ -640,7 +640,7 @@ _spike_forward() {
 _spike_exec() {
   local rc old_int old_term old_hup sub=run
   if [ "$1" = "live" ] && [ -n "$_SPIKE_ERRFILE" ]; then
-    sub=run-split
+    sub='run-split'
     set -- "$1" "$2" "$3" "$_SPIKE_ERRFILE" "${@:4}"
   fi
   old_int="$(trap -p INT)"
