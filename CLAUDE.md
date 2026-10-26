@@ -78,10 +78,10 @@ Helpers live in `.claude/agents/` (details and how to add more: `docs/AGENT_TEAM
 | Agent | Model | Writes code? | Use |
 |---|---|---|---|
 | architect | opus, xhigh | no (docs/ only) | big designs, ADRs, task briefs |
-| implementer | sonnet, high (lead passes model=opus for Swift/PTY/signals/concurrency) | yes, own worktree | one brief each, max 3 in parallel, max 1 on opus |
+| implementer | sonnet, medium (lead passes model=opus for Swift/PTY/signals/concurrency) | yes, own worktree | one brief each, max 3 in parallel, max 1 on opus |
 | scout | haiku | no | read-only fact finding, up to 4 in parallel |
 | test-runner | haiku | no | runs `make check-fast` in a worktree |
-| compliance-auditor | sonnet, high | no | hard-rule merge gate |
+| compliance-auditor | sonnet, medium | no | hard-rule merge gate |
 | reviewer | opus, high | no | final review per branch |
 | docs | haiku | Markdown only | after merge |
 

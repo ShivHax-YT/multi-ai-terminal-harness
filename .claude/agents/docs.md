@@ -3,7 +3,7 @@ name: docs
 description: Updates README, CHANGELOG and ADR formatting after a merge. Docs only, never source logic.
 tools: Read, Grep, Glob, Edit, Write
 model: haiku
-effort: medium
+effort: max
 maxTurns: 25
 color: yellow
 hooks:

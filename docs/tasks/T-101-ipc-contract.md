@@ -1,6 +1,6 @@
 # T-101 appendix: Harness IPC contract v1 (UI ⇄ backend)
 
-Status: draft (part of T-101, approved with it). T-101 implements it exactly: types in `src/lib/ipc/contract.ts`,
+Status: approved with T-101 on 2026-10-25. T-101 implements it exactly: types in `src/lib/ipc/contract.ts`,
 Tauri client in `src/lib/ipc/tauri.ts`, stateful mock in `src/lib/ipc/mock/**` + `src/lib/ipc/fixtures/*.json`, Rust
 stubs in `src-tauri/src/commands.rs`. Screen briefs consume it and never edit it; if one needs a change, it stops and
 reports to the lead.
