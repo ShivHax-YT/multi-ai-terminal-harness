@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resume-provider"
+description = "Enables the resume_provider command without any pre-configured scope."
+commands.allow = ["resume_provider"]
+
+[[permission]]
+identifier = "deny-resume-provider"
+description = "Denies the resume_provider command without any pre-configured scope."
+commands.deny = ["resume_provider"]

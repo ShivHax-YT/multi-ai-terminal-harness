@@ -1,0 +1,10 @@
+[package]
+name = "pty-view"
+description = "PTY spawn and the human-only write path (view and take-over). The app shell is its only dependent."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

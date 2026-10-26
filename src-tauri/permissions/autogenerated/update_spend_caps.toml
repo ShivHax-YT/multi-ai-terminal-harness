@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-update-spend-caps"
+description = "Enables the update_spend_caps command without any pre-configured scope."
+commands.allow = ["update_spend_caps"]
+
+[[permission]]
+identifier = "deny-update-spend-caps"
+description = "Denies the update_spend_caps command without any pre-configured scope."
+commands.deny = ["update_spend_caps"]

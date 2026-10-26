@@ -1,0 +1,30 @@
+{
+  "as_of": "2026-10-25T09:00:00Z",
+  "user_idle_minutes": 0,
+  "idle_pause_minutes": 30,
+  "app_in_background": false,
+  "providers": [
+    {
+      "provider": "claude",
+      "auth_mode": "subscription",
+      "sessions": { "current": 0, "limit": 2, "ceiling": 2 },
+      "prompts_last_hour": { "current": 0, "limit": 30, "ceiling": 30 },
+      "max_task_turns": { "current": 0, "limit": 40, "ceiling": 40 },
+      "run_minutes_today": { "current": 0, "limit": 480, "ceiling": 480 },
+      "pacing": { "consecutive_limit_errors": 0, "paused": false },
+      "tokens_today": { "input": 0, "output": 0, "is_estimate": true },
+      "spend": null
+    },
+    {
+      "provider": "codex",
+      "auth_mode": "subscription",
+      "sessions": { "current": 0, "limit": 2, "ceiling": 2 },
+      "prompts_last_hour": { "current": 0, "limit": 30, "ceiling": 30 },
+      "max_task_turns": { "current": 0, "limit": 40, "ceiling": 40 },
+      "run_minutes_today": { "current": 0, "limit": 480, "ceiling": 480 },
+      "pacing": { "consecutive_limit_errors": 0, "paused": false },
+      "tokens_today": { "input": 0, "output": 0, "is_estimate": true },
+      "spend": null
+    }
+  ]
+}

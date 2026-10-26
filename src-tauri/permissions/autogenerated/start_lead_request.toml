@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-lead-request"
+description = "Enables the start_lead_request command without any pre-configured scope."
+commands.allow = ["start_lead_request"]
+
+[[permission]]
+identifier = "deny-start-lead-request"
+description = "Denies the start_lead_request command without any pre-configured scope."
+commands.deny = ["start_lead_request"]

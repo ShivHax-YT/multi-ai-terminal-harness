@@ -15,3 +15,8 @@ dist/
 DerivedData/
 *.xcuserstate
 .DS_Store
+# Tauri / UI
+src-tauri/gen/
+coverage/
+*.tsbuildinfo
+.eslintcache

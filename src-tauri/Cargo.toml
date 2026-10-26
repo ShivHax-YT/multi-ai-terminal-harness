@@ -1,0 +1,38 @@
+# Cargo workspace root and the `app` package (the Tauri shell).
+# Crates: harness-core (lead, scheduler, adapters, compliance) and the PTY view crate. Rule 3: harness-core never depends
+# on the PTY crate; scripts/ci/check-crate-boundary.sh asserts it on the resolved dependency graph.
+# No Tauri plugins (rules 4, 5, 6): the webview gets core:default plus the app's own commands, nothing else.
+
+[workspace]
+members = ["crates/harness-core", "crates/pty-view"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+license = "UNLICENSED"
+publish = false
+
+[package]
+name = "app"
+description = "Harness desktop shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "app_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+harness-core = { path = "crates/harness-core" }
+pty-view = { path = "crates/pty-view" }

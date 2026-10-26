@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-confirm-personal-use"
+description = "Enables the confirm_personal_use command without any pre-configured scope."
+commands.allow = ["confirm_personal_use"]
+
+[[permission]]
+identifier = "deny-confirm-personal-use"
+description = "Denies the confirm_personal_use command without any pre-configured scope."
+commands.deny = ["confirm_personal_use"]

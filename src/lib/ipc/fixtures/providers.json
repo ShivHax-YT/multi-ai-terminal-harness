@@ -1,0 +1,239 @@
+[
+  {
+    "provider": "claude",
+    "adapter_available": true,
+    "auth_modes": [
+      "subscription",
+      "api_key"
+    ],
+    "install": {
+      "state": "installed",
+      "version": "2.1.295"
+    },
+    "binary": {
+      "state": "verified",
+      "checked_at": "2026-10-25T08:55:00Z",
+      "checks": [
+        {
+          "kind": "codesign",
+          "result": "pass",
+          "detail": "Signature valid; signed by the vendor Developer ID."
+        },
+        {
+          "kind": "checksum",
+          "result": "not_applicable",
+          "detail": "The vendor publishes no checksum for this install method."
+        },
+        {
+          "kind": "install_source",
+          "result": "pass",
+          "detail": "Install path matches the vendor installer."
+        }
+      ]
+    },
+    "sign_in": {
+      "state": "signed_in",
+      "checked_at": "2026-10-25T08:55:00Z"
+    },
+    "personal_use_confirmed": true,
+    "api_key": {
+      "present": false,
+      "caps": null
+    },
+    "killswitch": "enabled",
+    "usable": {
+      "lead": true,
+      "worker": true,
+      "blockers": []
+    }
+  },
+  {
+    "provider": "codex",
+    "adapter_available": true,
+    "auth_modes": [
+      "subscription",
+      "api_key"
+    ],
+    "install": {
+      "state": "installed",
+      "version": "0.162.0"
+    },
+    "binary": {
+      "state": "verified",
+      "checked_at": "2026-10-25T08:55:00Z",
+      "checks": [
+        {
+          "kind": "codesign",
+          "result": "pass",
+          "detail": "Signature valid; signed by the vendor Developer ID."
+        },
+        {
+          "kind": "checksum",
+          "result": "not_applicable",
+          "detail": "The vendor publishes no checksum for this install method."
+        },
+        {
+          "kind": "install_source",
+          "result": "pass",
+          "detail": "Install path matches the vendor installer."
+        }
+      ]
+    },
+    "sign_in": {
+      "state": "signed_in",
+      "checked_at": "2026-10-25T08:55:00Z"
+    },
+    "personal_use_confirmed": true,
+    "api_key": {
+      "present": false,
+      "caps": null
+    },
+    "killswitch": "enabled",
+    "usable": {
+      "lead": true,
+      "worker": true,
+      "blockers": []
+    }
+  },
+  {
+    "provider": "grok",
+    "adapter_available": false,
+    "auth_modes": [
+      "subscription",
+      "api_key"
+    ],
+    "install": {
+      "state": "not_installed"
+    },
+    "binary": {
+      "state": "unchecked",
+      "checks": []
+    },
+    "sign_in": {
+      "state": "unknown"
+    },
+    "personal_use_confirmed": false,
+    "api_key": {
+      "present": false,
+      "caps": null
+    },
+    "killswitch": "enabled",
+    "usable": {
+      "lead": false,
+      "worker": false,
+      "blockers": [
+        "adapter_unavailable"
+      ]
+    }
+  },
+  {
+    "provider": "kimi",
+    "adapter_available": false,
+    "auth_modes": [
+      "subscription",
+      "api_key"
+    ],
+    "install": {
+      "state": "not_installed"
+    },
+    "binary": {
+      "state": "unchecked",
+      "checks": []
+    },
+    "sign_in": {
+      "state": "unknown"
+    },
+    "personal_use_confirmed": false,
+    "api_key": {
+      "present": false,
+      "caps": null
+    },
+    "killswitch": "enabled",
+    "usable": {
+      "lead": false,
+      "worker": false,
+      "blockers": [
+        "adapter_unavailable"
+      ]
+    }
+  },
+  {
+    "provider": "gemini",
+    "adapter_available": true,
+    "auth_modes": [
+      "api_key"
+    ],
+    "install": {
+      "state": "installed",
+      "version": "0.21.0"
+    },
+    "binary": {
+      "state": "verified",
+      "checked_at": "2026-10-25T08:55:00Z",
+      "checks": [
+        {
+          "kind": "codesign",
+          "result": "pass",
+          "detail": "Signature valid; signed by the vendor Developer ID."
+        },
+        {
+          "kind": "checksum",
+          "result": "not_applicable",
+          "detail": "The vendor publishes no checksum for this install method."
+        },
+        {
+          "kind": "install_source",
+          "result": "pass",
+          "detail": "Install path matches the vendor installer."
+        }
+      ]
+    },
+    "sign_in": {
+      "state": "unknown"
+    },
+    "personal_use_confirmed": false,
+    "api_key": {
+      "present": false,
+      "caps": null
+    },
+    "killswitch": "api_key_only",
+    "usable": {
+      "lead": false,
+      "worker": false,
+      "blockers": [
+        "api_key_missing"
+      ]
+    }
+  },
+  {
+    "provider": "glm",
+    "adapter_available": false,
+    "auth_modes": [
+      "subscription",
+      "api_key"
+    ],
+    "install": {
+      "state": "not_installed"
+    },
+    "binary": {
+      "state": "unchecked",
+      "checks": []
+    },
+    "sign_in": {
+      "state": "unknown"
+    },
+    "personal_use_confirmed": false,
+    "api_key": {
+      "present": false,
+      "caps": null
+    },
+    "killswitch": "enabled",
+    "usable": {
+      "lead": false,
+      "worker": false,
+      "blockers": [
+        "adapter_unavailable"
+      ]
+    }
+  }
+]

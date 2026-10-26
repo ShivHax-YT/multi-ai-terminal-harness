@@ -1,0 +1,43 @@
+{
+  "identifier": "main",
+  "description": "Main window: Tauri core defaults plus one permission per Harness IPC command, nothing else (no fs, shell, http or other plugin permissions; rules 4, 5, 6).",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "allow-get-app-info",
+    "allow-list-providers",
+    "allow-refresh-provider-status",
+    "allow-open-provider-login",
+    "allow-confirm-personal-use",
+    "allow-set-api-key",
+    "allow-update-spend-caps",
+    "allow-remove-api-key",
+    "allow-start-lead-request",
+    "allow-cancel-lead-request",
+    "allow-list-lead-requests",
+    "allow-list-plans",
+    "allow-get-plan",
+    "allow-update-plan",
+    "allow-discard-plan",
+    "allow-approve-plan",
+    "allow-list-sessions",
+    "allow-pause-session",
+    "allow-resume-session",
+    "allow-kill-session",
+    "allow-set-takeover",
+    "allow-resume-provider",
+    "allow-attach-terminal",
+    "allow-resize-terminal",
+    "allow-pty-write",
+    "allow-list-reviews",
+    "allow-get-review",
+    "allow-mark-reviewed",
+    "allow-get-usage",
+    "allow-get-limits",
+    "allow-get-settings",
+    "allow-update-settings",
+    "allow-get-killswitch-status"
+  ]
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-killswitch-status"
+description = "Enables the get_killswitch_status command without any pre-configured scope."
+commands.allow = ["get_killswitch_status"]
+
+[[permission]]
+identifier = "deny-get-killswitch-status"
+description = "Denies the get_killswitch_status command without any pre-configured scope."
+commands.deny = ["get_killswitch_status"]
