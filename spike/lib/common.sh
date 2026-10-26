@@ -395,8 +395,20 @@ spike_redact() {
 # _spike_inputs fills _SPIKE_IN with the SPIKE_IN_* assignments the helper reads. The array is never empty (bash 3.2 with
 # set -u fails on an empty array). Values are data: they come after the constant interpreter path, so env never parses them.
 _SPIKE_IN=()
+# _spike_self_pid sets _SPIKE_SELF to the pid of the shell that is running (a subshell has its own pid, which is what a
+# command started from it gets as its parent). BASHPID exists in bash 4+; bash 3.2 (macOS) asks the sh it execs in place.
+_SPIKE_SELF=""
+_spike_self_pid() {
+  _SPIKE_SELF="${BASHPID:-}"
+  case "$_SPIKE_SELF" in
+    "" | *[!0-9]*) _SPIKE_SELF="$(exec /bin/sh -c 'echo $PPID')" ;;
+  esac
+}
+# SPIKE_IN_PARENT is the pid the helper must have as its parent. If the shell died before the helper looked, the helper's
+# parent is already the reaper; it sees the mismatch and starts nothing (the run) or stops (the codesign watch).
 _spike_inputs() {
-  _SPIKE_IN=("SPIKE_IN_MARK=1")
+  _spike_self_pid
+  _SPIKE_IN=("SPIKE_IN_MARK=1" "SPIKE_IN_PARENT=$_SPIKE_SELF")
   if [ "${PATH+set}" = "set" ]; then _SPIKE_IN[${#_SPIKE_IN[@]}]="SPIKE_IN_PATH=$PATH"; fi
   if [ "${HOME+set}" = "set" ]; then _SPIKE_IN[${#_SPIKE_IN[@]}]="SPIKE_IN_HOME=$HOME"; fi
   if [ "${TMPDIR+set}" = "set" ]; then _SPIKE_IN[${#_SPIKE_IN[@]}]="SPIKE_IN_TMPDIR=$TMPDIR"; fi

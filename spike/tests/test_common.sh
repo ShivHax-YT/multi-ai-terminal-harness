@@ -1847,6 +1847,49 @@ eq "split: an empty errfile is a usage error (rc 2)" "2" "$?"
 rm -f "$SANDBOX/outprobe-ran"
 /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/perl "$RUNNER2" run-split ungated 5 "$SANDBOX/sp-ok" "$SANDBOX/sp-ok2" - /usr/bin/true >/dev/null 2>&1
 eq "split: the helper refuses the split form in a mode other than live (rc 2)" "2" "$?"
+# The caller's pid is an input (SPIKE_IN_PARENT). A helper whose real parent is another process was started by a caller that has
+# died already (the reaper is its parent): it starts nothing and ends 143. A missing or malformed pid is refused (rc 2).
+pp_run() { # pp_run <run|run-split> <pid | UNSET | text>: the helper started straight from this shell; sets PPRC
+  local par="SPIKE_IN_PARENT=$2"
+  if [ "$2" = "UNSET" ]; then par="SPIKE_IN_NOPARENT=1"; fi
+  rm -f "$SANDBOX/outprobe-ran" "$SANDBOX/pp-out" "$SANDBOX/pp-err"
+  if [ "$1" = "run" ]; then
+    /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C SPIKE_IN_PATH="$PATH" SPIKE_IN_TMPDIR="$SANDBOX" SPIKE_IN_HOME="$FH" SPIKE_IN_LIVE=1 "$par" \
+      /usr/bin/perl "$RUNNER2" run live 5 "$SANDBOX/pp-out" - "$SANDBOX/splitprobe.sh" </dev/null >/dev/null 2>&1
+  else
+    /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C SPIKE_IN_PATH="$PATH" SPIKE_IN_TMPDIR="$SANDBOX" SPIKE_IN_HOME="$FH" SPIKE_IN_LIVE=1 "$par" \
+      /usr/bin/perl "$RUNNER2" run-split live 5 "$SANDBOX/pp-out" "$SANDBOX/pp-err" - "$SANDBOX/splitprobe.sh" </dev/null >/dev/null 2>&1
+  fi
+  PPRC=$?
+}
+/bin/sh -c 'exit 0' &
+PP_DEAD=$!
+{ wait "$PP_DEAD"; } 2>/dev/null
+for ppsub in run run-split; do
+  pp_run "$ppsub" "$$"
+  eq "caller gone [$ppsub]: with the real parent pid the command runs (rc 0)" "0" "$PPRC"
+  check "caller gone [$ppsub]: ...and its marker appears" test -e "$SANDBOX/outprobe-ran"
+  pp_run "$ppsub" 1
+  eq "caller gone [$ppsub]: a parent pid that is not the real parent (1) ends 143" "143" "$PPRC"
+  check_absent "caller gone [$ppsub]: ...and the command was never started" "$SANDBOX/outprobe-ran"
+  check_absent "caller gone [$ppsub]: ...and no outfile was created" "$SANDBOX/pp-out"
+  pp_run "$ppsub" "$PP_DEAD"
+  eq "caller gone [$ppsub]: a dead parent pid ends 143" "143" "$PPRC"
+  check_absent "caller gone [$ppsub]: ...and the command was never started (dead pid)" "$SANDBOX/outprobe-ran"
+  for ppbad in UNSET "" abc "12x" "x12" 0 -1 "1 2" "007x" "99999999999"; do
+    pp_run "$ppsub" "$ppbad"
+    eq "caller gone [$ppsub]: SPIKE_IN_PARENT=[$ppbad] is refused (rc 2)" "2" "$PPRC"
+    check_absent "caller gone [$ppsub]: ...and nothing was started for [$ppbad]" "$SANDBOX/outprobe-ran"
+  done
+done
+PP_SELF="$(/bin/bash -c '. "$1"; _spike_self_pid; echo "$_SPIKE_SELF $$"' _ "$COMMON" 2>/dev/null)"
+eq "caller gone: _spike_self_pid is the shell's own pid" "${PP_SELF#* }" "${PP_SELF%% *}"
+PP_SELF="$(/bin/bash -c '. "$1"; unset BASHPID; _spike_self_pid; echo "$_SPIKE_SELF $$"' _ "$COMMON" 2>/dev/null)"
+eq "caller gone: without BASHPID (bash 3.2) the pid comes from the exec'd sh and is the shell's own" "${PP_SELF#* }" "${PP_SELF%% *}"
+PP_SELF="$(/bin/bash -c '. "$1"; ( _spike_self_pid; echo "$_SPIKE_SELF $BASHPID" )' _ "$COMMON" 2>/dev/null)"
+eq "caller gone: inside a subshell it is the subshell's pid" "${PP_SELF#* }" "${PP_SELF%% *}"
+has "caller gone: common.sh passes the starting shell's pid to the helper" "$(cat "$COMMON_REAL")" 'SPIKE_IN_PARENT=$_SPIKE_SELF'
+has "caller gone: runner.pl compares the parent pid before it starts the command" "$(cat "$RUNNER_REAL")" "the caller is already gone; nothing was started"
 # the live gate: no SPIKE_LIVE, no run
 rm -f "$SANDBOX/outprobe-ran" "$SANDBOX/sp-g-out" "$SANDBOX/sp-g-err"
 o="$(env -u SPIKE_LIVE HOME="$FH" /bin/bash -c '. "$1"; spike_run_live_split 5 "$2" "$3" "$4"; echo CONTINUED' _ "$COMMON2" "$SANDBOX/sp-g-out" "$SANDBOX/sp-g-err" "$SANDBOX/splitprobe.sh" 2>/dev/null)"
@@ -2135,6 +2178,10 @@ kill -9 "$CSCALLER" 2>/dev/null
 cs_gone "codesign watch: after kill -9 of the caller, the codesign and its child are gone within 3 s (no orphan under init)"
 { wait "$CSCALLER"; } 2>/dev/null
 rm -f "$FSDIR/cs.pids"
+# A registration whose caller is already gone (SPIKE_IN_PARENT names a process that is not its parent) starts no codesign.
+/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C SPIKE_IN_PATH="$PATH" SPIKE_IN_TMPDIR="$SANDBOX" SPIKE_IN_HOME="$SANDBOX/home" SPIKE_IN_PARENT=1 /usr/bin/perl "$RUNNER" register "$CSVD" claude path "$RG/claude" >/dev/null 2>&1
+eq "codesign watch: with the caller already gone the registration ends 143" "143" "$?"
+check_absent "codesign watch: ...and no codesign was started" "$FSDIR/cs.pids"
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude; echo "AFTER rc=$?"' _ "$COMMON" "$RG/claude" >| "$SANDBOX/cs-term.out" 2>&1 &
 CSCALLER=$!
 n=0

@@ -62,6 +62,8 @@ use constant DENY_FAIL_MSG => 'the CLI-home denylist (compliance/denylist.txt) i
 my %IN;      # the caller's inputs, copied from SPIKE_IN_* at start
 my $CWD;     # physical cwd at start (relative inputs are made absolute from it)
 my $ORIG_PPID = getppid();    # the caller; a different parent pid later means the caller died
+# run / run-split replace it with the pid the caller says it is (SPIKE_IN_PARENT): a caller that died before this process got
+# here has already been replaced by the reaper, and getppid() at start would then name the reaper as "the caller".
 
 $| = 1;
 
@@ -555,6 +557,7 @@ my $CAP_SIG = 0;
 sub run_capture {
     my ($secs, @argv) = @_;
     my ($rd, $wr);
+    POSIX::_exit(143) if getppid() != $ORIG_PPID;    # the caller is already gone: start no codesign
     pipe($rd, $wr) or return (-1, '', 0);
     my $mask = POSIX::SigSet->new(POSIX::SIGTERM(), POSIX::SIGINT(), POSIX::SIGHUP());
     my $old  = POSIX::SigSet->new();
@@ -1117,6 +1120,10 @@ sub run_core {
     return usage('bad timeout') unless $secs =~ /\A[0-9]{1,4}\z/ && $secs >= 1 && $secs <= 3600;
     $secs = $secs + 0;
     return usage('bad output file') unless defined $outfile && length $outfile && !has_ctl($outfile);
+    # The caller's pid arrives as input (digits only). If this process is no longer its child, the caller is already gone:
+    # nothing is started.
+    return usage('run: SPIKE_IN_PARENT is missing or not a pid') unless defined $IN{PARENT} && $IN{PARENT} =~ /\A[1-9][0-9]{0,9}\z/;
+    if (getppid() != $ORIG_PPID) { msg('run: the caller is already gone; nothing was started'); return 143; }
     my $r = resolve_phys($path);
     unless ($r && $r->{exists} && $r->{path} eq $path) { msg('run: not an exact physical path'); return 125; }
     # The policy is enforced again here, in the process that executes.
@@ -1152,7 +1159,6 @@ sub run_core {
             return 125;
         }
     }
-    my $orig_ppid = getppid();
     my %env = child_env();
 
     my $mask = POSIX::SigSet->new(POSIX::SIGTERM(), POSIX::SIGINT(), POSIX::SIGHUP());
@@ -1193,7 +1199,7 @@ sub run_core {
         if ($w == $pid) { $status = $?; last; }
         if ($w < 0) { $status = 0; last; }
         if ($sigged) { sweep(1, $pid); waitpid($pid, 0); return $sigged; }
-        if (getppid() != $orig_ppid) { sweep(1, $pid); waitpid($pid, 0); return 143; }
+        if (getppid() != $ORIG_PPID) { sweep(1, $pid); waitpid($pid, 0); return 143; }
         if (((POSIX::times())[0] - $t0) / $hz >= $secs) { sweep(1, $pid); waitpid($pid, 0); return 124; }
         select(undef, undef, undef, 0.05);
     }
@@ -1244,10 +1250,11 @@ sub cmd_tool_path {
 sub main {
     my ($sub, @a) = @_;
     $CWD = Cwd::getcwd();
-    for my $k (qw(PATH HOME TMPDIR LANG TERM USER LOGNAME LIVE)) {
+    for my $k (qw(PATH HOME TMPDIR LANG TERM USER LOGNAME LIVE PARENT)) {
         $IN{$k} = $ENV{"SPIKE_IN_$k"} if exists $ENV{"SPIKE_IN_$k"};
     }
     %ENV = ();
+    $ORIG_PPID = $IN{PARENT} + 0 if defined $IN{PARENT} && $IN{PARENT} =~ /\A[1-9][0-9]{0,9}\z/;
     return usage('runner.pl <subcommand> ...') unless defined $sub;
     # Fail closed: without a usable compliance/denylist.txt no operation of this helper runs.
     unless (denylist_ok()) { msg(DENY_FAIL_MSG); return DENY_FAIL_RC; }
