@@ -17,7 +17,8 @@
 #     uses a program found on PATH (jq and git for display probes run through the helper with a closed environment).
 #   - A command is resolved ONCE, physically (lstat walk, at most 40 links), refusing any control character, and the
 #     resolved path is what runs. The helper compares (device, inode), not strings, for the CLI homes (rule 4).
-#   - spike_run_timeout / spike_run_live / spike_run_status / spike_run_timed are the only helpers that start a command.
+#   - spike_run_timeout / spike_run_live / spike_run_live_split / spike_run_status / spike_run_timed are the only helpers
+#     that start a command (spike_run_live_split is spike_run_live with a separate stderr file).
 #     The helper puts itself at the head of a NEW process group, forks the command into that group and watches it: it
 #     kills the group on timeout, on TERM/INT/HUP, and when the caller disappears (the helper's parent pid changes). A
 #     SIGKILL to the caller or to the caller's whole process group therefore cannot orphan the command; a SIGKILL to the
@@ -606,6 +607,9 @@ _spike_secs() {
 }
 
 _SPIKE_SECS=""
+# The error file of a split live run. Set (as a function-local) only by spike_run_live_split; assigned here so an inherited
+# variable of the same name can never turn another entry point into a split run.
+_SPIKE_ERRFILE=""
 _spike_run_args_ok() { # usage check shared by the entry points: needs seconds, outfile, cmd
   if [ "$#" -lt 3 ]; then
     spike_err "usage: <seconds> <outfile> <cmd> [args...]"
@@ -631,9 +635,14 @@ _spike_forward() {
 
 # _spike_exec <mode> <seconds> <outfile> <vdir|-> <resolved-path> [args...] -- no gate here; callers decide. The helper is
 # started as a plain background command (its parent is THIS shell, whose death it watches). Returns the command's exit code
-# (124 on timeout, 128+n when the helper swept the group after a signal).
+# (124 on timeout, 128+n when the helper swept the group after a signal). In live mode with _SPIKE_ERRFILE set (only
+# spike_run_live_split does that) the helper's run-split subcommand is used: stdout to the outfile, stderr to the errfile.
 _spike_exec() {
-  local rc old_int old_term old_hup
+  local rc old_int old_term old_hup sub=run
+  if [ "$1" = "live" ] && [ -n "$_SPIKE_ERRFILE" ]; then
+    sub='run-split'
+    set -- "$1" "$2" "$3" "$_SPIKE_ERRFILE" "${@:4}"
+  fi
   old_int="$(trap -p INT)"
   old_term="$(trap -p TERM)"
   old_hup="$(trap -p HUP)"
@@ -643,7 +652,7 @@ _spike_exec() {
   trap '_spike_forward 130' INT
   trap '_spike_forward 143' TERM
   trap '_spike_forward 129' HUP
-  "$SPIKE_ENVBIN" -i PATH=/usr/bin:/bin LC_ALL=C "${_SPIKE_IN[@]}" "$SPIKE_PERL" "$SPIKE_HELPER" run "$@" </dev/null &
+  "$SPIKE_ENVBIN" -i PATH=/usr/bin:/bin LC_ALL=C "${_SPIKE_IN[@]}" "$SPIKE_PERL" "$SPIKE_HELPER" "$sub" "$@" </dev/null &
   _SPIKE_BG=$!
   if [ -n "$_SPIKE_BG_PENDING" ]; then
     kill -s TERM "$_SPIKE_BG" 2>/dev/null
@@ -731,6 +740,27 @@ spike_run_live() {
   _spike_run_args_ok "$@" || return 2
   secs="$_SPIKE_SECS" out="$2" cmd="$3"
   shift 3
+  spike_require_live
+  _spike_run_live_policy "$secs" "$out" "$cmd" "$@"
+}
+
+# spike_run_live_split <seconds> <outfile> <errfile> <cmd> [args...]
+# Exactly spike_run_live (same live gate, same verified-copy rule, same environment, watchdog and signal handling), except
+# that the command's stdout goes to <outfile> and its stderr to <errfile>, so a caller can tell event lines (stdout) from
+# diagnostics (stderr). <errfile> gets the outfile policy: O_NOFOLLOW|O_APPEND, mode 0600, and a symlink, a hard link, a
+# non-regular file (the null device excepted) or a parent inside a CLI home is refused (rc 125). The two files must be
+# different files (rc 125). spike_run_live itself is unchanged.
+spike_run_live_split() {
+  local secs out cmd
+  local _SPIKE_ERRFILE=""
+  if [ "$#" -lt 4 ]; then
+    spike_err "usage: <seconds> <outfile> <errfile> <cmd> [args...]"
+    return 2
+  fi
+  case "$3" in "") spike_err "bad errfile"; return 2 ;; esac
+  _spike_run_args_ok "$1" "$2" "$4" || return 2
+  secs="$_SPIKE_SECS" out="$2" _SPIKE_ERRFILE="$3" cmd="$4"
+  shift 4
   spike_require_live
   _spike_run_live_policy "$secs" "$out" "$cmd" "$@"
 }

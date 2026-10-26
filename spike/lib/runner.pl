@@ -1037,7 +1037,7 @@ sub open_outfile {
         elsif (S_ISREG($fs[2])) { $good = ($fs[3] == 1 && (!@l || ident(@fs) eq ident(@l))) ? 1 : 0; }
     }
     unless ($good) { close $out; return; }
-    return $out;
+    return wantarray ? ($out, $full) : $out;
 }
 
 sub child_env {
@@ -1112,8 +1112,21 @@ sub exit_status {
 }
 
 # run <mode> <secs> <outfile> <vdir|-> <path> [args...]
-sub cmd_run {
-    my ($mode, $secs, $outfile, $vdir, $path, @args) = @_;
+sub cmd_run { return run_core(undef, @_); }
+
+# run-split live <secs> <outfile> <errfile> <vdir|-> <path> [args...]: the same as `run live`, except that the child's stdout
+# goes to <outfile> and its stderr to <errfile>. Only the live mode has a split form; <errfile> gets exactly the outfile
+# policy, and the two files must be different files.
+sub cmd_run_split {
+    my ($mode, $secs, $outfile, $errfile, @rest) = @_;
+    return usage('run-split live <secs> <out> <err> <vdir|-> <path> [args]') unless defined $errfile && @rest >= 2;
+    return usage('run-split mode') unless $mode eq 'live';
+    return usage('bad error file') unless length $errfile && !has_ctl($errfile);
+    return run_core($errfile, $mode, $secs, $outfile, @rest);
+}
+
+sub run_core {
+    my ($errfile, $mode, $secs, $outfile, $vdir, $path, @args) = @_;
     return usage('run <mode> <secs> <out> <vdir|-> <path> [args]') unless defined $path;
     return usage('bad timeout') unless $secs =~ /\A[0-9]{1,4}\z/ && $secs >= 1 && $secs <= 3600;
     $secs = $secs + 0;
@@ -1138,8 +1151,21 @@ sub cmd_run {
     }
     # Rule 2: the child's HOME is always the account's own home; a caller whose HOME is another directory is refused.
     unless (defined child_home()) { msg('run: HOME is not the account home (the child never gets an alternate home)'); return 125; }
-    my $out = open_outfile($outfile);
+    my ($out, $outfull) = open_outfile($outfile);
     unless ($out) { msg('run: the output file is refused (symlink, hard link, non-regular file, or inside a CLI home) or cannot be opened'); return 125; }
+    my $err;
+    if (defined $errfile) {
+        my $errfull;
+        ($err, $errfull) = open_outfile($errfile);
+        unless ($err) { msg('run: the error file is refused (symlink, hard link, non-regular file, or inside a CLI home) or cannot be opened'); return 125; }
+        # Two names for one file would interleave the streams: refuse the same resolved path and the same open file.
+        my @eid = stat($err);
+        my @oid = stat($out);
+        if ($errfull eq $outfull || (@eid && @oid && ident(@eid) eq ident(@oid))) {
+            msg('run: the output file and the error file must be different files');
+            return 125;
+        }
+    }
     my $orig_ppid = getppid();
     my %env = child_env();
 
@@ -1159,7 +1185,7 @@ sub cmd_run {
         POSIX::sigprocmask(POSIX::SIG_SETMASK(), POSIX::SigSet->new(), undef);
         open(STDIN, '<', '/dev/null');
         POSIX::dup2(fileno($out), 1);
-        POSIX::dup2(fileno($out), 2);
+        POSIX::dup2(fileno(defined $err ? $err : $out), 2);
         %ENV = %env;
         {
             no warnings 'exec';
@@ -1170,6 +1196,7 @@ sub cmd_run {
         POSIX::_exit($code);
     }
     close $out;
+    close $err if defined $err;
     POSIX::sigprocmask(POSIX::SIG_SETMASK(), $old, undef);
 
     my $hz = POSIX::sysconf(POSIX::_SC_CLK_TCK()) || 100;
@@ -1244,6 +1271,7 @@ sub main {
     return cmd_tool_path(@a)  if $sub eq 'tool-path';
     return cmd_gate(@a)       if $sub eq 'gate';
     return cmd_run(@a)        if $sub eq 'run';
+    return cmd_run_split(@a)  if $sub eq 'run-split';
     return cmd_register(@a)   if $sub eq 'register';
     return cmd_vdir_create(@a) if $sub eq 'vdir-create';
     return cmd_vdir_sweep(@a) if $sub eq 'vdir-sweep';

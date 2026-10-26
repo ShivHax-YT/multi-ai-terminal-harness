@@ -82,10 +82,25 @@ EOF
 }
 for t in bash env perl git jq awk sed tr cut head od cat cp mv ln chmod mkdir rm touch printf true false sleep ls date mktemp seq wc ps grep dirname basename kill id; do trip_add "$t"; done
 
-MAIN_PID="${BASHPID:-$$}"
+# selfpid: set SELF_PID to the pid of the CURRENT shell process, subshells included. $BASHPID does not exist in the macOS
+# /bin/bash 3.2 and $$ is the top shell's pid even in a subshell, so a child forked straight from this process reports
+# its parent pid instead. Fails (and leaves SELF_PID empty) when it cannot tell.
+SELF_PID=""
+selfpid() {
+  local f
+  SELF_PID=""
+  f="$(mktemp "$SANDBOX/.selfpid.XXXXXX" 2>/dev/null)" || return 1
+  /bin/sh -c 'echo $PPID' >| "$f" 2>/dev/null
+  read -r SELF_PID < "$f" 2>/dev/null
+  rm -f "$f"
+  [ -n "$SELF_PID" ]
+}
+selfpid || { echo "cannot determine the main pid" >&2; exit 1; }
+MAIN_PID="$SELF_PID"
 finish() {
   local rc=$? viol=0
-  [ "${BASHPID:-$$}" = "$MAIN_PID" ] || return 0   # a forked subshell signalled before it execs must not remove the sandbox
+  # A forked subshell signalled before it execs must not remove the sandbox. If the pid cannot be told, it is not the main shell.
+  selfpid && [ "$SELF_PID" = "$MAIN_PID" ] || return 0
   trip_check
   local trc=$?
   if [ -s "$VIOLATIONS" ]; then viol=1; printf 'FAIL the sandbox guard refused a write:\n'; cat "$VIOLATIONS"; fi
@@ -95,6 +110,11 @@ finish() {
   fi
 }
 trap finish EXIT
+
+# Regression (macOS /bin/bash 3.2 has no BASHPID): the exit handler run inside a forked subshell must leave the sandbox alone.
+( finish ) >/dev/null 2>&1
+if [ -d "$SANDBOX" ] && [ ! -s "$VIOLATIONS" ]; then ok "the exit handler in a forked subshell does not remove the sandbox"; else bad "the exit handler in a forked subshell does not remove the sandbox"; fi
+if ( selfpid && [ "$SELF_PID" != "$MAIN_PID" ] ); then ok "selfpid reports a different pid inside a subshell"; else bad "selfpid reports a different pid inside a subshell"; fi
 
 # A refusal is recorded in a file because sbx_put usually runs in a pipeline (a subshell).
 sbx_refuse() { printf 'sandbox guard refused: %s\n' "$1" >> "$VIOLATIONS"; return 1; }
@@ -657,7 +677,7 @@ rooted "no verify directory set: nothing is rooted" 0 - "$VD/inside"
 rooted "a directory that merely looks like a verify directory is not one" 0 "$FH/.claude" "$FH/.claude/canary"
 denied "codesign --verify on a canary under a fake home is not ungated (rc 3)" "_SPIKE_VERIFY_DIR='$VD'; spike_run_timeout 5 /dev/null codesign --verify --strict '$FH/.claude/canary'"
 denied "codesign --verify through a symlink into the fake home is not ungated (rc 3)" "_SPIKE_VERIFY_DIR='$VD'; spike_run_timeout 5 /dev/null codesign --verify --strict '$VD/link-to-canary'"
-check "the canary was never copied or read into a verify output" /bin/bash -c '! grep -rq CANARY-ROOT "$1"' _ "$VD"
+check "the canary was never copied or read into a verify output" /bin/bash -c '! grep -r -D skip -q CANARY-ROOT "$1"' _ "$VD"
 check "spike_set_verify_dir no longer exists (the caller cannot choose the verify directory)" /bin/bash -c '. "$1"; ! declare -F spike_set_verify_dir >/dev/null' _ "$COMMON"
 
 # --- spike_run_status: only a registered, unchanged verified copy, and only the three status shapes -----------------
@@ -942,7 +962,7 @@ env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COM
 eq "spike_mark_verified refuses a path with a trailing newline (rc 2)" "2" "$?"
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$RG/claude"$'\nforged-line' >/dev/null 2>&1
 eq "spike_mark_verified refuses a path that would inject a registry line (rc 2)" "2" "$?"
-check "no registry in this sandbox contains an injected line" /bin/bash -c '! grep -rq forged-line "$1"/spike-verify.*/.registry' _ "$SANDBOX"
+check "no registry in this sandbox contains an injected line" /bin/bash -c '! grep -r -D skip -q forged-line "$1"/spike-verify.*/.registry' _ "$SANDBOX"
 
 # --- Opus finding 4: a path containing '=' runs that file, never a PATH program ----------------------------------------------
 sbx_mkdir "$SANDBOX/e=q" "$SANDBOX/pwbin"
@@ -1034,7 +1054,7 @@ lacks "spike_run_timed never ran file(1) on the canary (nothing in the output fi
 HOME="$UH" spike_run_timed 5 "$SANDBOX/probe-file.out" file "$SANDBOX/rp/real/target" >/dev/null 2>&1
 eq "spike_run_timed now refuses file(1) even on an ordinary file (rc 2; file was dropped from the tool list)" "2" "$?"
 eq "nothing was written to the probe output file by any refused probe" "" "$(cat "$SANDBOX/probe-file.out")"
-check "the hard-linked canary was never copied anywhere" /bin/bash -c '! grep -rq "^x$" "$1"/spike-verify.*/claude 2>/dev/null' _ "$SANDBOX"
+check "the hard-linked canary was never copied anywhere" /bin/bash -c '! grep -r -D skip -q "^x$" "$1"/spike-verify.*/claude 2>/dev/null' _ "$SANDBOX"
 # Sonnet audit: HOME unset, relative or pointed away must not lift the refusal of the account's own home.
 if /bin/bash -c 'unset HOME; . "$1"; spike_under_cli_home "$2"' _ "$COMMON" "$UH/plain/bin/claude" >/dev/null 2>&1; then bad "CLI home: HOME unset: an unrelated path is judged by the account home, not refused blindly"; else ok "CLI home: HOME unset: an unrelated path is judged by the account home, not refused blindly"; fi
 PWHOME="$(/usr/bin/perl -e 'print((getpwuid($<))[7])')"
@@ -1659,6 +1679,197 @@ HOME="$PWHOME" SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live 5 "$2" "$3"' _ 
 eq "outfile: the same symlink refusal holds under the real-account layout (rc 125)" "125" "$?"
 has "runner.pl opens the outfile O_NOFOLLOW|O_APPEND with mode 0600" "$(cat "$RUNNER_REAL")" 'O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_NOCTTY, 0600'
 
+# --- T-008: spike_run_live_split (stdout -> outfile, stderr -> errfile; everything else as spike_run_live) -----------------
+sbx_put "$SANDBOX/splitprobe.sh" <<EOF
+#!/bin/sh
+touch "$SANDBOX/outprobe-ran"
+printf '%s\n' '{"a":1}'
+printf '%s\n' '{"err":1}' 'plain stderr text' >&2
+exit 0
+EOF
+chmod +x "$SANDBOX/splitprobe.sh"
+split2() { # split2 <outfile> <errfile>: split live run of the probe with HOME = the ut2 account home; sets SRC
+  rm -f "$SANDBOX/outprobe-ran"
+  HOME="$FH" SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live_split 5 "$2" "$3" "$4"' _ "$COMMON2" "$1" "$2" "$SANDBOX/splitprobe.sh" >/dev/null 2>&1
+  SRC=$?
+}
+rm -f "$SANDBOX/sp-out" "$SANDBOX/sp-err"
+split2 "$SANDBOX/sp-out" "$SANDBOX/sp-err"
+eq "split: a run with two new files succeeds (rc 0)" "0" "$SRC"
+eq "split: outfile holds the stdout bytes only" '{"a":1}' "$(cat "$SANDBOX/sp-out")"
+eq "split: errfile holds the stderr bytes only" '{"err":1} plain stderr text' "$(tr '\n' ' ' < "$SANDBOX/sp-err" | sed 's/ $//')"
+eq "split: the outfile has mode 0600" "-rw-------" "$(ls -l "$SANDBOX/sp-out" | cut -c1-10)"
+eq "split: the errfile has mode 0600" "-rw-------" "$(ls -l "$SANDBOX/sp-err" | cut -c1-10)"
+split2 "$SANDBOX/sp-out" "$SANDBOX/sp-err"
+eq "split: both files are appended to on a second run" '{"a":1} {"a":1}' "$(tr '\n' ' ' < "$SANDBOX/sp-out" | sed 's/ $//')"
+eq "split: the errfile keeps its earlier content on a second run" "4" "$(wc -l < "$SANDBOX/sp-err" | tr -d ' ')"
+split2 "$SANDBOX/sp-out2" /dev/null
+eq "split: the null device is accepted as the errfile (rc 0)" "0" "$SRC"
+eq "split: with a null errfile the stdout still reaches the outfile" '{"a":1}' "$(cat "$SANDBOX/sp-out2")"
+split2 /dev/null "$SANDBOX/sp-err2"
+eq "split: the null device is accepted as the outfile (rc 0)" "0" "$SRC"
+eq "split: with a null outfile the stderr still reaches the errfile" "2" "$(wc -l < "$SANDBOX/sp-err2" | tr -d ' ')"
+( cd "$SANDBOX" && HOME="$FH" SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live_split 5 sp-rel-out sp-rel-err "$2"' _ "$COMMON2" "$SANDBOX/splitprobe.sh" >/dev/null 2>&1 )
+eq "split: relative paths work (rc 0)" "0" "$?"
+eq "split: relative outfile and errfile were written in the cwd" '{"a":1}|2' "$(cat "$SANDBOX/sp-rel-out" 2>/dev/null)|$(wc -l < "$SANDBOX/sp-rel-err" 2>/dev/null | tr -d ' ')"
+# the existing entry point is unchanged: one outfile gets both streams
+rm -f "$SANDBOX/sp-merged"
+HOME="$FH" SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live 5 "$2" "$3"' _ "$COMMON2" "$SANDBOX/sp-merged" "$SANDBOX/splitprobe.sh" >/dev/null 2>&1
+eq "spike_run_live still merges stdout and stderr into the one outfile" '{"a":1} {"err":1} plain stderr text' "$(tr '\n' ' ' < "$SANDBOX/sp-merged" | sed 's/ $//')"
+rm -f "$SANDBOX/sp-merged" "$SANDBOX/sp-inherited"
+_SPIKE_ERRFILE="$SANDBOX/sp-inherited" HOME="$FH" SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live 5 "$2" "$3"' _ "$COMMON2" "$SANDBOX/sp-merged" "$SANDBOX/splitprobe.sh" >/dev/null 2>&1
+eq "an inherited _SPIKE_ERRFILE does not turn spike_run_live into a split run" "3" "$(wc -l < "$SANDBOX/sp-merged" | tr -d ' ')"
+check_absent "an inherited _SPIKE_ERRFILE created no file" "$SANDBOX/sp-inherited"
+# identical files are refused
+rm -f "$SANDBOX/sp-same"
+split2 "$SANDBOX/sp-same" "$SANDBOX/sp-same"
+eq "split: the same path for both is refused (rc 125)" "125" "$SRC"
+check_absent "split: the same-path run did not start the command" "$SANDBOX/outprobe-ran"
+sbx_mkdir "$SANDBOX/sp-sub"
+split2 "$SANDBOX/sp-same" "$SANDBOX/sp-sub/../sp-same"
+eq "split: the same file spelled with .. is refused (rc 125)" "125" "$SRC"
+split2 "$SANDBOX/sp-same" "$SANDBOX/./sp-same"
+eq "split: the same file spelled with ./ is refused (rc 125)" "125" "$SRC"
+split2 /dev/null /dev/null
+eq "split: /dev/null for both is refused too (rc 125)" "125" "$SRC"
+check_absent "split: none of the identical-path runs started the command" "$SANDBOX/outprobe-ran"
+# errfile refusals: the outfile policy, each rc 125, nothing runs, nothing written where it must not be
+sbx_ln "$FH/.claude/canary" "$SANDBOX/sp-link-canary"
+split2 "$SANDBOX/sp-ok" "$SANDBOX/sp-link-canary"
+eq "split errfile: a symlink into a fake CLI home is refused (rc 125)" "125" "$SRC"
+eq "split errfile: nothing was written to the canary through the symlink" "CANARY-ROOT-9d1e" "$(cat "$FH/.claude/canary")"
+sbx_ln "$FH/.claude/new-target" "$SANDBOX/sp-link-dangling"
+split2 "$SANDBOX/sp-ok" "$SANDBOX/sp-link-dangling"
+eq "split errfile: a dangling symlink into a fake CLI home is refused (rc 125)" "125" "$SRC"
+check_absent "split errfile: the dangling symlink's target was not created" "$FH/.claude/new-target"
+printf 'plain\n' | sbx_put "$SANDBOX/sp-plain"
+sbx_ln "$SANDBOX/sp-plain" "$SANDBOX/sp-link-plain"
+split2 "$SANDBOX/sp-ok" "$SANDBOX/sp-link-plain"
+eq "split errfile: a symlink to an ordinary file is refused (rc 125)" "125" "$SRC"
+eq "split errfile: the file behind that symlink is unchanged" "plain" "$(cat "$SANDBOX/sp-plain")"
+split2 "$SANDBOX/sp-ok" "$FH/.claude/sp-direct"
+eq "split errfile: a new file whose parent is a CLI home is refused (rc 125)" "125" "$SRC"
+check_absent "split errfile: the file inside the CLI home was not created" "$FH/.claude/sp-direct"
+sbx_ln "$FH/.claude" "$SANDBOX/sp-dirlink"
+split2 "$SANDBOX/sp-ok" "$SANDBOX/sp-dirlink/sp-via"
+eq "split errfile: a parent directory that is a symlink into a CLI home is refused (rc 125)" "125" "$SRC"
+check_absent "split errfile: nothing was created through the symlinked parent" "$FH/.claude/sp-via"
+split2 "$SANDBOX/sp-ok" "$FH/.cl""aude.json"
+eq "split errfile: a single-file CLI home entry is refused (rc 125)" "125" "$SRC"
+eq "split errfile: that entry is unchanged" "CANARY-ENTRY" "$(cat "$FH/.cl""aude.json")"
+printf 'orig\n' | sbx_put "$SANDBOX/sp-hl-a"
+ln "$SANDBOX/sp-hl-a" "$SANDBOX/sp-hl-b"
+split2 "$SANDBOX/sp-ok" "$SANDBOX/sp-hl-b"
+eq "split errfile: a hard-linked file is refused (rc 125)" "125" "$SRC"
+eq "split errfile: the hard-linked file is unchanged" "orig" "$(cat "$SANDBOX/sp-hl-a")"
+ln "$FH/.claude/canary" "$SANDBOX/sp-hl-canary"
+split2 "$SANDBOX/sp-ok" "$SANDBOX/sp-hl-canary"
+eq "split errfile: a hard link to a canary is refused (rc 125)" "125" "$SRC"
+eq "split errfile: the canary behind the hard link is unchanged" "CANARY-ROOT-9d1e" "$(cat "$FH/.claude/canary")"
+mkfifo "$SANDBOX/sp-fifo"
+split2 "$SANDBOX/sp-ok" "$SANDBOX/sp-fifo"
+eq "split errfile: a FIFO is refused without blocking (rc 125)" "125" "$SRC"
+split2 "$SANDBOX/sp-fifo" "$SANDBOX/sp-ok"
+eq "split outfile: a FIFO is refused without blocking (rc 125)" "125" "$SRC"
+split2 "$SANDBOX/sp-ok" "$SANDBOX/out-dir"
+eq "split errfile: a directory is refused (rc 125)" "125" "$SRC"
+split2 "$SANDBOX/sp-ok" "$SANDBOX/no-such-parent/err"
+eq "split errfile: a missing parent directory is refused (rc 125)" "125" "$SRC"
+split2 "$SANDBOX/out-link-canary" "$SANDBOX/sp-ok"
+eq "split outfile: a symlink into a fake CLI home is refused (rc 125)" "125" "$SRC"
+check_absent "split errfile: none of the refused runs started the command" "$SANDBOX/outprobe-ran"
+# an errfile refusal is the helper's rc 125 under the real-account layout too
+sbx_ln "$SANDBOX/sp-plain" "$SANDBOX/sp-link-plain2"
+HOME="$PWHOME" SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live_split 5 "$2" "$3" "$4"' _ "$COMMON" "$SANDBOX/sp-ok" "$SANDBOX/sp-link-plain2" "$SANDBOX/splitprobe.sh" >/dev/null 2>&1
+eq "split errfile: the same symlink refusal holds under the real-account layout (rc 125)" "125" "$?"
+has "runner.pl opens the errfile with the outfile helper (one policy)" "$(cat "$RUNNER_REAL")" '($err, $errfull) = open_outfile($errfile);'
+# usage
+SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live_split 5 "$2" "$3"' _ "$COMMON" "$SANDBOX/sp-ok" "$SANDBOX/splitprobe.sh" >/dev/null 2>&1
+eq "split: too few arguments (no errfile) is a usage error (rc 2)" "2" "$?"
+SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live_split 5 "$2" "" "$3"' _ "$COMMON" "$SANDBOX/sp-ok" "$SANDBOX/splitprobe.sh" >/dev/null 2>&1
+eq "split: an empty errfile is a usage error (rc 2)" "2" "$?"
+# the helper gives the split form to live mode only
+rm -f "$SANDBOX/outprobe-ran"
+/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/perl "$RUNNER2" run-split ungated 5 "$SANDBOX/sp-ok" "$SANDBOX/sp-ok2" - /usr/bin/true >/dev/null 2>&1
+eq "split: the helper refuses the split form in a mode other than live (rc 2)" "2" "$?"
+# the live gate: no SPIKE_LIVE, no run
+rm -f "$SANDBOX/outprobe-ran" "$SANDBOX/sp-g-out" "$SANDBOX/sp-g-err"
+o="$(env -u SPIKE_LIVE HOME="$FH" /bin/bash -c '. "$1"; spike_run_live_split 5 "$2" "$3" "$4"; echo CONTINUED' _ "$COMMON2" "$SANDBOX/sp-g-out" "$SANDBOX/sp-g-err" "$SANDBOX/splitprobe.sh" 2>/dev/null)"
+eq "split gate: without SPIKE_LIVE=1 the calling script is stopped (rc 3)" "3" "$?"
+lacks "split gate: the caller does not continue" "$o" "CONTINUED"
+check_absent "split gate: the command was not started" "$SANDBOX/outprobe-ran"
+check_absent "split gate: no outfile was created" "$SANDBOX/sp-g-out"
+check_absent "split gate: no errfile was created" "$SANDBOX/sp-g-err"
+# a pinned CLI name runs only as the registered, hash-verified copy, also through the split entry point
+rm -f "$FAKE"/ran-*
+SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude && spike_run_live_split 5 /dev/null "$2/sp-reg-err" "$SPIKE_VERIFIED_COPY" -p hi' _ "$COMMON" "$REG" 2>/dev/null
+eq "split: the registered, hash-verified copy of claude runs (rc 0)" "0" "$?"
+eq "split: the registered copy was started" "1" "$(ran)"
+rm -f "$FAKE"/ran-*
+o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude && spike_run_live_split 5 /dev/null "$2/sp-reg-err" "$SPIKE_VERIFIED_COPY" -p hi; echo CONTINUED' _ "$COMMON" "$REG" 2>/dev/null)"
+eq "split: the registered copy still needs SPIKE_LIVE=1 (rc 3)" "3" "$?"
+eq "split: the registered copy was not started without SPIKE_LIVE=1" "0" "$(ran)"
+o="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude || exit 9; printf "%s\n" "#!/bin/sh" "touch \"$3/ran-swapped\"" >| "$SPIKE_VERIFIED_COPY"; spike_run_live_split 5 /dev/null "$2/sp-reg-err" "$SPIKE_VERIFIED_COPY" -p hi; echo CONTINUED' _ "$COMMON" "$REG" "$FAKE" 2>/dev/null)"
+eq "split: a registered copy whose content changed is refused (rc 3)" "3" "$?"
+lacks "split: ...and the caller is stopped" "$o" "CONTINUED"
+check_absent "split: the changed registered copy never ran" "$FAKE/ran-swapped"
+SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live_split 5 /dev/null "$2/sp-reg-err" "$2/claude" -p hi' _ "$COMMON" "$FAKE" 2>/dev/null
+eq "split: an UNVERIFIED claude is refused even with SPIKE_LIVE=1 (rc 3)" "3" "$?"
+SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live_split 5 /dev/null "$2/sp-reg-err" "$2/alias-to-claude" -p hi' _ "$COMMON" "$FAKE" 2>/dev/null
+eq "split: a symlink whose RESOLVED basename is claude is refused (rc 3)" "3" "$?"
+eq "split: no unverified fixture was started" "0" "$(ran)"
+# HOME must be the account home
+rm -f "$SANDBOX/outprobe-ran"
+HOME="$SANDBOX/elsewhere" SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live_split 5 "$2" "$3" "$4"' _ "$COMMON" "$SANDBOX/sp-ok" "$SANDBOX/sp-ok2" "$SANDBOX/splitprobe.sh" >/dev/null 2>&1
+eq "split: HOME pointed away is refused (rc 125)" "125" "$?"
+check_absent "split: the command was not started with HOME pointed away" "$SANDBOX/outprobe-ran"
+# the child's environment is the same closed allowlist
+rm -f "$SANDBOX/sp-env-out" "$SANDBOX/sp-env-err"
+SPIKE_TEST_SECRET=hunter2 HOME="$FH" SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live_split 5 "$2" "$3" env' _ "$COMMON2" "$SANDBOX/sp-env-out" "$SANDBOX/sp-env-err" >/dev/null 2>&1
+lacks "split: a secret in the caller's environment does not reach the child" "$(cat "$SANDBOX/sp-env-out")" "hunter2"
+has "split: the child's HOME is the account home" "$(cat "$SANDBOX/sp-env-out")" "HOME=$FH"
+# timeout: the group is killed, rc 124
+sbx_put "$SANDBOX/splitlauncher.sh" <<EOF
+#!/bin/sh
+sleep 30 &
+echo \$! > "$SANDBOX/split-grandchild.pid"
+wait
+EOF
+chmod +x "$SANDBOX/splitlauncher.sh"
+rm -f "$SANDBOX/split-grandchild.pid"
+SPIKE_LIVE=1 spike_run_live_split 1 /dev/null "$SANDBOX/sp-to-err" "$SANDBOX/splitlauncher.sh"
+eq "split: a launcher that outlives the timeout is stopped (rc 124)" "124" "$?"
+SGC="$(cat "$SANDBOX/split-grandchild.pid" 2>/dev/null)"
+check "split: the launcher wrote its grandchild pid" test -n "$SGC"
+if gone_within 30 "$SGC"; then ok "split: the grandchild was killed with the launcher"; else bad "split: the grandchild was killed with the launcher"; kill -9 "$SGC" 2>/dev/null; fi
+# signals to the caller leave nothing running
+for sig in TERM HUP; do
+  rm -f "$SANDBOX/splitsig.pids"
+  sbx_put "$SANDBOX/splitsig.sh" <<EOF
+#!/bin/sh
+sleep 33 &
+echo "\$\$ \$!" > "$SANDBOX/splitsig.pids.tmp"
+mv "$SANDBOX/splitsig.pids.tmp" "$SANDBOX/splitsig.pids"
+wait
+EOF
+  chmod +x "$SANDBOX/splitsig.sh"
+  SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_run_live_split 60 /dev/null "$3" "$2"; echo AFTER' _ "$COMMON" "$SANDBOX/splitsig.sh" "$SANDBOX/sp-sig-err" >| "$SANDBOX/splitsig.out" 2>/dev/null &
+  CALLER=$!
+  n=0
+  while [ ! -s "$SANDBOX/splitsig.pids" ] && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+  LPID=""
+  GPID=""
+  read -r LPID GPID < "$SANDBOX/splitsig.pids" 2>/dev/null
+  if alive "$LPID" && alive "$GPID"; then ok "split SIG$sig: launcher and grandchild are running before the signal"; else bad "split SIG$sig: launcher and grandchild are running before the signal"; fi
+  kill -s "$sig" "$CALLER"
+  wait "$CALLER" 2>/dev/null
+  RC=$?
+  if gone_within 30 "$LPID"; then ok "split SIG$sig to the caller: launcher is gone"; else bad "split SIG$sig to the caller: launcher is gone"; kill -9 "$LPID" 2>/dev/null; fi
+  if gone_within 30 "$GPID"; then ok "split SIG$sig to the caller: grandchild is gone"; else bad "split SIG$sig to the caller: grandchild is gone"; kill -9 "$GPID" 2>/dev/null; fi
+  lacks "split SIG$sig to the caller: nothing ran afterwards" "$(cat "$SANDBOX/splitsig.out")" "AFTER"
+  check "split SIG$sig to the caller: exit status is a signal status" test "$RC" -gt 128
+done
+
 # --- item 7: the narrow binary exception: a file inside a CLI home must look like a vendor binary BEFORE it is opened --------
 NB="$SANDBOX/nbin"
 sbx_mkdir "$NB" "$FH/.claude/bin"
@@ -1712,7 +1923,7 @@ chmod 700 "$FH/.claude/bigelf"
 sbx_ln "$FH/.claude/bigelf" "$NB/claude"
 r="$(reg2 "$NB")"
 has "narrow exception: a big executable that is not a Mach-O is still refused (not read beyond the magic, not copied)" "$r" "STATUS=clihome"
-eq "narrow exception: the canary text was never copied into a verify directory" "0" "$(grep -rl 'CANARY-NARROW-5b1c' "$SANDBOX" 2>/dev/null | grep -c 'spike-verify')"
+eq "narrow exception: the canary text was never copied into a verify directory" "0" "$(grep -r -D skip -l 'CANARY-NARROW-5b1c' "$SANDBOX" 2>/dev/null | grep -c 'spike-verify')"
 # "never opened": proven by a seam (open_ro recorded) and, where strace works, by the system-call trace.
 VD2="$(/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C SPIKE_IN_PATH="$PATH" SPIKE_IN_TMPDIR="$SANDBOX" SPIKE_IN_HOME="$FH" /usr/bin/perl "$RUNNER2" vdir-create $$)"
 check_present "narrow exception: the seam test has a private verify directory" "$VD2/.registry"
