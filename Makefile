@@ -38,8 +38,13 @@ spike-test:
 	failed=0; \
 	for t in "$${tests[@]}"; do \
 	  echo "== $$t"; \
-	  /bin/bash "$$t"; rc=$$?; \
+	  log="$$(mktemp)"; \
+	  /bin/bash "$$t" 2>&1 | tee "$$log"; rc=$${PIPESTATUS[0]}; \
 	  echo "== $$t exit $$rc"; \
+	  if [ "$$rc" -ne 0 ] && [ -n "$${GITHUB_ACTIONS:-}" ]; then \
+	    grep -E '^(FAIL|not ok)|survivor' "$$log" | head -20 | sed "s|^|::error title=$$t::|"; \
+	  fi; \
+	  rm -f "$$log"; \
 	  if [ "$$rc" -ne 0 ]; then failed=$$((failed + 1)); fi; \
 	done; \
 	if [ "$$failed" -ne 0 ]; then echo "spike-test: $$failed suite(s) failed" >&2; exit 1; fi
