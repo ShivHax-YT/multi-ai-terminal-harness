@@ -1,14 +1,14 @@
 # Claude Code headless events (`claude -p --output-format stream-json --verbose`)
 
-Status: **every row below is "from docs"**. No live capture exists yet (the human runs `SPIKE_LIVE=1 spike/claude/run.sh` on
+Status: **every row below is "from docs" or "seen in binary, not observed"**. No live capture exists yet (the human runs `SPIKE_LIVE=1 spike/claude/run.sh` on
 the Mac). After that run, add `spike/fixtures/claude/observed.jsonl` (the `spike_redact` of the real capture, reviewed by
 the human) and change the Source column to **observed** for the rows that appeared.
 
-Sources (official Claude Code docs only; the binary was not run to get any of this):
+Sources (official Claude Code docs; the binary was not run to get any of this. The few rows marked "seen in binary" come from strings a reviewer found in the 2.1.295 binary):
 
 - Headless / `-p` and stream-json: https://code.claude.com/docs/en/headless (stream format, `system/api_retry`, `system/init`,
   `--resume`, permission modes)
-- CLI flags: https://code.claude.com/docs/en/cli-reference (`--max-turns` "print mode only", `--permission-mode`, `--resume`,
+- CLI flags: https://code.claude.com/docs/en/cli-reference (`--max-turns` "print mode only", which `claude --help` 2.1.295 hides, see "Flags used by the spike"; `--permission-mode`, `--resume`,
   `--output-format`, `--verbose`, `--include-partial-messages`)
 - Message types and fields: https://code.claude.com/docs/en/agent-sdk/typescript (`SDKMessage` union, `SDKResultMessage`,
   `SDKRateLimitEvent`, `SDKSystemMessage`, `SDKAssistantMessage`, `Usage`). The headless page says stream-json lines are these
@@ -52,7 +52,21 @@ hand-written file contains it. Examples are one line, redacted (`<ID>`, `<WORKTR
 | `auth_status` | from docs (SDKAuthStatusMessage) | none | `{"type":"auth_status","isAuthenticating":false,"output":[...]}` |
 | `prompt_suggestion` | from docs | none | only with `--prompt-suggestions` (not used here) |
 
-Anything not in this table is, by design, reported by `parse.jq` under `unknown` (type, subtype and key names only).
+### Seen in the binary, not observed (for T-004)
+
+These `system` subtypes were found as strings in the 2.1.295 binary. They are not in the docs and no capture has shown them, so
+nothing is known about their fields. `parse.jq` does not list them as known, so a live capture that contains one reports it under
+`unknown` (type, subtype and key names only), which is how T-004 should learn their shape. Treat every field as untrusted.
+
+| Key | Source | In fixtures | Note |
+|---|---|---|---|
+| `system/api_error` | seen in binary, not observed | none | probably an API error notice (compare `system/api_retry`); fields unknown |
+| `system/model_fallback` | seen in binary, not observed | none | probably a switch to another model; fields unknown |
+| `system/notification` | seen in binary, not observed | none | probably a user-facing notice; free text, untrusted |
+| `system/turn_duration` | seen in binary, not observed | none | probably per-turn timing; fields unknown |
+| `system/stop_hook_summary` | seen in binary, not observed | none | probably a summary of Stop hooks; the scratch repo has no hooks |
+
+Anything not in the tables above is, by design, reported by `parse.jq` under `unknown` (type, subtype and key names only).
 
 ## Rate-limit, usage-exhausted and error shapes (all from docs, none provoked)
 
@@ -76,7 +90,7 @@ itself). Rule 10 then applies (back off, never retry the same provider in a loop
 |---|---|---|
 | `-p` / `--print` | headless, non-interactive | cli-reference, headless |
 | `--output-format stream-json` with `--verbose` | newline-delimited JSON events; the last line is the `result` | headless "Stream responses" |
-| `--max-turns N` | "Limit the number of agentic turns (print mode only). Exits with an error when the limit is reached." Used with 5 (rule 1 ceiling is 40) | cli-reference |
+| `--max-turns N` | "Limit the number of agentic turns (print mode only). Exits with an error when the limit is reached." Used with 5 (rule 1 ceiling is 40). **Not listed by `claude --help` in 2.1.295**: the flag is hidden from help (hideHelp) but is defined in the binary, so it is accepted. The live run must still confirm the cap is honoured (`result/error_max_turns`) | cli-reference; binary inspection (hidden in help) |
 | `--permission-mode acceptEdits` | "Claude writes files without prompting"; other shell commands still need allowed tools. Not `bypassPermissions` | headless "Auto-approve tools" |
 | `--resume <session-id>` | continue a specific conversation; `--fork-session` (not used) would create a new id, so the id is expected to be reused | headless "Continue conversations", cli-reference |
 

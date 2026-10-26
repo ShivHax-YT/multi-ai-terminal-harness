@@ -9,6 +9,8 @@ unset CDPATH
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 SPIKE="$(cd "$HERE/.." && pwd -P)"
 PARSE="$SPIKE/claude/parse.jq"
+SPLIT="$SPIKE/claude/split.jq"
+SCRUB="$SPIKE/claude/scrub-init.jq"
 RUN="$SPIKE/claude/run.sh"
 RESUME="$SPIKE/claude/resume.sh"
 FIX="$SPIKE/fixtures/claude"
@@ -42,6 +44,8 @@ for f in "$RUN" "$RESUME" "$HERE/test_claude_parse.sh"; do
   check "bash -n ${f##*/}" /bin/bash -n "$f"
 done
 check "jq compiles parse.jq" jq -n -f "$PARSE" --argjson x 1
+check "jq compiles split.jq" jq -n -f "$SPLIT" --arg part raw
+check "jq compiles scrub-init.jq" jq -n -f "$SCRUB"
 check "scripts are executable" test -x "$RUN" -a -x "$RESUME"
 
 # ---- sample.jsonl ------------------------------------------------------------------------------------------------------------
@@ -102,6 +106,16 @@ expect "injected: session_id and final unaffected" "$I" '.session_id == "1111111
 expect "injected: unknown entries carry no free text" "$I" '[.unknown[] | tojson] | all(contains("ignore all previous") | not)'
 expect "injected: the unknown result error still shows as a limit/error event" "$I" '[.limit_or_error_events[] | select(.kind == "result_error")] | length == 1'
 
+# array-typed type/subtype must not match the known lists (jq index() does a subsequence search for an array argument)
+printf '%s\n' '{"type":["assistant"]}' '{"type":"system","subtype":["init"]}' '{"type":"result","subtype":["success"]}' \
+  '{"type":["system"],"subtype":"init"}' '{"type":"system"}' '{"type":"result"}' > "$TMP/arrays.jsonl"
+AR="$(parse "$TMP/arrays.jsonl" 2>"$TMP/arrays.err")"
+arc=$?
+if [ "$arc" -eq 0 ] && [ -z "$(cat "$TMP/arrays.err")" ]; then ok; else bad "array-typed type/subtype: parser exit $arc / stderr output"; fi
+expect "array-typed type/subtype: all six lines land in unknown" "$AR" '(.unknown | length) == 6 and .event_counts["system/init"] == null'
+expect "array-typed type/subtype: not counted as known events" "$AR" '(.event_counts | keys) == ["result","system"]'
+expect "array-typed type/subtype: no text leaks" "$AR" '[.unknown[] | tojson] | all(contains("assistant") | not)'
+
 # an array on stdin (jq -s) works too
 A="$(jq -s -f "$PARSE" "$SAMPLE" 2>/dev/null)"
 expect "slurped array input" "$A" '.session_id == "11111111-1111-4111-8111-111111111111" and .final.usage.output_tokens == 49'
@@ -158,6 +172,28 @@ check "nothing was created under the sandbox captures root" test -z "$(ls -A "$S
 check "no scratch repo was created" test -z "$(ls -A "$SBX/tmp")"
 check "the refusal message is printed" grep -q 'SPIKE_LIVE=1' "$TMP/gate.err"
 
+# ---- the "no direct CLI call" detector itself must catch the sneaky forms ---------------------------------------------------------
+calls_cli_directly() { # calls_cli_directly <file> -> 0 when a non-comment line starts a command that is claude
+  grep -v '^[[:space:]]*#' "$1" | grep -qE '(^|[;&|(`]|\$\()[[:space:]]*((exec|command|env|nohup|time)[[:space:]]+)*(claude|[^[:space:]]*/claude)([[:space:])`;|&]|$)'
+}
+DET="$TMP/detector"
+mkdir -p "$DET"
+i=0
+for line in 'claude -p x' '   claude -p x' 'x="$(claude -p x)"' 'x=$(claude -p x)' 'out=`claude -p x`' '  exec claude -p x' 'command claude -p x' \
+  'true && claude -p x' 'true; claude -p x' 'echo a | claude -p x' '/usr/local/bin/claude -p x' '	env claude -p x' '( claude -p x )' 'cat f | /opt/x/claude'; do
+  i=$((i + 1))
+  printf '%s\n' "$line" > "$DET/bad$i.sh"
+  if calls_cli_directly "$DET/bad$i.sh"; then ok; else bad "detector misses: $line"; fi
+done
+for line in 'spike_register_cli claude' 'command -v claude' '# claude -p x' "printf 'claude is not installed\\n'" 'spike_run_live 120 "$o" "$COPY" -p x' 'spike_err "claude was NOT verified"'; do
+  i=$((i + 1))
+  printf '%s\n' "$line" > "$DET/good$i.sh"
+  if calls_cli_directly "$DET/good$i.sh"; then bad "detector false positive: $line"; else ok; fi
+done
+# a second spike_run_live (indented, in a branch) must be counted too
+printf 'spike_run_live 1 o "$COPY" -p a\nif x; then\n  spike_run_live 1 o "$COPY" -p b\nfi\n' > "$DET/two.sh"
+check "the run-call counter sees an indented second spike_run_live" test "$(grep -v '^[[:space:]]*#' "$DET/two.sh" | grep -c 'spike_run_live')" -eq 2
+
 # ---- static review of the two live scripts (rules 1, 2, 3, 4, 6, 10) ---------------------------------------------------------------
 for f in "$RUN" "$RESUME"; do
   n="${f##*/}"
@@ -166,14 +202,76 @@ for f in "$RUN" "$RESUME"; do
   if [ -n "$first_stmt" ] && [ -n "$first_run" ] && [ "$first_stmt" -lt "$first_run" ]; then ok; else bad "$n: spike_require_live comes before any other spike action"; fi
   check "$n: sources the T-001 library" grep -q 'lib/common.sh' "$f"
   check "$n: starts the CLI only through spike_run_live with the verified copy" grep -q 'spike_run_live .*"\$COPY"' "$f"
-  if grep -nE '^[[:space:]]*(exec[[:space:]]+)?(command[[:space:]]+)?(claude|/[^ ]*/claude)([[:space:]]|$)' "$f" >/dev/null; then bad "$n: calls claude directly"; else ok; fi
+  if calls_cli_directly "$f"; then bad "$n: calls claude directly"; else ok; fi
   if grep -nE 'bypass|dangerously|CONFIG_DIR|[A-Z]+_HOME|expect|send-keys|tmux|script -q' "$f" | grep -v '^[0-9]*:[[:space:]]*#' >/dev/null; then bad "$n: forbidden word"; else ok; fi
   if grep -nE '(^|[^a-z_])(while|until)([^a-z_]|$)|seq |retry_|retries' "$f" | grep -v '^[0-9]*:[[:space:]]*#' | grep -v 'for f in' >/dev/null; then bad "$n: loop or retry"; else ok; fi
-  check "$n: only one run call" test "$(grep -c '^spike_run_live ' "$f")" -eq 1
+  # every non-comment line that mentions spike_run_live, indented or not: exactly one
+  check "$n: only one run call" test "$(grep -v '^[[:space:]]*#' "$f" | grep -c 'spike_run_live')" -eq 1
+  check "$n: sets umask 077 before anything else runs" test "$(grep -v '^[[:space:]]*#' "$f" | grep -v '^[[:space:]]*$' | sed -n '1,3p' | grep -c '^umask 077$')" -eq 1
+  check "$n: umask 077 comes before spike_require_live" test "$(grep -n '^umask 077$' "$f" | head -1 | cut -d: -f1)" -lt "$(grep -n '^spike_require_live$' "$f" | head -1 | cut -d: -f1)"
+  if grep -v '^[[:space:]]*#' "$f" | grep -qE ':[[:space:]]*>[[:space:]]*"?\$CAP/'; then bad "$n: pre-creates a capture file with a default-mode redirect"; else ok; fi
+  check "$n: splits output through split.jq" grep -q -e '-f "\$HERE/split.jq"' "$f"
+  if grep -v '^[[:space:]]*#' "$f" | grep -q "fromjson"; then bad "$n: inline stdout split instead of split.jq"; else ok; fi
+  check "$n: says --max-turns is hidden from help" grep -q 'hideHelp' "$f"
+  check "$n: handles runner status 121" grep -q '121)' "$f"
   check "$n: passes a turn cap" grep -q -e '--max-turns' "$f"
   check "$n: uses acceptEdits" grep -q -e '--permission-mode acceptEdits' "$f"
   check "$n: uses headless -p" grep -q -e ' -p ' "$f"
 done
+
+# ---- split.jq: every line lands in exactly one output; only JSON OBJECT lines are raw ----------------------------------------------
+COMB="$TMP/combined.txt"
+{
+  printf '%s\n' '{"type":"system","subtype":"init","session_id":"abcdefgh-1"}'
+  printf '%s\n' '42' '"a string"' '[1,2]' 'null' 'true' 'plain stderr text' '{"half":' ''
+  printf '%s\n' '  {"type":"result","subtype":"success"}'
+  printf '%s\n' 'warning: {"type":"assistant"} inside text'
+  printf '%s\n' '{"type":"result","subtype":"success","is_error":false}'
+} > "$COMB"
+RAWOUT="$(jq -R -r --arg part raw -f "$SPLIT" "$COMB")"
+OTHEROUT="$(jq -R -r --arg part other -f "$SPLIT" "$COMB")"
+check "split raw: only the three object lines" test "$(printf '%s\n' "$RAWOUT" | wc -l | tr -d ' ')" -eq 3
+check "split raw: every kept line is a JSON object" test "$(printf '%s\n' "$RAWOUT" | jq -s 'all(type == "object")')" = "true"
+check "split other: has the non-object JSON lines" test "$(printf '%s\n' "$OTHEROUT" | grep -cxE '42|"a string"|\[1,2\]|null|true')" -eq 5
+check "split other: has the text, half-line and blank lines" test "$(printf '%s\n' "$OTHEROUT" | grep -cE 'plain stderr text|^\{"half":$|inside text|^$')" -eq 4
+check "split: raw + other = all lines" test "$(( $(printf '%s\n' "$RAWOUT" | wc -l) + $(printf '%s\n' "$OTHEROUT" | wc -l) ))" -eq "$(wc -l < "$COMB" | tr -d ' ')"
+check "split raw output parses cleanly with parse.jq" test "$(printf '%s\n' "$RAWOUT" | parse | jq -r '(.unknown | length | tostring) + "/" + (.malformed | length | tostring)')" = "0/0"
+check "split.jq refuses a missing part argument" test "$(jq -R -r -f "$SPLIT" "$COMB" 2>&1 | grep -c 'needs --arg part\|not defined')" -ge 1
+check "split of an empty file is empty" test -z "$(jq -R -r --arg part raw -f "$SPLIT" /dev/null)"
+
+# ---- scrub-init.jq: personal configuration is removed from the init event ----------------------------------------------------------
+PERSONAL='{"type":"system","subtype":"init","session_id":"abcdefgh-1","cwd":"<WORKTREE>","tools":["Bash","mcp__acme_corp_vpn__connect"],"mcp_servers":[{"name":"acme-corp-vpn","status":"connected"}],"plugins":[{"name":"acme-plugin","path":"/x"}],"skills":["acme-deploy","review"],"slash_commands":["/acme-secret","/help"],"agents":["acme-agent"],"model":"claude-model-example","permissionMode":"acceptEdits","output_style":"default"}'
+printf '%s\n' "$PERSONAL" '{"type":"assistant","message":{"content":[{"type":"text","text":"tools skills plugins"}]},"tools":["keep-me"]}' '42' > "$TMP/personal.jsonl"
+SC="$(jq -c -f "$SCRUB" "$TMP/personal.jsonl")"
+SC1="$(printf '%s\n' "$SC" | sed -n 1p)"
+expect "scrub: the six lists are redacted" "$SC1" \
+  '.tools == ["<redacted>"] and .mcp_servers == ["<redacted>"] and .plugins == ["<redacted>"] and .skills == ["<redacted>"] and .slash_commands == ["<redacted>"] and .agents == ["<redacted>"]'
+expect "scrub: counts are kept" "$SC1" '.scrubbed_counts == {"tools":2,"mcp_servers":1,"plugins":1,"skills":2,"slash_commands":2,"agents":1}'
+expect "scrub: other init fields are untouched" "$SC1" '.session_id == "abcdefgh-1" and .model == "claude-model-example" and .permissionMode == "acceptEdits" and .output_style == "default"'
+check "scrub: no personal name survives anywhere" test -z "$(printf '%s\n' "$SC" | grep -i 'acme')"
+check "scrub: other events and non-object lines pass through unchanged" test "$(printf '%s\n' "$SC" | sed -n '2,3p')" = "$(sed -n '2,3p' "$TMP/personal.jsonl" | jq -c .)"
+check "scrub: idempotent" test "$(printf '%s\n' "$SC" | jq -c -f "$SCRUB")" = "$SC"
+printf '%s\n' '{"type":"system","subtype":"init","tools":[],"mcp_servers":"corp","agents":null}' > "$TMP/odd-init.jsonl"
+expect "scrub: empty list stays empty, string becomes redacted, null stays null" "$(jq -c -f "$SCRUB" "$TMP/odd-init.jsonl")" \
+  '.tools == [] and .mcp_servers == "<redacted>" and .agents == null and .scrubbed_counts == {"tools":0,"mcp_servers":null,"agents":null}'
+SCP="$(jq -c -f "$SCRUB" "$TMP/personal.jsonl" | parse 2>/dev/null)"
+expect "scrub: a scrubbed capture still parses" "$SCP" '.session_id == "abcdefgh-1" and (.malformed | length) == 0'
+if [ -f "$FIX/observed.jsonl" ]; then
+  check "observed.jsonl: init lists are scrubbed" test "$(jq -c 'select(.type == "system" and .subtype == "init") | [.mcp_servers, .plugins, .skills, .slash_commands, .agents, .tools] | map(select(. != null)) | all(. == [] or . == ["<redacted>"])' "$FIX/observed.jsonl" | grep -c false)" -eq 0
+fi
+
+# ---- resume.sh argument and result handling (static: these paths need SPIKE_LIVE=1, which a test never sets) ----------------------------
+strip_slashes() { local a="$1"; a="${a%"${a##*[!/]}"}"; printf '%s' "$a"; }
+check "the trailing-slash idiom strips one slash" test "$(strip_slashes "dir/")" = "dir"
+check "the trailing-slash idiom strips many slashes" test "$(strip_slashes "a/b///")" = "a/b"
+check "the trailing-slash idiom leaves a clean path alone" test "$(strip_slashes "/a/b")" = "/a/b"
+check "the trailing-slash idiom turns / into empty (refused as usage)" test -z "$(strip_slashes "/")"
+check "resume.sh strips trailing slashes with that idiom" grep -qF 'ARG="${ARG%"${ARG##*[!/]}"}"' "$RESUME"
+check "resume.sh strips before the symlink test" test "$(grep -nF 'ARG="${ARG%"${ARG##*[!/]}"}"' "$RESUME" | head -1 | cut -d: -f1)" -lt "$(grep -n '! -L "\$ARG"' "$RESUME" | head -1 | cut -d: -f1)"
+check "resume.sh reports unknown when the new session id is empty" grep -q 'reused="unknown"' "$RESUME"
+check "resume.sh only says no for a different, non-empty id" grep -qF 'if [ "$NEW_SID" = "$SID" ]; then reused="yes"; else reused="no"; fi' "$RESUME"
+check "run.sh prints the run dir when worktree or capture setup fails" test "$(grep -c 'scratch run dir left at' "$RUN")" -eq 2
+check "run.sh learns RUN_DIR right after the scratch repo exists" test "$(grep -n '^RUN_DIR=' "$RUN" | head -1 | cut -d: -f1)" -lt "$(grep -n '^WT=' "$RUN" | head -1 | cut -d: -f1)"
 
 # ---- fixtures: nothing personal ----------------------------------------------------------------------------------------------------
 check "fixtures contain no at-sign" test -z "$(grep -rl '@' "$FIX" 2>/dev/null)"
@@ -192,6 +290,10 @@ done
 for key in rate_limit_event system/api_retry result/error_max_turns result/error_max_budget_usd result/error_during_execution; do
   check "EVENTS.md lists \`$key\`" grep -qF "\`$key\`" "$EVENTS"
 done
+for key in system/api_error system/model_fallback system/notification system/turn_duration system/stop_hook_summary; do
+  check "EVENTS.md lists \`$key\` as seen in binary" test "$(grep -F "\`$key\`" "$EVENTS" | grep -c 'seen in binary, not observed')" -ge 1
+done
+check "EVENTS.md says --max-turns is hidden from claude --help" grep -q 'hideHelp' "$EVENTS"
 check "EVENTS.md marks rows as observed or from docs" grep -q 'from docs' "$EVENTS"
 check "EVENTS.md names the docs source" grep -q 'code.claude.com/docs' "$EVENTS"
 

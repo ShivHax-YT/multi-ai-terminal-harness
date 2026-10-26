@@ -10,11 +10,14 @@
 #   2. makes a scratch repo + worktree "claude-1" under $TMPDIR/harness-spike/ (outside this repo)
 #   3. with cwd = the worktree, runs through spike_run_live (closed environment, 120 s watchdog):
 #        claude -p "<TASK>" --output-format stream-json --verbose --permission-mode acceptEdits --max-turns 5
-#      --max-turns is a documented print-mode option (https://code.claude.com/docs/en/cli-reference), so the turn cap is
-#      5 (rule 1 ceiling: 40). The 120 s runner watchdog is a second, independent limit.
-#   4. splits the output into raw.jsonl (JSON object lines) and stderr.txt (everything else), runs parse.jq, prints a summary
+#      --max-turns is a documented print-mode option (https://code.claude.com/docs/en/cli-reference), but `claude --help`
+#      (2.1.295) does NOT list it: the flag is hidden from help (hideHelp) and still defined in the binary. So the turn cap is
+#      5 (rule 1 ceiling: 40) and the live run must confirm it is honoured. The 120 s runner watchdog is a second, independent limit.
+#   4. splits the output (split.jq) into raw.jsonl (JSON object lines) and stderr.txt (everything else), runs parse.jq, prints a summary
+# Capture files are private: umask 077 below, so nothing in the capture directory is group- or world-readable.
 # Headless -p only (rule 3). No config-home variable is named or set (rule 2); no credential file is read (rule 4).
 set -u
+umask 077
 
 _here="${BASH_SOURCE[0]}"
 case "$_here" in
@@ -53,9 +56,16 @@ COPY="$SPIKE_VERIFIED_COPY"
 
 # ---- 2. scratch repo, worktree, capture directory -----------------------------------------------------------------------------
 REPO="$(spike_scratch_repo)" || { spike_err "cannot create the scratch repo"; exit 1; }
-WT="$(spike_worktree_add "$REPO" claude-1)" || { spike_err "cannot create the worktree"; exit 1; }
 RUN_DIR="$(dirname "$REPO")"
-CAP="$(spike_capture_dir claude)" || { spike_err "cannot create the capture directory"; exit 1; }
+# From here on a scratch run directory exists; if setup fails, say where it is so the human can remove it.
+WT="$(spike_worktree_add "$REPO" claude-1)" || {
+  spike_err "cannot create the worktree; scratch run dir left at: $RUN_DIR (remove with: . spike/lib/common.sh; spike_cleanup $RUN_DIR)"
+  exit 1
+}
+CAP="$(spike_capture_dir claude)" || {
+  spike_err "cannot create the capture directory; scratch run dir left at: $RUN_DIR (remove with: . spike/lib/common.sh; spike_cleanup $RUN_DIR)"
+  exit 1
+}
 CAP="${CAP%/}"
 printf '%s\n' "$WT" > "$CAP/worktree.path"
 printf '%s\n' "$RUN_DIR" > "$CAP/rundir.path"
@@ -65,7 +75,7 @@ printf '%s\n' "$TASK" > "$CAP/task.txt"
 # The runner has no cwd option, so the script changes directory itself. The runner puts stdout AND stderr of the child into
 # the one output file, so the output is split afterwards (step 4).
 cd "$WT" || exit 1
-: > "$CAP/combined.txt"
+# combined.txt is created by the runner itself (mode 0600), not pre-created here.
 spike_run_live "$WATCHDOG_SECS" "$CAP/combined.txt" "$COPY" \
   -p "$TASK" --output-format stream-json --verbose --permission-mode acceptEdits --max-turns "$MAX_TURNS"
 rc=$?
@@ -73,8 +83,9 @@ cd "$HERE" || exit 1
 
 # ---- 4. split, parse, summarise ---------------------------------------------------------------------------------------------------
 # A line that is a JSON object goes to raw.jsonl; everything else (stderr text, a startup warning) goes to stderr.txt.
-jq -R -r 'select(try (fromjson | type == "object") catch false)' "$CAP/combined.txt" > "$CAP/raw.jsonl" 2>/dev/null
-jq -R -r 'select((try (fromjson | type == "object") catch false) | not)' "$CAP/combined.txt" > "$CAP/stderr.txt" 2>/dev/null
+# Both files are always created by the redirects (a missing combined.txt, e.g. a refused run, gives two empty files).
+jq -R -r --arg part raw -f "$HERE/split.jq" "$CAP/combined.txt" > "$CAP/raw.jsonl" 2>/dev/null
+jq -R -r --arg part other -f "$HERE/split.jq" "$CAP/combined.txt" > "$CAP/stderr.txt" 2>/dev/null
 jq -Rs -f "$HERE/parse.jq" "$CAP/raw.jsonl" > "$CAP/summary.json" 2>/dev/null || printf '{}\n' > "$CAP/summary.json"
 
 hello="no"

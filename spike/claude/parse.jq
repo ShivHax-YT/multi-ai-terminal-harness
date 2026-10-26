@@ -35,10 +35,13 @@ def known_system: ["init", "api_retry", "compact_boundary", "status", "informati
 def known_result: ["success", "error_max_turns", "error_during_execution", "error_max_budget_usd",
                    "error_max_structured_output_retries"];
 
+# type and subtype must be STRINGS before the lookup: jq's index() on an array treats an array argument as a subsequence search,
+# so {"type":["assistant"]} would otherwise count as a known type. Anything else lands in "unknown".
 def is_known:
-  (.type as $t | known_top | index($t)) != null
-  and (if .type == "system" then (.subtype as $s | known_system | index($s)) != null
-       elif .type == "result" then (.subtype as $s | known_result | index($s)) != null
+  (.type | type) == "string"
+  and ((.type as $t | known_top | index($t)) != null)
+  and (if .type == "system" then (.subtype | type) == "string" and ((.subtype as $s | known_system | index($s)) != null)
+       elif .type == "result" then (.subtype | type) == "string" and ((.subtype as $s | known_result | index($s)) != null)
        else true end);
 
 def evlabel: if (.subtype | type) == "string" then "\(.type)/\(.subtype)" else "\(.type)" end;

@@ -12,7 +12,11 @@
 # Differences from the brief's sketch, on purpose: the prompt comes before --resume (the form the headless docs show:
 # https://code.claude.com/docs/en/headless#continue-conversations); --permission-mode acceptEdits and --max-turns 5 are
 # repeated because a resumed run needs the same write permission and the same turn cap (rule 1). No retry (rule 10).
+# --max-turns is documented for print mode (https://code.claude.com/docs/en/cli-reference) but `claude --help` (2.1.295) does
+# NOT list it: the flag is hidden from help (hideHelp) and still defined in the binary. The live run must confirm it is honoured.
+# Capture files are private: umask 077 below, so nothing in the capture directory is group- or world-readable.
 set -u
+umask 077
 
 _here="${BASH_SOURCE[0]}"
 case "$_here" in
@@ -37,6 +41,8 @@ command -v jq >/dev/null 2>&1 || { spike_err "jq is required"; exit 1; }
 
 # ---- the capture directory is an argument: check it before trusting anything in it ----------------------------------------
 ARG="${1:-}"
+# Strip trailing slashes first: "dir/" would make the symlink test below follow a link, and "/" alone is never a capture dir.
+ARG="${ARG%"${ARG##*[!/]}"}"
 if [ -z "$ARG" ] || [ "$#" -ne 1 ]; then
   spike_err "usage: SPIKE_LIVE=1 spike/claude/resume.sh <capture-dir>"
   exit 2
@@ -86,19 +92,22 @@ COPY="$SPIKE_VERIFIED_COPY"
 
 # ---- the one resume ------------------------------------------------------------------------------------------------------------------
 cd "$WT" || exit 1
-: > "$CAP/resume-combined.txt"
+# resume-combined.txt is created by the runner itself (mode 0600), not pre-created here.
 spike_run_live "$WATCHDOG_SECS" "$CAP/resume-combined.txt" "$COPY" \
   -p "$PROMPT" --resume "$SID" --output-format stream-json --verbose --permission-mode acceptEdits --max-turns "$MAX_TURNS"
 rc=$?
 cd "$HERE" || exit 1
 
-jq -R -r 'select(try (fromjson | type == "object") catch false)' "$CAP/resume-combined.txt" > "$CAP/resume-raw.jsonl" 2>/dev/null
-jq -R -r 'select((try (fromjson | type == "object") catch false) | not)' "$CAP/resume-combined.txt" > "$CAP/resume-stderr.txt" 2>/dev/null
+jq -R -r --arg part raw -f "$HERE/split.jq" "$CAP/resume-combined.txt" > "$CAP/resume-raw.jsonl" 2>/dev/null
+jq -R -r --arg part other -f "$HERE/split.jq" "$CAP/resume-combined.txt" > "$CAP/resume-stderr.txt" 2>/dev/null
 jq -Rs -f "$HERE/parse.jq" "$CAP/resume-raw.jsonl" > "$CAP/resume-summary.json" 2>/dev/null || printf '{}\n' > "$CAP/resume-summary.json"
 
 NEW_SID="$(jq -r '.session_id // empty' "$CAP/resume-summary.json" 2>/dev/null)"
-reused="no"
-[ -n "$NEW_SID" ] && [ "$NEW_SID" = "$SID" ] && reused="yes"
+# unknown = the resumed run reported no session id at all (not the same as a different id)
+reused="unknown"
+if [ -n "$NEW_SID" ]; then
+  if [ "$NEW_SID" = "$SID" ]; then reused="yes"; else reused="no"; fi
+fi
 both="no"
 if [ -f "$WT/hello.txt" ] && [ ! -L "$WT/hello.txt" ] && grep -qx 'hello from claude' "$WT/hello.txt" && grep -qxE 'resumed[.]?' "$WT/hello.txt"; then
   both="yes"
@@ -108,6 +117,7 @@ case "$rc" in
   0) status="exited 0" ;;
   124) status="stopped by the ${WATCHDOG_SECS}s watchdog (124)" ;;
   125) status="refused by the runner (125)" ;;
+  121) status="refused (121: the CLI-home denylist is unusable)" ;;
   126|127) status="the verified copy could not run ($rc); needs human review" ;;
   *) status="exited $rc" ;;
 esac
