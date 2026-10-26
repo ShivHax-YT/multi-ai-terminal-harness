@@ -30,7 +30,7 @@ unset _here
 . "$HERE/../lib/common.sh"
 spike_require_live
 
-PROMPT='Append a second line to hello.txt: resumed. Reply DONE.'
+PROMPT='Append a second line to hello.txt that is only the word resumed with no punctuation. Reply DONE.'
 WATCHDOG_SECS=120
 
 trap 'spike_verify_cleanup' EXIT
