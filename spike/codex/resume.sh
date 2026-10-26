@@ -42,6 +42,19 @@ fi
 command -v jq >/dev/null 2>&1 || { spike_err "jq is required"; exit 2; }
 
 # ---- inputs from the first run (all checked; the files are data, not code) ------------------------------------------------
+# link_count <file>: the number of hard links, portable (field 2 of `ls -ld`; the same on macOS and Linux). `stat` is avoided
+# because its option letters differ between the two (and `stat -f %l` means something else on Linux).
+link_count() {
+  /bin/ls -ld -- "$1" 2>/dev/null | /usr/bin/awk '{ print $2; exit }'
+}
+# safe_input <file>: 0 only for a regular file that is not a symlink, is outside every CLI home (the T-001 check, which also
+# refuses hard-linked regular files and anything it cannot resolve) and has exactly one link. Prints nothing and never opens
+# the file, so a link to a credential file cannot leak into any output. Rule 4.
+safe_input() {
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  if spike_under_cli_home "$1"; then return 1; fi
+  [ "$(link_count "$1")" = "1" ]
+}
 CAP="$(spike_resolve_path "$1")" || { spike_err "cannot resolve the capture directory: $1"; exit 2; }
 CAPROOT="$(spike_resolve_path "${SPIKE_CAPTURES_ROOT:-$SPIKE_DIR/captures}")" || { spike_err "cannot resolve the captures root"; exit 2; }
 case "$CAP" in
@@ -49,12 +62,16 @@ case "$CAP" in
   *) spike_err "not a codex capture directory under $CAPROOT: $1"; exit 2 ;;
 esac
 [ -d "$CAP" ] && [ -f "$CAP/raw.jsonl" ] && [ -f "$CAP/worktree.txt" ] || { spike_err "not a run.sh capture (raw.jsonl or worktree.txt missing): $CAP"; exit 2; }
+# every capture file is checked BEFORE it is read (rule 4); the message names only the capture directory, never file content
+safe_input "$CAP/raw.jsonl" && safe_input "$CAP/worktree.txt" \
+  || { spike_err "a capture file is a link, is hard-linked or lies inside a CLI home; refused, nothing was read: $CAP"; exit 2; }
 # reserve_resume: the one-resume guard. mkdir either creates the directory or fails, in one step, so two resumes of the same
 # capture cannot both pass. The reservation is made before the CLI call and is never removed (a failed resume is not retried).
 reserve_resume() {
   mkdir "$1/resume.lock" 2>/dev/null
 }
-if [ -e "$CAP/resume.combined.txt" ] || [ -e "$CAP/resume.lock" ]; then
+# any name starting with resume. (the lock, a combined file, or a planted file or link where an output will be written)
+if compgen -G "$CAP/resume.*" >/dev/null; then
   spike_err "this capture was already resumed once (or is being resumed); one resume per capture"
   exit 2
 fi

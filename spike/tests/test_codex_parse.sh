@@ -348,6 +348,50 @@ for s in run.sh resume.sh; do
   check "$s: a failing verdict sets OK=0" grep -q '^REASONS="\$(completion_verdict .*)" || {$' "$CODEX/$s"
 done
 
+# ---- resume.sh refuses linked capture files before reading them (rule 4) ---------------------------------------------------
+LK=$(mktemp -d "$TMP/links.XXXXXX")
+awk '/^link_count\(\) \{/ { p = 1 } p { print } p && /^\}/ { exit }' "$CODEX/resume.sh" > "$LK/fn.sh"
+awk '/^safe_input\(\) \{/ { p = 1 } p { print } p && /^\}/ { exit }' "$CODEX/resume.sh" >> "$LK/fn.sh"
+check "link_count and safe_input found in resume.sh" test "$(grep -c '^link_count()\|^safe_input()' "$LK/fn.sh")" = "2"
+safe_rc() { # file: exit status of safe_input; the output goes to $LK/out and $LK/err
+  "$SH" -c '. "$1"; . "$2"; safe_input "$3"' _ "$SPIKE/lib/common.sh" "$LK/fn.sh" "$1" > "$LK/out" 2> "$LK/err" < /dev/null
+}
+link_count_of() { "$SH" -c '. "$1"; link_count "$2"' _ "$LK/fn.sh" "$1"; }
+CANARY="CANARY-TEXT-must-never-be-printed-7f3a9c"
+mkdir "$LK/elsewhere" "$LK/cap"
+printf '%s\n' "$CANARY" > "$LK/elsewhere/secret.txt"
+printf '{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}\n' > "$LK/cap/raw.jsonl"
+printf '%s\n' "$LK/wt" > "$LK/cap/worktree.txt"
+safe_rc "$LK/cap/raw.jsonl"; eq "safe_input: a plain single-link file is accepted" "$?" "0"
+safe_rc "$LK/cap/worktree.txt"; eq "safe_input: a plain worktree.txt is accepted" "$?" "0"
+eq "link_count: a plain file has one link" "$(link_count_of "$LK/cap/raw.jsonl")" "1"
+ln "$LK/elsewhere/secret.txt" "$LK/cap/linked.jsonl"
+eq "link_count: a hard-linked file has two links" "$(link_count_of "$LK/cap/linked.jsonl")" "2"
+safe_rc "$LK/cap/linked.jsonl"; check "safe_input: a hard link to a canary file is refused" test "$?" -ne 0
+check "safe_input: the canary text reached neither stdout nor stderr" test "$(cat "$LK/out" "$LK/err" | grep -c "$CANARY")" = "0"
+check "safe_input: nothing is printed at all" test ! -s "$LK/out" -a ! -s "$LK/err"
+# a hard link made from the capture's own file (the other name lives anywhere)
+ln "$LK/cap/raw.jsonl" "$LK/elsewhere/second-name"
+safe_rc "$LK/cap/raw.jsonl"; check "safe_input: a capture file that gained another hard link is refused" test "$?" -ne 0
+rm -f "$LK/elsewhere/second-name"
+ln -s "$LK/elsewhere/secret.txt" "$LK/cap/sym.jsonl"
+safe_rc "$LK/cap/sym.jsonl"; check "safe_input: a symlink to the canary is refused" test "$?" -ne 0
+check "safe_input: the canary text did not leak through the symlink case" test "$(cat "$LK/out" "$LK/err" | grep -c "$CANARY")" = "0"
+safe_rc "$LK/cap"; check "safe_input: a directory is refused" test "$?" -ne 0
+safe_rc "$LK/cap/missing.jsonl"; check "safe_input: a missing file is refused" test "$?" -ne 0
+# the wiring: both inputs are checked before any read of them, and the resume.* pre-existence check covers planted names
+SI=$(grep -n '^safe_input "\$CAP/raw.jsonl"' "$CODEX/resume.sh" | head -n 1 | cut -d: -f1)
+RJ=$(grep -n 'parse.jq" < "\$CAP/raw.jsonl"' "$CODEX/resume.sh" | head -n 1 | cut -d: -f1)
+RW=$(grep -n 'head -n 1 "\$CAP/worktree.txt"' "$CODEX/resume.sh" | head -n 1 | cut -d: -f1)
+check "safe_input runs on raw.jsonl and worktree.txt before either is read" test -n "$SI" -a -n "$RJ" -a -n "$RW" -a "${SI:-999999}" -lt "${RJ:-0}" -a "${SI:-999999}" -lt "${RW:-0}"
+check "the safe_input call names both capture files" grep -q '^safe_input "\$CAP/raw.jsonl" && safe_input "\$CAP/worktree.txt"' "$CODEX/resume.sh"
+check "no capture file is read anywhere before the check" test "$(head -n "$((SI - 1))" "$CODEX/resume.sh" | grep -vE '^[[:space:]]*#' | grep -cE '(<|cat|head|tail|jq|sed|awk)[^|]*\$CAP/(raw\.jsonl|worktree\.txt)')" = "0"
+mkdir "$LK/cap3"
+: > "$LK/cap3/resume.raw.jsonl"
+ln -s "$LK/elsewhere/nothing-here" "$LK/cap3/resume.stderr.txt"
+check "a planted resume.* name (file or dangling symlink) is seen by the glob check" "$SH" -c 'compgen -G "$1/resume.*"' _ "$LK/cap3"
+check "resume.sh refuses any pre-existing resume.* name" grep -q 'compgen -G "\$CAP/resume\.\*"' "$CODEX/resume.sh"
+
 # ---- the one-resume reservation is atomic (mkdir), made before the CLI call, and never removed ----------------------------
 RD=$(mktemp -d "$TMP/resv.XXXXXX")
 awk '/^reserve_resume\(\) \{/ { p = 1 } p { print } p && /^\}/ { exit }' "$CODEX/resume.sh" > "$RD/fn.sh"

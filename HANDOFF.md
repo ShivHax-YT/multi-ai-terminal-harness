@@ -10,21 +10,22 @@ from the official `@openai/codex-sdk` 0.164.0 type definitions; nothing observed
 allow-list test, narrower rate-limit heuristic, de-duplicated error items, exact hello.txt byte checks, pwned check in the temp dir.
 Gate round: both scripts now fail unless the CLI exited 0, parse.jq succeeded, the parsed final status is "completed" and the
 thread id is usable (`completion_verdict`, tested offline per failure case); resume.sh reserves the capture atomically with
-`mkdir resume.lock` before the CLI call and never removes it. The stdout/stderr split is untouched (runner change is T-008, lead).
+`mkdir resume.lock` before the CLI call and never removes it. Rule 4 round: resume.sh refuses a capture whose `raw.jsonl` or
+`worktree.txt` is a symlink, is hard-linked (link count > 1), or lies in a CLI home (`spike_under_cli_home`), before reading either. The stdout/stderr split is untouched (runner change is T-008, lead).
 
 ## Files changed
 - spike/codex/run.sh - gated live run: register codex, login status (exit code only), scratch worktree codex-1, one `codex exec --json --sandbox workspace-write -C <wt>` (single-line call), split/parse/redact, exact-bytes hello.txt check (one optional trailing newline), `completion_verdict` (CLI exit 0, parse.jq exit 0, status completed, usable thread id; a matching hello.txt never rescues a failing verdict)
-- spike/codex/resume.sh - gated live resume by thread id, one resume per capture, single-line call, exact two-line hello.txt check (second line with or without trailing newline), same `completion_verdict` plus thread id equal to the first run's, atomic `reserve_resume` (`mkdir <capture>/resume.lock` before the CLI call, never removed); comment records the verified flag order
+- spike/codex/resume.sh - gated live resume by thread id, one resume per capture, single-line call, exact two-line hello.txt check (second line with or without trailing newline), same `completion_verdict` plus thread id equal to the first run's, atomic `reserve_resume` (`mkdir <capture>/resume.lock` before the CLI call, never removed), `safe_input`/`link_count` (capture inputs refused if symlinked, hard-linked or in a CLI home, checked before any read) and a refusal of any pre-existing `resume.*` name in the capture; comment records the verified flag order
 - spike/codex/parse.jq - JSONL summary; rate-limit heuristic narrowed (rate/usage limit, insufficient_quota, quota exceeded, too many requests, 429); limit_or_error_events built from de-duplicated items
 - spike/codex/EVENTS.md - event/item/usage/error shapes; flag placement marked "observed via --help, codex-cli 0.162.0"; heuristic false-positive note for T-004
 - spike/fixtures/codex/sample.jsonl - hand-written from the SDK types, every event and item type plus two synthetic unknowns
 - spike/fixtures/codex/failure.jsonl - error and turn.failed shapes with synthetic rate-limit wording
 - spike/fixtures/codex/malformed.jsonl - broken lines, wrong shapes, inert injection text
-- spike/tests/test_codex_parse.sh - 427 offline checks (parser, fixtures, EVENTS.md coverage, gate with a fake codex, exact-argv allow-list with mutation self-test, hello_ok byte cases, completion_verdict failure cases, reservation incl. six racing processes, heuristic and dedup cases, static rules)
+- spike/tests/test_codex_parse.sh - 445 offline checks (parser, fixtures, EVENTS.md coverage, gate with a fake codex, exact-argv allow-list with mutation self-test, hello_ok byte cases, completion_verdict failure cases, reservation incl. six racing processes, heuristic and dedup cases, static rules)
 - HANDOFF.md - this file
 
 ## Tests run
-- `/bin/bash spike/tests/test_codex_parse.sh` - 427 passed, 0 failed (offline; SPIKE_LIVE never set; no provider CLI run)
+- `/bin/bash spike/tests/test_codex_parse.sh` - 445 passed, 0 failed (offline; SPIKE_LIVE never set; no provider CLI run)
 - `PATH=/usr/bin:/bin make -s check-fast` - PASS (compliance-scan clean)
 - `PATH=/usr/bin:/bin make -s spike-test` - PASS (codex 302, common 914, handoff 1039, plan 414, preflight 142)
 - `bash -n` on run.sh and resume.sh - clean
@@ -33,7 +34,7 @@ thread id is usable (`completion_verdict`, tested offline per failure case); res
 - Rule 1 (human-triggered, bounded): run.sh and resume.sh exit 3 without SPIKE_LIVE=1 (unset plus 7 near-miss values tried), the fake codex marker stays absent, nothing is created; exactly one `spike_run_live` call each, no loops, 120 s watchdog (test_codex_parse.sh, gate and static sections).
 - Rule 2 (no profiles/overrides/alternate homes): the test pins the exact argument vector on the single `spike_run_live` line of each script (nothing can be appended after `-C "$WT"`; mutated copies with extra arguments are rejected), explicitly rejects --enable, --disable, --ignore-user-config, --strict-config, --ignore-rules, attached -ckey=value, -c/--config, -p/--profile, --dangerously-*, --oss, --local-provider, --approve-for-me, and greps for the four config-home variable names; compliance scan clean.
 - Rule 3 (headless only): only `codex exec` via the runner, stdin /dev/null; test checks the command shape and that no bare codex/claude command exists in the scripts.
-- Rule 4 (credentials): sign-in by `login status` exit code only (output to /dev/null); scripts name no CLI home (checked against compliance/denylist.txt); fixtures contain no at-sign, /Users/ or /home/ (tested).
+- Rule 4 (credentials): resume.sh `safe_input` (T-001 `spike_under_cli_home` plus an own link-count check via `ls -ld`, portable; `stat` avoided because the -c flag is banned by the static test) runs on raw.jsonl and worktree.txt before they are read; tests: a hard link to a canary file is refused and the canary text reaches neither stdout nor stderr, a symlink, a directory, a missing file and a file that gained a second hard link are refused, and the check precedes every read. run.sh reads no capture input (it writes the capture). Sign-in by `login status` exit code only (output to /dev/null); scripts name no CLI home (checked against compliance/denylist.txt); fixtures contain no at-sign, /Users/ or /home/ (tested).
 - Rule 6 (official binary): `spike_register_cli codex` and `$SPIKE_VERIFIED_COPY` only; test checks the call shape.
 - Rule 10 (no retry): one call, no loop/retry/sleep in code; resume.sh reserves the capture with an atomic `mkdir resume.lock` before dispatch and never removes it (tests: the second reservation fails, exactly one of six racing reservations wins, the reservation precedes the `spike_run_live` line, no rm/rmdir in the script).
 
@@ -62,4 +63,4 @@ Follow-ups for shared files (lead):
 - T-004: use EVENTS.md as the codex input; rate-limit detection must combine the text heuristic with exit status.
 
 ## Confidence
-Medium. The parser, fixtures, gate behaviour, exact argument vector and static rules are fully tested offline (427 checks), and the flag placement is now verified against codex-cli 0.162.0 `--help`. Confidence in the live path is still lower: the post-gate code (registration, scratch repo, result checks) is unexercised by design, and the event shapes are unobserved.
+Medium. The parser, fixtures, gate behaviour, exact argument vector and static rules are fully tested offline (445 checks), and the flag placement is now verified against codex-cli 0.162.0 `--help`. Confidence in the live path is still lower: the post-gate code (registration, scratch repo, result checks) is unexercised by design, and the event shapes are unobserved.
