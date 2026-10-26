@@ -68,6 +68,24 @@ completion_verdict() {
   return 0
 }
 
+# hello_ok <file> <expected text without a trailing newline>: byte-exact check of the file the CLI wrote. The file must be a regular
+# file (not a symlink) whose content is exactly the expected text, with or without ONE trailing newline: no extra lines, no
+# trailing spaces or carriage returns, no NUL bytes (the byte count must equal the length of what the shell read).
+hello_ok() {
+  (
+    LC_ALL=C
+    f="$1"
+    want="$2"
+    [ -f "$f" ] && [ ! -L "$f" ] || exit 1
+    size="$(wc -c < "$f" | tr -d ' ')"
+    got="$(cat -- "$f"; printf x)"
+    got="${got%x}"
+    [ "${#got}" = "$size" ] || exit 1
+    [ "$got" = "$want" ] || [ "$got" = "$want"$'\n' ] || exit 1
+    exit 0
+  )
+}
+
 command -v jq >/dev/null 2>&1 || { spike_err "jq is required"; exit 1; }
 command -v git >/dev/null 2>&1 || { spike_err "git is required"; exit 1; }
 
@@ -122,7 +140,7 @@ PARSE_RC=$?
 if completion_verdict "$rc" "$PARSE_RC" "$CAP/summary.json"; then verdict="PASS"; else verdict="FAIL ($VERDICT_REASON)"; fi
 
 hello="no"
-if [ -f "$WT/hello.txt" ] && [ ! -L "$WT/hello.txt" ] && grep -qx 'hello from claude' "$WT/hello.txt"; then hello="yes"; fi
+if hello_ok "$WT/hello.txt" 'hello from claude'; then hello="yes"; fi
 
 case "$rc" in
   0) status="exited 0" ;;

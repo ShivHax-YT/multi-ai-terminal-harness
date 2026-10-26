@@ -73,6 +73,42 @@ reserve_resume() {
   mkdir "$CAP/resume.lock" 2>/dev/null
 }
 
+# hello_ok <file> <expected text without a trailing newline>: byte-exact check of the file the CLI wrote. The file must be a regular
+# file (not a symlink) whose content is exactly the expected text, with or without ONE trailing newline: no extra lines, no
+# trailing spaces or carriage returns, no NUL bytes (the byte count must equal the length of what the shell read).
+hello_ok() {
+  (
+    LC_ALL=C
+    f="$1"
+    want="$2"
+    [ -f "$f" ] && [ ! -L "$f" ] || exit 1
+    size="$(wc -c < "$f" | tr -d ' ')"
+    got="$(cat -- "$f"; printf x)"
+    got="${got%x}"
+    [ "${#got}" = "$size" ] || exit 1
+    [ "$got" = "$want" ] || [ "$got" = "$want"$'\n' ] || exit 1
+    exit 0
+  )
+}
+
+# link_count <file>: the number of hard links to the file (BSD/macOS stat -f %l, GNU stat -c %h); empty when it cannot be read.
+link_count() {
+  case "$(uname -s)" in
+    Darwin|*BSD) stat -f %l "$1" 2>/dev/null ;;
+    *) stat -c %h "$1" 2>/dev/null ;;
+  esac
+}
+
+# safe_input_file <file>: 0 only for a regular file that is not a symlink, has exactly one hard link, and is not (or inside, or a
+# hard link into) a CLI home according to the T-001 check spike_under_cli_home (rule 4). Run it BEFORE reading any file that
+# comes from a capture directory; a hard-linked credential file would pass a plain regular-file test. Prints nothing.
+safe_input_file() {
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  [ "$(link_count "$1")" = "1" ] || return 1
+  if spike_under_cli_home "$1"; then return 1; fi
+  return 0
+}
+
 command -v jq >/dev/null 2>&1 || { spike_err "jq is required"; exit 1; }
 
 # ---- the capture directory is an argument: check it before trusting anything in it ----------------------------------------
@@ -89,8 +125,14 @@ if spike_under_cli_home "$CAP"; then
   spike_err "refusing a capture directory inside a CLI home (rule 4)"
   exit 2
 fi
+# Every file read from the capture directory must pass safe_input_file first (regular, no symlink, one link, outside the CLI
+# homes: rule 4). Nothing from a refused file is read or printed.
 for f in raw.jsonl worktree.path; do
-  [ -f "$CAP/$f" ] && [ ! -L "$CAP/$f" ] || { spike_err "capture is missing $f: $CAP"; exit 2; }
+  safe_input_file "$CAP/$f" || { spike_err "capture file $f is missing or refused (not a plain single-link file outside the CLI homes): $CAP"; exit 2; }
+done
+# resume.sh writes these names into the capture; a pre-existing entry (a hard link or symlink would be written through) is refused.
+for f in resume-combined.txt resume-raw.jsonl resume-stderr.txt resume-summary.json resume-result.json; do
+  if [ -e "$CAP/$f" ] || [ -L "$CAP/$f" ]; then spike_err "capture already holds $f: refusing (one resume per capture)"; exit 2; fi
 done
 
 # session id: a bounded token, never used as anything but one argument
@@ -150,7 +192,7 @@ if [ -n "$NEW_SID" ]; then
   if [ "$NEW_SID" = "$SID" ]; then reused="yes"; else reused="no"; fi
 fi
 both="no"
-if [ -f "$WT/hello.txt" ] && [ ! -L "$WT/hello.txt" ] && grep -qx 'hello from claude' "$WT/hello.txt" && grep -qxE 'resumed[.]?' "$WT/hello.txt"; then
+if safe_input_file "$WT/hello.txt" && hello_ok "$WT/hello.txt" $'hello from claude\nresumed'; then
   both="yes"
 fi
 

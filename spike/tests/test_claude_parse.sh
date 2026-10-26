@@ -373,6 +373,103 @@ check "resume.sh: reserve_resume uses mkdir on resume.lock" grep -qF 'mkdir "$CA
 check "resume.sh: the lock is never removed" test -z "$(grep -v '^[[:space:]]*#' "$RESUME" | grep -E 'rmdir|rm -|resume\.lock.*(rm|rmdir)')"
 check "resume.sh: reserve_resume is called once" test "$(grep -v '^[[:space:]]*#' "$RESUME" | grep -c '^reserve_resume ||')" -eq 1
 
+# ---- hello_ok: byte-exact check of hello.txt (extracted from each script) -----------------------------------------------------------
+HW="$TMP/hello"
+mkdir -p "$HW"
+hcase() { # hcase <script-name> <fn-text> <label> <expected-rc> <expected text> <printf format of the file bytes>
+  local n="$1" fn="$2" label="$3" erc="$4" want="$5" bytes="$6" got
+  # shellcheck disable=SC2059
+  printf "$bytes" > "$HW/f"
+  FNTEXT="$fn" WANT="$want" /bin/bash -c 'eval "$FNTEXT"; hello_ok "$1" "$WANT"' _ "$HW/f" >/dev/null 2>&1
+  got=$?
+  if [ "$got" = "$erc" ]; then ok; else bad "$n hello_ok: $label (rc $got, wanted $erc)"; fi
+}
+RUNFN="$(extract_fn "$RUN" hello_ok)"
+RESFN="$(extract_fn "$RESUME" hello_ok)"
+if [ -n "$RUNFN" ] && [ -n "$RESFN" ]; then ok; else bad "hello_ok is defined in run.sh and resume.sh"; fi
+W1='hello from claude'
+W2="$(printf 'hello from claude\nresumed')"
+# run.sh: exactly one line, with or without one trailing newline
+hcase run.sh "$RUNFN" "exact, no newline" 0 "$W1" 'hello from claude'
+hcase run.sh "$RUNFN" "exact, one newline" 0 "$W1" 'hello from claude\n'
+hcase run.sh "$RUNFN" "two trailing newlines" 1 "$W1" 'hello from claude\n\n'
+hcase run.sh "$RUNFN" "trailing space" 1 "$W1" 'hello from claude \n'
+hcase run.sh "$RUNFN" "carriage return" 1 "$W1" 'hello from claude\r\n'
+hcase run.sh "$RUNFN" "NUL after the text" 1 "$W1" 'hello from claude\0'
+hcase run.sh "$RUNFN" "NUL before the newline" 1 "$W1" 'hello from claude\0\n'
+hcase run.sh "$RUNFN" "wrong case" 1 "$W1" 'Hello from claude\n'
+hcase run.sh "$RUNFN" "a longer line" 1 "$W1" 'hello from claude!\n'
+hcase run.sh "$RUNFN" "leading newline" 1 "$W1" '\nhello from claude\n'
+hcase run.sh "$RUNFN" "extra second line" 1 "$W1" 'hello from claude\nresumed\n'
+hcase run.sh "$RUNFN" "the line twice" 1 "$W1" 'hello from claude\nhello from claude\n'
+hcase run.sh "$RUNFN" "empty file" 1 "$W1" ''
+hcase run.sh "$RUNFN" "only a newline" 1 "$W1" '\n'
+# resume.sh: exactly "hello from claude" then "resumed", the second with or without a trailing newline
+hcase resume.sh "$RESFN" "exact, no final newline" 0 "$W2" 'hello from claude\nresumed'
+hcase resume.sh "$RESFN" "exact, final newline" 0 "$W2" 'hello from claude\nresumed\n'
+hcase resume.sh "$RESFN" "resumed with a period" 1 "$W2" 'hello from claude\nresumed.\n'
+hcase resume.sh "$RESFN" "reversed order" 1 "$W2" 'resumed\nhello from claude\n'
+hcase resume.sh "$RESFN" "extra third line" 1 "$W2" 'hello from claude\nresumed\nmore\n'
+hcase resume.sh "$RESFN" "blank line between" 1 "$W2" 'hello from claude\n\nresumed\n'
+hcase resume.sh "$RESFN" "two final newlines" 1 "$W2" 'hello from claude\nresumed\n\n'
+hcase resume.sh "$RESFN" "first line only" 1 "$W2" 'hello from claude\n'
+hcase resume.sh "$RESFN" "second line only" 1 "$W2" 'resumed\n'
+hcase resume.sh "$RESFN" "first line without its newline" 1 "$W2" 'hello from clauderesumed'
+hcase resume.sh "$RESFN" "carriage returns" 1 "$W2" 'hello from claude\r\nresumed\r\n'
+hcase resume.sh "$RESFN" "NUL inside" 1 "$W2" 'hello from claude\n\0resumed'
+hcase resume.sh "$RESFN" "trailing space" 1 "$W2" 'hello from claude\nresumed \n'
+hcase resume.sh "$RESFN" "empty file" 1 "$W2" ''
+# not a regular file: missing, directory, symlink to a good file
+for fn in "$RUNFN" "$RESFN"; do
+  mkdir -p "$HW/d"
+  printf 'hello from claude\n' > "$HW/good"
+  ln -sf "$HW/good" "$HW/link"
+  for target in "$HW/missing" "$HW/d" "$HW/link"; do
+    FNTEXT="$fn" /bin/bash -c 'eval "$FNTEXT"; hello_ok "$1" "hello from claude"' _ "$target" >/dev/null 2>&1
+    if [ $? -ne 0 ]; then ok; else bad "hello_ok accepts a non-regular file: ${target##*/}"; fi
+  done
+done
+check "run.sh calls hello_ok on the worktree file" grep -qF 'hello_ok "$WT/hello.txt" '"'"'hello from claude'"'" "$RUN"
+check "resume.sh calls hello_ok with exactly the two lines" grep -qF 'hello_ok "$WT/hello.txt" $'"'"'hello from claude\nresumed'"'" "$RESUME"
+check "neither script still matches hello.txt by grep" test -z "$(grep -v '^[[:space:]]*#' "$RUN" "$RESUME" | grep 'grep.*hello\|grep.*resumed')"
+
+# ---- resume.sh: capture input files are refused when linked, symlinked or in a CLI home (rule 4) -----------------------------------------
+LFN="$(extract_fn "$RESUME" link_count)"
+SFN="$(extract_fn "$RESUME" safe_input_file)"
+if [ -n "$LFN" ] && [ -n "$SFN" ]; then ok; else bad "resume.sh defines link_count and safe_input_file"; fi
+CAPD="$TMP/capin"
+mkdir -p "$CAPD"
+CANARY_TEXT="CANARY-CREDENTIAL-TEXT-$$"
+printf '%s\n' "$CANARY_TEXT" > "$TMP/canary"
+ln "$TMP/canary" "$CAPD/raw.jsonl"           # a hard link to the canary, as a stolen credential file would be
+ln -s "$TMP/canary" "$CAPD/worktree.path"    # a symlink to it
+printf '{"type":"result"}\n' > "$CAPD/ok.jsonl"
+safe() { # safe <file> -> exit status of safe_input_file, output saved in $TMP/safe.out / safe.err
+  FNL="$LFN" FNS="$SFN" COMMON="$SPIKE/lib/common.sh" /bin/bash -c '. "$COMMON"; eval "$FNL"; eval "$FNS"; safe_input_file "$1"' _ "$1" >"$TMP/safe.out" 2>"$TMP/safe.err" </dev/null
+}
+if safe "$CAPD/ok.jsonl"; then ok; else bad "safe_input_file accepts a plain single-link file"; fi
+if safe "$CAPD/raw.jsonl"; then bad "safe_input_file accepts a hard link to another file"; else ok; fi
+check "link_count of the hard-linked canary is 2" test "$(FNL="$LFN" /bin/bash -c 'eval "$FNL"; link_count "$1"' _ "$CAPD/raw.jsonl")" = "2"
+check "link_count of a plain file is 1" test "$(FNL="$LFN" /bin/bash -c 'eval "$FNL"; link_count "$1"' _ "$CAPD/ok.jsonl")" = "1"
+check "the canary text did not reach stdout" test -z "$(grep -F "$CANARY_TEXT" "$TMP/safe.out")"
+check "the canary text did not reach stderr" test -z "$(grep -F "$CANARY_TEXT" "$TMP/safe.err")"
+if safe "$CAPD/worktree.path"; then bad "safe_input_file accepts a symlink"; else ok; fi
+if safe "$CAPD/does-not-exist"; then bad "safe_input_file accepts a missing file"; else ok; fi
+if safe "$CAPD"; then bad "safe_input_file accepts a directory"; else ok; fi
+check "no output file in the capture directory holds the canary text" test -z "$(grep -rlF "$CANARY_TEXT" "$CAPD" 2>/dev/null | grep -v '/raw.jsonl$' | grep -v '/worktree.path$')"
+# a file in a (fake) CLI home is refused too, through spike_under_cli_home
+check "safe_input_file uses spike_under_cli_home" grep -q 'spike_under_cli_home "\$1"' "$RESUME"
+# source order in resume.sh: the check comes before the first read of each capture input
+san_line="$(grep -n '^  safe_input_file "\$CAP/\$f"' "$RESUME" | head -1 | cut -d: -f1)"
+read1_line="$(grep -n 'parse.jq" "\$CAP/raw.jsonl"' "$RESUME" | head -1 | cut -d: -f1)"
+read2_line="$(grep -n 'head -n 1 "\$CAP/worktree.path"' "$RESUME" | head -1 | cut -d: -f1)"
+if [ -n "$san_line" ] && [ -n "$read1_line" ] && [ -n "$read2_line" ] && [ "$san_line" -lt "$read1_line" ] && [ "$san_line" -lt "$read2_line" ]; then ok; else bad "safe_input_file runs before raw.jsonl and worktree.path are read ($san_line/$read1_line/$read2_line)"; fi
+check "the loop covers raw.jsonl and worktree.path" grep -qF 'for f in raw.jsonl worktree.path; do' "$RESUME"
+check "resume.sh refuses pre-existing resume output names" grep -qF 'for f in resume-combined.txt resume-raw.jsonl resume-stderr.txt resume-summary.json resume-result.json; do' "$RESUME"
+# every read of a capture file in resume.sh is of a name the loop checked, or of a file this script wrote itself
+reads="$(grep -v '^[[:space:]]*#' "$RESUME" | grep -o '< *"\$CAP/[A-Za-z.-]*"\|cat *"\$CAP/[A-Za-z.-]*"\|head [^|]*"\$CAP/[A-Za-z.-]*"' | grep -o '"\$CAP/[A-Za-z.-]*"' | sort -u | tr '\n' ' ')"
+check "resume.sh reads only the two checked capture files by redirect/cat/head ($reads)" test -z "$(printf '%s\n' "$reads" | tr ' ' '\n' | grep -v '^$' | grep -v 'raw.jsonl\|worktree.path')"
+
 # ---- fixtures: nothing personal ----------------------------------------------------------------------------------------------------
 check "fixtures contain no at-sign" test -z "$(grep -rl '@' "$FIX" 2>/dev/null)"
 check "fixtures contain no /Users/ path" test -z "$(grep -rl '/Users/' "$FIX" 2>/dev/null)"
