@@ -14,9 +14,9 @@ CARGO_MANIFEST := --manifest-path src-tauri/Cargo.toml
 
 .PHONY: check-fast check compliance compliance-selftest crate-boundary spike-test rust-fast rust-full ui-fast ui-full
 
-check-fast: compliance crate-boundary spike-test rust-fast ui-fast
+check-fast: compliance crate-boundary rust-fast ui-fast
 
-check: check-fast compliance-selftest rust-full ui-full
+check: check-fast compliance-selftest spike-test rust-full ui-full
 
 compliance:
 	@scripts/ci/compliance-scan.sh
@@ -28,13 +28,21 @@ compliance-selftest:
 crate-boundary:
 	@scripts/ci/check-crate-boundary.sh
 
-# Phase 0 spike suites (offline; none sets SPIKE_LIVE). Each runs under /bin/bash; skipped when there are none.
+# Phase 0 spike suites (offline; none sets SPIKE_LIVE). Part of `make check`, not check-fast. Each suite runs under
+# /bin/bash with its full output visible; every suite runs, one status line each, non-zero exit if any failed.
 spike-test:
-	@set -eo pipefail; \
+	@set -o pipefail; \
 	shopt -s nullglob; \
 	tests=(spike/tests/*.sh); \
 	if [ "$${#tests[@]}" -eq 0 ]; then echo "spike-test: no spike tests"; exit 0; fi; \
-	for t in "$${tests[@]}"; do echo "== $$t"; /bin/bash "$$t" 2>/dev/null | tail -1; done
+	failed=0; \
+	for t in "$${tests[@]}"; do \
+	  echo "== $$t"; \
+	  /bin/bash "$$t"; rc=$$?; \
+	  echo "== $$t exit $$rc"; \
+	  if [ "$$rc" -ne 0 ]; then failed=$$((failed + 1)); fi; \
+	done; \
+	if [ "$$failed" -ne 0 ]; then echo "spike-test: $$failed suite(s) failed" >&2; exit 1; fi
 
 rust-fast:
 	@set -e; \
