@@ -38,6 +38,36 @@ WATCHDOG_SECS=120
 cleanup() { spike_verify_cleanup; }
 trap cleanup EXIT
 
+# completion_verdict <cli-exit-status> <parse-exit-status> <summary.json>
+# Parsed completion decides success (rules 1 and 10: report, never retry). Returns 0 only when ALL of these hold: the CLI exited 0
+# (124 gets its own reason), parse.jq exited 0, the summary is a JSON object with a result event whose is_error is exactly false,
+# and the session id is usable (letters, digits and dashes, 8 to 64 long). Sets VERDICT_REASON to a FIXED string on failure (stream
+# text is untrusted and is never echoed) and VERDICT_SID to the session id when it is usable. Whether hello.txt looks right is
+# reported separately and can never turn a failing verdict into a pass.
+completion_verdict() {
+  local cli_rc="$1" parse_rc="$2" file="$3" sid
+  VERDICT_REASON=""
+  VERDICT_SID=""
+  sid="$(jq -r '(.session_id | select(type == "string")) // empty' "$file" 2>/dev/null)"
+  case "$sid" in
+    ""|*[!A-Za-z0-9-]*) sid="" ;;
+  esac
+  if [ -n "$sid" ] && [ "${#sid}" -ge 8 ] && [ "${#sid}" -le 64 ]; then VERDICT_SID="$sid"; fi
+  case "$cli_rc" in
+    0) ;;
+    124) VERDICT_REASON="the CLI was stopped by the watchdog timeout"; return 1 ;;
+    *) VERDICT_REASON="the CLI did not exit 0"; return 1 ;;
+  esac
+  [ "$parse_rc" = "0" ] || { VERDICT_REASON="parse.jq failed on the output"; return 1; }
+  jq -e 'type == "object"' "$file" >/dev/null 2>&1 || { VERDICT_REASON="the summary is missing or unreadable"; return 1; }
+  jq -e '(.event_counts // {}) | keys | any(. == "result" or startswith("result/"))' "$file" >/dev/null 2>&1 \
+    || { VERDICT_REASON="the output has no result event"; return 1; }
+  jq -e '.final.is_error == false' "$file" >/dev/null 2>&1 \
+    || { VERDICT_REASON="the result event does not report is_error false"; return 1; }
+  [ -n "$VERDICT_SID" ] || { VERDICT_REASON="no usable session id in the output"; return 1; }
+  return 0
+}
+
 command -v jq >/dev/null 2>&1 || { spike_err "jq is required"; exit 1; }
 command -v git >/dev/null 2>&1 || { spike_err "git is required"; exit 1; }
 
@@ -86,7 +116,10 @@ cd "$HERE" || exit 1
 # Both files are always created by the redirects (a missing combined.txt, e.g. a refused run, gives two empty files).
 jq -R -r --arg part raw -f "$HERE/split.jq" "$CAP/combined.txt" > "$CAP/raw.jsonl" 2>/dev/null
 jq -R -r --arg part other -f "$HERE/split.jq" "$CAP/combined.txt" > "$CAP/stderr.txt" 2>/dev/null
-jq -Rs -f "$HERE/parse.jq" "$CAP/raw.jsonl" > "$CAP/summary.json" 2>/dev/null || printf '{}\n' > "$CAP/summary.json"
+jq -Rs -f "$HERE/parse.jq" "$CAP/raw.jsonl" > "$CAP/summary.json" 2>/dev/null
+PARSE_RC=$?
+[ "$PARSE_RC" -eq 0 ] || printf '{}\n' > "$CAP/summary.json"
+if completion_verdict "$rc" "$PARSE_RC" "$CAP/summary.json"; then verdict="PASS"; else verdict="FAIL ($VERDICT_REASON)"; fi
 
 hello="no"
 if [ -f "$WT/hello.txt" ] && [ ! -L "$WT/hello.txt" ] && grep -qx 'hello from claude' "$WT/hello.txt"; then hello="yes"; fi
@@ -102,6 +135,7 @@ esac
 
 printf '== claude headless run ==\n'
 printf 'status        : %s\n' "$status"
+printf 'verdict       : %s\n' "$verdict"
 printf 'capture       : %s\n' "$CAP"
 printf 'worktree      : %s\n' "$WT"
 printf 'hello.txt ok  : %s\n' "$hello"
@@ -113,7 +147,6 @@ printf 'Resume once:  SPIKE_LIVE=1 spike/claude/resume.sh %s\n' "$CAP"
 printf 'Clean up:     (source spike/lib/common.sh; spike_cleanup %s)\n' "$RUN_DIR"
 printf 'No retry was made. If the status above is an error, report it; do not re-run in a loop (rule 10).\n'
 
-if [ "$rc" -ne 0 ]; then exit 1; fi
-sid="$(jq -r '.session_id // empty' "$CAP/summary.json" 2>/dev/null)"
-[ -n "$sid" ] || { spike_err "no session id found in the output"; exit 1; }
+# The verdict alone decides the exit status; hello.txt above is information and never rescues a failing verdict.
+[ "$verdict" = "PASS" ] || exit 1
 exit 0
