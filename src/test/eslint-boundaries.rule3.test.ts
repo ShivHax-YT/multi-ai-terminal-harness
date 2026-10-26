@@ -13,7 +13,9 @@ beforeAll(() => {
   eslint = new ESLint({
     cwd: root,
     // Snippet files do not exist on disk, so type-aware parsing is off and only the guard rules run.
-    overrideConfig: { languageOptions: { parserOptions: { projectService: false, project: null } } },
+    overrideConfig: {
+      languageOptions: { parserOptions: { projectService: false, project: null } },
+    },
     ruleFilter: ({ ruleId }) =>
       [
         "import-x/no-restricted-paths",
@@ -36,7 +38,8 @@ async function errors(file: string, code: string): Promise<string[]> {
   return result.messages.map((m) => m.ruleId ?? "unknown");
 }
 
-const imp = (what: string, from: string) => `import { ${what} } from "${from}";\nexport const x = ${what};\n`;
+const imp = (what: string, from: string) =>
+  `import { ${what} } from "${from}";\nexport const x = ${what};\n`;
 
 describe("rule 3: PTY input port and xterm only in the terminal view", () => {
   const port = "usePtyInput";
@@ -63,7 +66,9 @@ describe("rule 3: PTY input port and xterm only in the terminal view", () => {
   it("xterm is blocked outside the terminal view", async () => {
     const code = imp("Terminal", "@xterm/xterm");
     expect(await errors("src/features/lead/x.tsx", code)).toContain("no-restricted-imports");
-    expect(await errors("src/features/sessions/list/x.tsx", code)).toContain("no-restricted-imports");
+    expect(await errors("src/features/sessions/list/x.tsx", code)).toContain(
+      "no-restricted-imports",
+    );
     expect(await errors("src/app/x.tsx", code)).toContain("no-restricted-imports");
     expect(await errors("src/features/sessions/terminal/view.tsx", code)).toEqual([]);
   });
@@ -82,7 +87,9 @@ describe("rule 9: approval port only in the plan screen", () => {
   });
   it("the plan screen may", async () => {
     expect(await errors("src/features/plan/approve.tsx", code("@/lib/ipc/approval"))).toEqual([]);
-    expect(await errors("src/features/plan/approve.tsx", code("../../lib/ipc/approval"))).toEqual([]);
+    expect(await errors("src/features/plan/approve.tsx", code("../../lib/ipc/approval"))).toEqual(
+      [],
+    );
   });
   it("the IPC bundle (which carries both ports) stays inside src/lib/ipc", async () => {
     const c = imp("useIpcBundle", "@/lib/ipc/context");
@@ -121,10 +128,17 @@ describe("one IPC door, mock never ships, motion through wrappers, independent f
       "no-restricted-imports",
     );
     expect(
-      await errors("src/features/lead/x.tsx", imp("AnimatedGroup", "@/components/motion-primitives/animated-group")),
+      await errors(
+        "src/features/lead/x.tsx",
+        imp("AnimatedGroup", "@/components/motion-primitives/animated-group"),
+      ),
     ).toContain("import-x/no-restricted-paths");
-    expect(await errors("src/components/motion/extra.tsx", imp("motion", "motion/react"))).toEqual([]);
-    expect(await errors("src/features/lead/x.tsx", imp("Stagger", "@/components/motion"))).toEqual([]);
+    expect(await errors("src/components/motion/extra.tsx", imp("motion", "motion/react"))).toEqual(
+      [],
+    );
+    expect(await errors("src/features/lead/x.tsx", imp("Stagger", "@/components/motion"))).toEqual(
+      [],
+    );
   });
 
   it("features never import each other; routes.tsx imports feature indexes only", async () => {
@@ -150,7 +164,8 @@ describe("one IPC door, mock never ships, motion through wrappers, independent f
 describe("security: untrusted text never becomes HTML", () => {
   const files = ["src/features/review/diff.tsx", "src/components/ui/extra.tsx", "src/lib/x.tsx"];
   it.each(files)("dangerouslySetInnerHTML is an error in %s", async (file) => {
-    const code = 'export const X = ({ t }: { t: string }) => <div dangerouslySetInnerHTML={{ __html: t }} />;\n';
+    const code =
+      "export const X = ({ t }: { t: string }) => <div dangerouslySetInnerHTML={{ __html: t }} />;\n";
     expect(await errors(file, code)).toContain("react/no-danger");
   });
   it.each([

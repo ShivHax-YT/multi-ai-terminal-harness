@@ -263,7 +263,11 @@ export class MockBackend {
   }
 
   /** Every command goes through here: record, apply injected failures, run, return a copy. */
-  private async run<T>(command: CommandName, args: unknown, impl: () => T | Promise<T>): Promise<T> {
+  private async run<T>(
+    command: CommandName,
+    args: unknown,
+    impl: () => T | Promise<T>,
+  ): Promise<T> {
     this.calls.push({ command, args: clone(args ?? null) });
     await this.ready;
     const queued = this.failures.get(command);
@@ -280,7 +284,8 @@ export class MockBackend {
 
   private apiKeyOnlyProviders(): Set<ProviderId> {
     const out = new Set<ProviderId>();
-    for (const s of this.providers.values()) if (!s.auth_modes.includes("subscription")) out.add(s.provider);
+    for (const s of this.providers.values())
+      if (!s.auth_modes.includes("subscription")) out.add(s.provider);
     return out;
   }
 
@@ -312,9 +317,21 @@ export class MockBackend {
         state: "failed",
         checked_at: this.nowIso(),
         checks: [
-          { kind: "codesign", result: "fail", detail: "codesign: code object is not signed at all." },
-          { kind: "checksum", result: "not_applicable", detail: "The vendor publishes no checksum for this install method." },
-          { kind: "install_source", result: "fail", detail: "Install path does not match the vendor installer." },
+          {
+            kind: "codesign",
+            result: "fail",
+            detail: "codesign: code object is not signed at all.",
+          },
+          {
+            kind: "checksum",
+            result: "not_applicable",
+            detail: "The vendor publishes no checksum for this install method.",
+          },
+          {
+            kind: "install_source",
+            result: "fail",
+            detail: "Install path does not match the vendor installer.",
+          },
         ],
       };
     }
@@ -326,7 +343,11 @@ export class MockBackend {
         signature: "valid",
         adapters: this.killswitch.adapters.map((a) =>
           a.provider === id
-            ? { provider: id, state: "disabled", reason: "Disabled by the signed config while terms are re-checked." }
+            ? {
+                provider: id,
+                state: "disabled",
+                reason: "Disabled by the signed config while terms are re-checked.",
+              }
             : a,
         ),
       };
@@ -353,7 +374,12 @@ export class MockBackend {
         text: plan.request_summary,
         created_at: this.nowIso(-5 * 60 * 1000),
         state: "plan_ready",
-        messages: [{ at: this.nowIso(-5 * 60 * 1000), text: `Plan ready: ${String(plan.tasks.length)} tasks.` }],
+        messages: [
+          {
+            at: this.nowIso(-5 * 60 * 1000),
+            text: `Plan ready: ${String(plan.tasks.length)} tasks.`,
+          },
+        ],
         plan_id: plan.plan_id,
       });
       if (s !== "plan_draft") {
@@ -408,9 +434,20 @@ export class MockBackend {
       takeover: false,
     };
     this.sessions.set(session.session_id, session);
-    this.terminals.set(session.session_id, { cols: 120, rows: 32, bytes: new Uint8Array(), seq: 0 });
-    this.appendTerminal(session.session_id, "\u001b[2m[harness] read-only mirror of the headless worker\u001b[0m\r\n", false);
-    const usage = this.usage.providers.find((u) => u.provider === task.provider && u.auth_mode === "subscription");
+    this.terminals.set(session.session_id, {
+      cols: 120,
+      rows: 32,
+      bytes: new Uint8Array(),
+      seq: 0,
+    });
+    this.appendTerminal(
+      session.session_id,
+      "\u001b[2m[harness] read-only mirror of the headless worker\u001b[0m\r\n",
+      false,
+    );
+    const usage = this.usage.providers.find(
+      (u) => u.provider === task.provider && u.auth_mode === "subscription",
+    );
     if (usage !== undefined) {
       usage.sessions.current = 1;
       usage.prompts_last_hour.current = 4;
@@ -429,7 +466,10 @@ export class MockBackend {
           const live = this.sessions.get(session.session_id);
           if (live === undefined || !isLive(live) || live.paused !== null) return;
           step += 1;
-          this.appendTerminal(session.session_id, `step ${String(step)}: editing src/features/settings/form.tsx\r\n`);
+          this.appendTerminal(
+            session.session_id,
+            `step ${String(step)}: editing src/features/settings/form.tsx\r\n`,
+          );
         },
         TERMINAL_TICK_MS,
       );
@@ -452,7 +492,12 @@ export class MockBackend {
       const delay = this.settings.limits.backoff_base_s * 1000 * 2 ** (consecutive - 1);
       const retryAt = this.nowIso(delay);
       pacing.backoff = { retry_at: retryAt, attempt: consecutive };
-      session.state = { kind: "rate_limited", retry_at: retryAt, attempt: consecutive, consecutive_limit_errors: consecutive };
+      session.state = {
+        kind: "rate_limited",
+        retry_at: retryAt,
+        attempt: consecutive,
+        consecutive_limit_errors: consecutive,
+      };
       this.schedule(delay, () => {
         const live = this.sessions.get(session.session_id);
         if (live === undefined || live.state.kind !== "rate_limited") return;
@@ -473,14 +518,16 @@ export class MockBackend {
   }
 
   private computeUsable(s: ProviderStatus): ProviderStatus["usable"] {
-    if (!s.adapter_available) return { lead: false, worker: false, blockers: ["adapter_unavailable"] };
+    if (!s.adapter_available)
+      return { lead: false, worker: false, blockers: ["adapter_unavailable"] };
     const blockers: Blocker[] = [];
     if (s.install.state === "not_installed") blockers.push("not_installed");
     if (s.binary.state === "failed") blockers.push("binary_failed");
     else if (s.binary.state === "unchecked") blockers.push("binary_unchecked");
     if (s.killswitch === "disabled") blockers.push("killswitch_disabled");
     if (this.pacing.get(s.provider)?.paused === true) blockers.push("provider_paused");
-    const subscriptionAllowed = s.auth_modes.includes("subscription") && s.killswitch !== "api_key_only";
+    const subscriptionAllowed =
+      s.auth_modes.includes("subscription") && s.killswitch !== "api_key_only";
     const subscriptionBlockers: Blocker[] = [];
     if (s.sign_in.state === "signed_out") subscriptionBlockers.push("signed_out");
     else if (s.sign_in.state === "unknown") subscriptionBlockers.push("sign_in_unknown");
@@ -501,10 +548,22 @@ export class MockBackend {
     return {
       provider,
       auth_mode: authMode,
-      sessions: { current: 0, limit: l.concurrent_sessions, ceiling: r.concurrent_sessions.ceiling },
-      prompts_last_hour: { current: 0, limit: l.prompts_per_hour, ceiling: r.prompts_per_hour.ceiling },
+      sessions: {
+        current: 0,
+        limit: l.concurrent_sessions,
+        ceiling: r.concurrent_sessions.ceiling,
+      },
+      prompts_last_hour: {
+        current: 0,
+        limit: l.prompts_per_hour,
+        ceiling: r.prompts_per_hour.ceiling,
+      },
       max_task_turns: { current: 0, limit: l.turns_per_task, ceiling: r.turns_per_task.ceiling },
-      run_minutes_today: { current: 0, limit: l.run_minutes_per_day, ceiling: r.run_minutes_per_day.ceiling },
+      run_minutes_today: {
+        current: 0,
+        limit: l.run_minutes_per_day,
+        ceiling: r.run_minutes_per_day.ceiling,
+      },
       pacing: { consecutive_limit_errors: 0, paused: false },
       tokens_today: { input: 0, output: 0, is_estimate: true },
       spend: null,
@@ -520,7 +579,10 @@ export class MockBackend {
       u.run_minutes_today.limit = l.run_minutes_per_day;
       const pacing = this.pacing.get(u.provider);
       if (pacing !== undefined) {
-        u.pacing = { consecutive_limit_errors: pacing.consecutive_limit_errors, paused: pacing.paused };
+        u.pacing = {
+          consecutive_limit_errors: pacing.consecutive_limit_errors,
+          paused: pacing.paused,
+        };
         if (pacing.paused_until !== undefined) u.pacing.paused_until = pacing.paused_until;
         if (pacing.backoff !== undefined) u.pacing.backoff = { ...pacing.backoff };
       }
@@ -563,16 +625,29 @@ export class MockBackend {
     const merged = new Uint8Array(term.bytes.length + chunk.length);
     merged.set(term.bytes);
     merged.set(chunk, term.bytes.length);
-    term.bytes = merged.length > SCROLLBACK_CAP_BYTES ? merged.slice(merged.length - SCROLLBACK_CAP_BYTES) : merged;
+    term.bytes =
+      merged.length > SCROLLBACK_CAP_BYTES
+        ? merged.slice(merged.length - SCROLLBACK_CAP_BYTES)
+        : merged;
     term.seq += 1;
-    if (emit) this.emit("terminal_output", { session_id: sessionId, seq: term.seq, data_b64: bytesToBase64(chunk) });
+    if (emit)
+      this.emit("terminal_output", {
+        session_id: sessionId,
+        seq: term.seq,
+        data_b64: bytesToBase64(chunk),
+      });
   }
 
   private validateCaps(caps: unknown): SpendCaps {
     const max = this.limits.spend_cap_max;
     if (!isObject(caps)) return ruleBlocked(11, "Daily and weekly spend caps are required.");
     const { daily_usd: daily, weekly_usd: weekly } = caps;
-    if (typeof daily !== "number" || typeof weekly !== "number" || !Number.isFinite(daily) || !Number.isFinite(weekly)) {
+    if (
+      typeof daily !== "number" ||
+      typeof weekly !== "number" ||
+      !Number.isFinite(daily) ||
+      !Number.isFinite(weekly)
+    ) {
       return ruleBlocked(11, "Spend caps must be numbers; there is no unlimited value.");
     }
     if (daily <= 0 || weekly <= 0) return ruleBlocked(11, "Spend caps must be greater than zero.");
@@ -597,7 +672,9 @@ export class MockBackend {
       })),
 
     list_providers: () =>
-      this.run("list_providers", undefined, () => [...this.providers.keys()].map((id) => this.providerStatus(id))),
+      this.run("list_providers", undefined, () =>
+        [...this.providers.keys()].map((id) => this.providerStatus(id)),
+      ),
 
     refresh_provider_status: (args) =>
       this.run("refresh_provider_status", args, () => {
@@ -616,9 +693,12 @@ export class MockBackend {
         if (!status.auth_modes.includes("subscription")) {
           return ruleBlocked(7, "This provider runs on an API key only; there is no sign-in.");
         }
-        if (status.killswitch === "disabled") return ruleBlocked(12, "This adapter is disabled by the signed config.");
-        if (status.killswitch === "api_key_only") return ruleBlocked(12, "The signed config allows an API key only.");
-        if (status.binary.state === "failed") return ruleBlocked(6, "The CLI failed verification; sign-in is refused.");
+        if (status.killswitch === "disabled")
+          return ruleBlocked(12, "This adapter is disabled by the signed config.");
+        if (status.killswitch === "api_key_only")
+          return ruleBlocked(12, "The signed config allows an API key only.");
+        if (status.binary.state === "failed")
+          return ruleBlocked(6, "The CLI failed verification; sign-in is refused.");
         if (status.install.state === "not_installed") return invalid("Install the CLI first.");
         this.idSeq += 1;
         const session: SessionView = {
@@ -632,8 +712,16 @@ export class MockBackend {
           takeover: true,
         };
         this.sessions.set(session.session_id, session);
-        this.terminals.set(session.session_id, { cols: 100, rows: 30, bytes: new Uint8Array(), seq: 0 });
-        this.appendTerminal(session.session_id, "Follow the sign-in steps of the CLI in this terminal.\r\n$ ");
+        this.terminals.set(session.session_id, {
+          cols: 100,
+          rows: 30,
+          bytes: new Uint8Array(),
+          seq: 0,
+        });
+        this.appendTerminal(
+          session.session_id,
+          "Follow the sign-in steps of the CLI in this terminal.\r\n$ ",
+        );
         this.emit("session_changed", session);
         return { session_id: session.session_id };
       }),
@@ -641,7 +729,8 @@ export class MockBackend {
     confirm_personal_use: (args) =>
       this.run("confirm_personal_use", args, () => {
         const status = this.provider(args.provider);
-        if (!status.auth_modes.includes("subscription")) return invalid("This provider has no subscription sign-in.");
+        if (!status.auth_modes.includes("subscription"))
+          return invalid("This provider has no subscription sign-in.");
         status.personal_use_confirmed = true;
         const out = this.providerStatus(status.provider);
         this.emit("provider_changed", out);
@@ -653,15 +742,23 @@ export class MockBackend {
         const status = this.provider(args.provider);
         if (status.api_key === null) return invalid("This provider has no API-key mode.");
         const caps = this.validateCaps((args as { caps?: unknown }).caps);
-        if (typeof args.key !== "string" || args.key.trim() === "") return invalid("Enter an API key.");
+        if (typeof args.key !== "string" || args.key.trim() === "")
+          return invalid("Enter an API key.");
         this.apiKeys.set(status.provider, args.key);
         status.api_key = { present: true, caps };
-        let usage = this.usage.providers.find((u) => u.provider === status.provider && u.auth_mode === "api_key");
+        let usage = this.usage.providers.find(
+          (u) => u.provider === status.provider && u.auth_mode === "api_key",
+        );
         if (usage === undefined) {
           usage = this.newUsage(status.provider, "api_key");
           this.usage.providers.push(usage);
         }
-        usage.spend = { today_usd: usage.spend?.today_usd ?? 0, week_usd: usage.spend?.week_usd ?? 0, caps, is_estimate: true };
+        usage.spend = {
+          today_usd: usage.spend?.today_usd ?? 0,
+          week_usd: usage.spend?.week_usd ?? 0,
+          caps,
+          is_estimate: true,
+        };
         const out = this.providerStatus(status.provider);
         this.emit("provider_changed", out);
         this.emit("usage_changed", this.usageSnapshot());
@@ -674,7 +771,9 @@ export class MockBackend {
         if (status.api_key?.present !== true) return invalid("Add an API key first.");
         const caps = this.validateCaps((args as { caps?: unknown }).caps);
         status.api_key = { present: true, caps };
-        const usage = this.usage.providers.find((u) => u.provider === status.provider && u.auth_mode === "api_key");
+        const usage = this.usage.providers.find(
+          (u) => u.provider === status.provider && u.auth_mode === "api_key",
+        );
         if (usage?.spend) usage.spend.caps = caps;
         const out = this.providerStatus(status.provider);
         this.emit("provider_changed", out);
@@ -700,7 +799,8 @@ export class MockBackend {
     start_lead_request: (args) =>
       this.run("start_lead_request", args, () => {
         const status = this.providerStatus(this.provider(args.lead).provider);
-        if (typeof args.text !== "string" || args.text.trim() === "") return invalid("Describe what you want built.");
+        if (typeof args.text !== "string" || args.text.trim() === "")
+          return invalid("Describe what you want built.");
         if (this.leadRequests.some((r) => r.state === "thinking")) {
           return invalid("A lead request is already in flight; wait or cancel it.");
         }
@@ -717,7 +817,9 @@ export class MockBackend {
         this.leadRequests.unshift(request);
         this.emit("lead_changed", request);
         const authMode: AuthMode =
-          status.auth_modes.includes("subscription") && status.killswitch !== "api_key_only" ? "subscription" : "api_key";
+          status.auth_modes.includes("subscription") && status.killswitch !== "api_key_only"
+            ? "subscription"
+            : "api_key";
         this.schedule(LEAD_THINK_MS, async () => {
           if (request.state !== "thinking") return;
           const plan = clone<Plan>(planJson);
@@ -730,7 +832,10 @@ export class MockBackend {
           this.plans.set(plan.plan_id, record);
           request.state = "plan_ready";
           request.plan_id = plan.plan_id;
-          request.messages.push({ at: this.nowIso(), text: `Plan ready: ${String(plan.tasks.length)} tasks.` });
+          request.messages.push({
+            at: this.nowIso(),
+            text: `Plan ready: ${String(plan.tasks.length)} tasks.`,
+          });
           this.emit("plan_changed", await this.planView(record));
           this.emit("lead_changed", request);
         });
@@ -739,7 +844,9 @@ export class MockBackend {
 
     cancel_lead_request: (args) =>
       this.run("cancel_lead_request", args, () => {
-        const request = this.leadRequests.find((r) => r.request_id === args.request_id) ?? notFound("lead request");
+        const request =
+          this.leadRequests.find((r) => r.request_id === args.request_id) ??
+          notFound("lead request");
         if (request.state !== "thinking" && request.state !== "rate_limited") {
           return invalid("Only a request in flight can be cancelled.");
         }
@@ -752,19 +859,18 @@ export class MockBackend {
     list_plans: () =>
       this.run("list_plans", undefined, () =>
         [...this.plans.values()]
-          .map(
-            (r): PlanListItem => ({
-              plan_id: r.plan.plan_id,
-              created_at: r.plan.created_at,
-              lead: r.plan.lead.provider,
-              status: r.status,
-              task_count: r.plan.tasks.length,
-            }),
-          )
+          .map((r): PlanListItem => ({
+            plan_id: r.plan.plan_id,
+            created_at: r.plan.created_at,
+            lead: r.plan.lead.provider,
+            status: r.status,
+            task_count: r.plan.tasks.length,
+          }))
           .sort((a, b) => (a.created_at < b.created_at ? 1 : -1)),
       ),
 
-    get_plan: (args) => this.run("get_plan", args, () => this.planView(this.planRecord(args.plan_id))),
+    get_plan: (args) =>
+      this.run("get_plan", args, () => this.planView(this.planRecord(args.plan_id))),
 
     update_plan: (args) =>
       this.run("update_plan", args, async () => {
@@ -805,18 +911,30 @@ export class MockBackend {
       this.run("resume_session", args, () => {
         const s = this.session(args.session_id);
         if (!isLive(s)) return invalid("The session has ended.");
-        if (s.takeover) return invalid("Hand control back (turn take-over off) before resuming automation.");
+        if (s.takeover)
+          return invalid("Hand control back (turn take-over off) before resuming automation.");
         if (s.state.kind === "rate_limited") {
-          return ruleBlocked(10, "The provider is backing off after a rate limit.", s.state.retry_at);
+          return ruleBlocked(
+            10,
+            "The provider is backing off after a rate limit.",
+            s.state.retry_at,
+          );
         }
         const pacing = this.pacing.get(s.provider);
         if (pacing?.paused === true) {
-          return ruleBlocked(10, "The provider is paused after repeated limit errors; resume the provider.", pacing.paused_until);
+          return ruleBlocked(
+            10,
+            "The provider is paused after repeated limit errors; resume the provider.",
+            pacing.paused_until,
+          );
         }
         if (s.kind === "worker" && s.turns.current >= s.turns.limit) {
           return ruleBlocked(1, "The task reached its turn ceiling.");
         }
-        if (s.paused?.reason === "user_idle" && this.usage.user_idle_minutes >= this.settings.limits.idle_pause_minutes) {
+        if (
+          s.paused?.reason === "user_idle" &&
+          this.usage.user_idle_minutes >= this.settings.limits.idle_pause_minutes
+        ) {
           return ruleBlocked(1, "Automation stays paused while you are away.");
         }
         s.paused = null;
@@ -879,23 +997,23 @@ export class MockBackend {
       this.run("resize_terminal", args, () => {
         const s = this.session(args.session_id);
         const term = this.terminals.get(s.session_id) ?? notFound("terminal");
-        const ok = (n: unknown): n is number => Number.isInteger(n) && (n as number) >= 2 && (n as number) <= 1000;
-        if (!ok(args.cols) || !ok(args.rows)) return invalid("cols and rows must be integers from 2 to 1000");
+        const ok = (n: unknown): n is number =>
+          Number.isInteger(n) && (n as number) >= 2 && (n as number) <= 1000;
+        if (!ok(args.cols) || !ok(args.rows))
+          return invalid("cols and rows must be integers from 2 to 1000");
         term.cols = args.cols;
         term.rows = args.rows;
       }),
 
     list_reviews: () =>
       this.run("list_reviews", undefined, () =>
-        [...this.reviews.values()].map(
-          (r): ReviewListItem => ({
-            task_id: r.task_id,
-            plan_id: r.plan_id,
-            title: r.title,
-            provider: r.provider,
-            state: r.reviewed ? "reviewed" : r.test_log.status === "failed" ? "failed" : "ready",
-          }),
-        ),
+        [...this.reviews.values()].map((r): ReviewListItem => ({
+          task_id: r.task_id,
+          plan_id: r.plan_id,
+          title: r.title,
+          provider: r.provider,
+          state: r.reviewed ? "reviewed" : r.test_log.status === "failed" ? "failed" : "ready",
+        })),
       ),
 
     get_review: (args) =>
@@ -930,27 +1048,36 @@ export class MockBackend {
         if (typed.limits !== undefined) {
           if (!isObject(typed.limits)) return invalid("limits must be an object");
           for (const [key, value] of Object.entries(typed.limits)) {
-            if (!(LIMIT_KEYS as readonly string[]).includes(key)) return invalid(`unknown limit ${key}`);
+            if (!(LIMIT_KEYS as readonly string[]).includes(key))
+              return invalid(`unknown limit ${key}`);
             const k = key as LimitKey;
             const rule = this.limits.rules[k];
             if (!Number.isInteger(value)) return invalid(`${k} must be an integer`);
             const v = value;
             const looser = rule.stricter === "lower" ? v > rule.ceiling : v < rule.ceiling;
             if (looser) {
-              return ruleBlocked(RULE_FOR_LIMIT[k], `${k} cannot be looser than its ceiling (${String(rule.ceiling)}).`);
+              return ruleBlocked(
+                RULE_FOR_LIMIT[k],
+                `${k} cannot be looser than its ceiling (${String(rule.ceiling)}).`,
+              );
             }
             const inRange = rule.stricter === "lower" ? v >= rule.bound : v <= rule.bound;
-            if (!inRange) return invalid(`${k} must stay between ${String(rule.bound)} and ${String(rule.ceiling)}`);
+            if (!inRange)
+              return invalid(
+                `${k} must stay between ${String(rule.bound)} and ${String(rule.ceiling)}`,
+              );
             next.limits[k] = v;
           }
         }
         this.settings = next;
-        for (const s of this.sessions.values()) if (s.kind === "worker") s.turns.limit = next.limits.turns_per_task;
+        for (const s of this.sessions.values())
+          if (s.kind === "worker") s.turns.limit = next.limits.turns_per_task;
         this.emit("usage_changed", this.usageSnapshot());
         return this.settings;
       }),
 
-    get_killswitch_status: () => this.run("get_killswitch_status", undefined, () => this.killswitch),
+    get_killswitch_status: () =>
+      this.run("get_killswitch_status", undefined, () => this.killswitch),
 
     listen: (event, handler) => Promise.resolve(this.listen(event, handler)),
   };
@@ -959,10 +1086,14 @@ export class MockBackend {
     approve_plan: (args) =>
       this.run("approve_plan", args, async () => {
         const record = this.planRecord(args.plan_id);
-        if (record.status !== "draft") return invalid(`A ${record.status} plan cannot be approved again.`);
+        if (record.status !== "draft")
+          return invalid(`A ${record.status} plan cannot be approved again.`);
         const view = await this.planView(record);
         if (typeof args.plan_hash !== "string" || args.plan_hash !== view.plan_hash) {
-          return reject({ kind: "plan_hash_mismatch", message: "The plan changed since you reviewed it. Review it again." });
+          return reject({
+            kind: "plan_hash_mismatch",
+            message: "The plan changed since you reviewed it. Review it again.",
+          });
         }
         if (view.violations.length > 0) {
           return reject({
@@ -988,7 +1119,8 @@ export class MockBackend {
     pty_write: (args) =>
       this.run("pty_write", args, () => {
         const s = this.session(args.session_id);
-        if (!s.takeover) return ruleBlocked(3, "Take-over is off; automation never types into a terminal.");
+        if (!s.takeover)
+          return ruleBlocked(3, "Take-over is off; automation never types into a terminal.");
         if (!isLive(s)) return invalid("The session has ended.");
         if (typeof args.data !== "string") return invalid("data must be text");
         this.appendTerminal(s.session_id, args.data);
@@ -1035,7 +1167,10 @@ function applyEdit(plan: Plan, edit: PlanEdit): void {
           invalid("each fallback needs a provider and an auth_mode");
         }
       }
-      task.fallback_providers = edit.fallback_providers.map((f) => ({ provider: f.provider, auth_mode: f.auth_mode }));
+      task.fallback_providers = edit.fallback_providers.map((f) => ({
+        provider: f.provider,
+        auth_mode: f.auth_mode,
+      }));
       return;
     case "set_acceptance":
       if (!Array.isArray(edit.acceptance) || !edit.acceptance.every((a) => typeof a === "string")) {
@@ -1045,7 +1180,8 @@ function applyEdit(plan: Plan, edit: PlanEdit): void {
       return;
     case "remove_task":
       if (plan.tasks.length === 1) invalid("A plan needs at least one task.");
-      if (plan.tasks.some((t) => t.depends_on.includes(task.id))) invalid("Another task depends on this one.");
+      if (plan.tasks.some((t) => t.depends_on.includes(task.id)))
+        invalid("Another task depends on this one.");
       plan.tasks = plan.tasks.filter((t) => t.id !== task.id);
       return;
     default:

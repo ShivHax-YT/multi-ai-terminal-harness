@@ -11,7 +11,12 @@ export interface UntrustedTextProps {
   className?: string;
 }
 
-export function UntrustedText({ text, mono = false, block = false, className }: UntrustedTextProps) {
+export function UntrustedText({
+  text,
+  mono = false,
+  block = false,
+  className,
+}: UntrustedTextProps) {
   const Tag = block ? "div" : "span";
   return (
     <Tag

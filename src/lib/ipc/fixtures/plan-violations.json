@@ -15,12 +15,8 @@
       "role": "backend",
       "provider": "claude",
       "auth_mode": "subscription",
-      "owned_files": [
-        "src-tauri/crates/harness-core/src/sessions.rs"
-      ],
-      "acceptance": [
-        "All session tests pass"
-      ],
+      "owned_files": ["src-tauri/crates/harness-core/src/sessions.rs"],
+      "acceptance": ["All session tests pass"],
       "depends_on": [],
       "estimated_usage": {
         "prompts": 20,
@@ -39,15 +35,9 @@
       "role": "tester",
       "provider": "codex",
       "auth_mode": "subscription",
-      "owned_files": [
-        "src-tauri/crates/harness-core/tests/sessions.rs"
-      ],
-      "acceptance": [
-        "Tests cover spawn, idle, rate-limited, exited and killed"
-      ],
-      "depends_on": [
-        "t1"
-      ],
+      "owned_files": ["src-tauri/crates/harness-core/tests/sessions.rs"],
+      "acceptance": ["Tests cover spawn, idle, rate-limited, exited and killed"],
+      "depends_on": ["t1"],
       "estimated_usage": {
         "prompts": 8,
         "turns": 30

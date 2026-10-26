@@ -11,7 +11,9 @@ import { UntrustedText } from "./untrusted-text";
 export function errorTitle(error: IpcError): string {
   switch (error.kind) {
     case "rule_blocked":
-      return error.rule === undefined ? "Blocked by a hard rule" : `Blocked by rule ${String(error.rule)}`;
+      return error.rule === undefined
+        ? "Blocked by a hard rule"
+        : `Blocked by rule ${String(error.rule)}`;
     case "not_found":
       return "Not found";
     case "invalid_input":

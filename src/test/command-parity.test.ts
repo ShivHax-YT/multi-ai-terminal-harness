@@ -31,9 +31,9 @@ function capabilityCommands(): { core: string[]; commands: string[] } {
 
 function commandFns(): string[] {
   const src = readRepo("src-tauri/src/commands.rs");
-  return [...src.matchAll(/#\[tauri::command\(rename_all = "snake_case"\)\]\s*pub fn ([a-z_]+)/g)].map(
-    (m) => m[1] ?? "",
-  );
+  return [
+    ...src.matchAll(/#\[tauri::command\(rename_all = "snake_case"\)\]\s*pub fn ([a-z_]+)/g),
+  ].map((m) => m[1] ?? "");
 }
 
 describe("command parity", () => {

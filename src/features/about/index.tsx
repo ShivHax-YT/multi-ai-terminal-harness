@@ -38,7 +38,7 @@ export default function AboutScreen() {
           Independence
         </h2>
         <p data-testid="not-affiliated">{notAffiliatedStatement()}</p>
-        <p className="text-muted-foreground text-sm">
+        <p className="text-sm text-muted-foreground">
           Harness runs the command-line tools you install yourself, on this computer only. It never
           sees or stores your passwords or sign-in tokens.
         </p>

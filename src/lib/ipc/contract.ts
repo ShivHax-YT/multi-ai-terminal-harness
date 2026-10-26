@@ -178,7 +178,11 @@ export interface ProviderStatus {
     install_hint?: string;
   };
   /** Rule 6. */
-  binary: { state: "verified" | "failed" | "unchecked"; checked_at?: string; checks: BinaryCheck[] };
+  binary: {
+    state: "verified" | "failed" | "unchecked";
+    checked_at?: string;
+    checks: BinaryCheck[];
+  };
   /** From the CLI's documented status output only (rule 4). */
   sign_in: { state: "signed_in" | "signed_out" | "unknown"; checked_at?: string };
   /** Rule 5. */
@@ -479,7 +483,11 @@ export interface IpcClient {
   refresh_provider_status(args: ProviderArgs): Promise<ProviderStatus>;
   open_provider_login(args: ProviderArgs): Promise<{ session_id: string }>;
   confirm_personal_use(args: ProviderArgs): Promise<ProviderStatus>;
-  set_api_key(args: { provider: ProviderId; key: string; caps: SpendCaps }): Promise<ProviderStatus>;
+  set_api_key(args: {
+    provider: ProviderId;
+    key: string;
+    caps: SpendCaps;
+  }): Promise<ProviderStatus>;
   update_spend_caps(args: { provider: ProviderId; caps: SpendCaps }): Promise<ProviderStatus>;
   remove_api_key(args: ProviderArgs): Promise<ProviderStatus>;
 

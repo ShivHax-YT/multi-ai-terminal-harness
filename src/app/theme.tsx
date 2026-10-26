@@ -56,8 +56,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const resolved: "light" | "dark" =
-    theme === "system" ? (prefersDark ? "dark" : "light") : theme;
+  const resolved: "light" | "dark" = theme === "system" ? (prefersDark ? "dark" : "light") : theme;
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", resolved === "dark");

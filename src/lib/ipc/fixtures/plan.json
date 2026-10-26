@@ -15,14 +15,8 @@
       "role": "frontend",
       "provider": "claude",
       "auth_mode": "subscription",
-      "owned_files": [
-        "src/features/settings/index.tsx",
-        "src/features/settings/form.tsx"
-      ],
-      "acceptance": [
-        "Settings screen renders every limit",
-        "make check-fast passes"
-      ],
+      "owned_files": ["src/features/settings/index.tsx", "src/features/settings/form.tsx"],
+      "acceptance": ["Settings screen renders every limit", "make check-fast passes"],
       "depends_on": [],
       "estimated_usage": {
         "prompts": 10,
@@ -41,12 +35,8 @@
       "role": "frontend",
       "provider": "codex",
       "auth_mode": "subscription",
-      "owned_files": [
-        "src/features/usage/index.tsx"
-      ],
-      "acceptance": [
-        "Panel shows per-provider usage against the ceilings"
-      ],
+      "owned_files": ["src/features/usage/index.tsx"],
+      "acceptance": ["Panel shows per-provider usage against the ceilings"],
       "depends_on": [],
       "estimated_usage": {
         "prompts": 12,
@@ -66,13 +56,8 @@
       "provider": "codex",
       "auth_mode": "subscription",
       "owned_files": [],
-      "acceptance": [
-        "Review notes cover every acceptance item of t1 and t2"
-      ],
-      "depends_on": [
-        "t1",
-        "t2"
-      ],
+      "acceptance": ["Review notes cover every acceptance item of t1 and t2"],
+      "depends_on": ["t1", "t2"],
       "estimated_usage": {
         "prompts": 6,
         "turns": 10

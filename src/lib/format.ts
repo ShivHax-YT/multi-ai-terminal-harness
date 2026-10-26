@@ -25,7 +25,8 @@ export function formatMinutes(minutes: number): string {
 /** "950", "182.4k", "1.2M" (one decimal, trailing ".0" dropped). */
 export function formatTokens(value: number): string {
   const n = Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
-  const short = (v: number, suffix: string) => `${(Math.round(v * 10) / 10).toFixed(1).replace(/\.0$/, "")}${suffix}`;
+  const short = (v: number, suffix: string) =>
+    `${(Math.round(v * 10) / 10).toFixed(1).replace(/\.0$/, "")}${suffix}`;
   if (n >= 1_000_000) return short(n / 1_000_000, "M");
   if (n >= 1_000) return short(n / 1_000, "k");
   return String(n);

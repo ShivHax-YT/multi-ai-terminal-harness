@@ -38,12 +38,16 @@ describe("rule 5: no remote content", () => {
     expect(main).toContain('import "@fontsource-variable/inter";');
     expect(main).toContain('import "@fontsource-variable/jetbrains-mono";');
     const css = readRepo("src/styles/globals.css");
-    expect(css).not.toMatch(/@import\s+url\(|fonts\.googleapis|@font-face[^}]*url\(\s*["']?https?:/);
+    expect(css).not.toMatch(
+      /@import\s+url\(|fonts\.googleapis|@font-face[^}]*url\(\s*["']?https?:/,
+    );
     expect(readRepo("index.html")).not.toMatch(/<link[^>]+(stylesheet|preconnect|font)/);
   });
 
   it("index.html loads only the local entry script", () => {
-    const scripts = [...readRepo("index.html").matchAll(/<script[^>]*src="([^"]+)"/g)].map((m) => m[1]);
+    const scripts = [...readRepo("index.html").matchAll(/<script[^>]*src="([^"]+)"/g)].map(
+      (m) => m[1],
+    );
     expect(scripts).toEqual(["/src/main.tsx"]);
   });
 });

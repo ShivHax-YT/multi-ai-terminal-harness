@@ -56,7 +56,9 @@ describe("rule 9: the approval path", () => {
   it("the command palette never names an acting command", () => {
     const palette = readRepo("src/app/command-palette.tsx");
     const code = palette.replace(/\/\/.*$/gm, "");
-    expect(code).not.toMatch(/\b(approve\w*|kill\w*|take.?over|pty\w*|resume\w*|pause\w*|reset\w*)\b/i);
+    expect(code).not.toMatch(
+      /\b(approve\w*|kill\w*|take.?over|pty\w*|resume\w*|pause\w*|reset\w*)\b/i,
+    );
   });
 });
 
@@ -74,7 +76,9 @@ describe("one IPC door", () => {
 
   it("production client selection never loads the mock outside the dev branch", () => {
     const index = readRepo("src/lib/ipc/index.ts");
-    expect(index).toMatch(/if \(import\.meta\.env\.DEV && import\.meta\.env\.VITE_HARNESS_IPC !== "tauri"\) \{\s*const \{ createDevMockIpc \} = await import\("\.\/mock"\);/);
+    expect(index).toMatch(
+      /if \(import\.meta\.env\.DEV && import\.meta\.env\.VITE_HARNESS_IPC !== "tauri"\) \{\s*const \{ createDevMockIpc \} = await import\("\.\/mock"\);/,
+    );
     expect(index).not.toMatch(/^import[^\n]*\.\/mock/m);
     const nonIpc = sources.filter((f) => !f.startsWith("src/lib/ipc/"));
     const specifier = /(from\s+|import\(\s*)["'][^"']*lib\/ipc\/(mock|fixtures)/;

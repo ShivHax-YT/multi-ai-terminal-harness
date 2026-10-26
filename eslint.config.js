@@ -28,7 +28,10 @@ const SCOPES = [
   { id: "terminal", files: [`src/features/sessions/terminal/${TS}`] },
   ...FEATURES.map((f) => ({ id: `feature:${f}`, files: [`src/features/${f}/${TS}`] })),
   { id: "ipc", files: [`src/lib/ipc/${TS}`] },
-  { id: "motion", files: [`src/components/motion/${TS}`, `src/components/motion-primitives/${TS}`] },
+  {
+    id: "motion",
+    files: [`src/components/motion/${TS}`, `src/components/motion-primitives/${TS}`],
+  },
   { id: "routes", files: ["src/app/routes.tsx"] },
   { id: "rest", files: [`src/${TS}`, "*.{ts,js}"] },
 ];
@@ -40,7 +43,8 @@ const SCOPES = [
 const BOUNDARIES = [
   {
     id: "pty-input",
-    message: "Rule 3: only the terminal view (src/features/sessions/terminal/**) may use the PTY input port.",
+    message:
+      "Rule 3: only the terminal view (src/features/sessions/terminal/**) may use the PTY input port.",
     modules: ["./src/lib/ipc/pty-input.ts"],
     allow: ["terminal", "ipc", "tests"],
   },
@@ -58,7 +62,8 @@ const BOUNDARIES = [
   },
   {
     id: "ipc-internal",
-    message: "Use useIpc() / useIpcEvent() from @/lib/ipc; the bundle and its ports stay inside src/lib/ipc.",
+    message:
+      "Use useIpc() / useIpcEvent() from @/lib/ipc; the bundle and its ports stay inside src/lib/ipc.",
     modules: ["./src/lib/ipc/context.tsx", "./src/lib/ipc/tauri.ts"],
     allow: ["ipc", "tests"],
   },
@@ -70,20 +75,23 @@ const BOUNDARIES = [
   },
   {
     id: "mock",
-    message: "The IPC mock and fixtures never ship: import them only in src/lib/ipc/**, src/test/** or tests.",
+    message:
+      "The IPC mock and fixtures never ship: import them only in src/lib/ipc/**, src/test/** or tests.",
     modules: ["./src/lib/ipc/mock", "./src/lib/ipc/fixtures"],
     allow: ["ipc", "tests"],
   },
   {
     id: "motion",
-    message: "Motion only through the wrappers in src/components/motion/ (they honour reduced motion).",
+    message:
+      "Motion only through the wrappers in src/components/motion/ (they honour reduced motion).",
     modules: ["./src/components/motion-primitives"],
     packages: { names: ["motion", "framer-motion"], patterns: ["motion/*", "framer-motion/*"] },
     allow: ["motion"],
   },
   {
     id: "banned-packages",
-    message: "Banned dependency (docs/tasks/T-101.md): no Tauri plugins, theme or HTML/markdown renderers.",
+    message:
+      "Banned dependency (docs/tasks/T-101.md): no Tauri plugins, theme or HTML/markdown renderers.",
     packages: {
       names: ["next-themes", "diff2html", "marked", "markdown-it", "react-markdown", "dompurify"],
       patterns: ["@tauri-apps/plugin-*", "tauri-plugin-*"],
@@ -106,7 +114,8 @@ function featureZones(scopeId) {
       },
     ];
   }
-  const own = scopeId === "terminal" ? "sessions" : scopeId.startsWith("feature:") ? scopeId.slice(8) : null;
+  const own =
+    scopeId === "terminal" ? "sessions" : scopeId.startsWith("feature:") ? scopeId.slice(8) : null;
   return FEATURES.filter((f) => f !== own).map((f) => ({
     target: ".",
     from: `${all}/${f}`,
@@ -153,11 +162,21 @@ const securityRules = {
     "error",
     { object: "document", property: "write", message: "Never write HTML into the document." },
     { object: "document", property: "writeln", message: "Never write HTML into the document." },
-    { object: "window", property: "open", message: "No new windows or external links from the webview." },
+    {
+      object: "window",
+      property: "open",
+      message: "No new windows or external links from the webview.",
+    },
     { object: "window", property: "eval", message: "No eval." },
     { object: "globalThis", property: "eval", message: "No eval." },
-    { property: "innerHTML", message: "Untrusted text never becomes HTML; render a text node (UntrustedText)." },
-    { property: "outerHTML", message: "Untrusted text never becomes HTML; render a text node (UntrustedText)." },
+    {
+      property: "innerHTML",
+      message: "Untrusted text never becomes HTML; render a text node (UntrustedText).",
+    },
+    {
+      property: "outerHTML",
+      message: "Untrusted text never becomes HTML; render a text node (UntrustedText).",
+    },
     { property: "insertAdjacentHTML", message: "Untrusted text never becomes HTML." },
   ],
   "no-restricted-globals": [

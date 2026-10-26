@@ -37,7 +37,8 @@ export function checkPlan(plan: Plan, ceilings: PlanCheckOptions): PlanViolation
     ceilings.apiKeyOnly.has(provider) && authMode !== "api_key";
 
   for (const task of plan.tasks) {
-    if (ids.has(task.id)) out.push({ rule: 9, message: `duplicate task id ${task.id}`, task_id: task.id });
+    if (ids.has(task.id))
+      out.push({ rule: 9, message: `duplicate task id ${task.id}`, task_id: task.id });
     ids.add(task.id);
     if (task.estimated_usage.turns > ceilings.turnsPerTask) {
       out.push({
@@ -52,7 +53,11 @@ export function checkPlan(plan: Plan, ceilings: PlanCheckOptions): PlanViolation
         out.push({ rule: 2, message: "a fallback is the task's own provider", task_id: task.id });
       }
       if (seen.has(fb.provider)) {
-        out.push({ rule: 2, message: `fallback provider ${fb.provider} is listed twice`, task_id: task.id });
+        out.push({
+          rule: 2,
+          message: `fallback provider ${fb.provider} is listed twice`,
+          task_id: task.id,
+        });
       }
       seen.add(fb.provider);
       if (!usedProviders.has(fb.provider)) {
@@ -63,7 +68,11 @@ export function checkPlan(plan: Plan, ceilings: PlanCheckOptions): PlanViolation
         });
       }
       if (keyOnly(fb.provider, fb.auth_mode)) {
-        out.push({ rule: 7, message: "this fallback provider runs on an API key only", task_id: task.id });
+        out.push({
+          rule: 7,
+          message: "this fallback provider runs on an API key only",
+          task_id: task.id,
+        });
       }
     }
     if (keyOnly(task.provider, task.auth_mode)) {
@@ -72,7 +81,8 @@ export function checkPlan(plan: Plan, ceilings: PlanCheckOptions): PlanViolation
   }
   for (const task of plan.tasks) {
     for (const dep of task.depends_on) {
-      if (dep === task.id) out.push({ rule: 9, message: "a task depends on itself", task_id: task.id });
+      if (dep === task.id)
+        out.push({ rule: 9, message: "a task depends on itself", task_id: task.id });
       else if (!ids.has(dep)) {
         out.push({ rule: 9, message: `depends on unknown task ${dep}`, task_id: task.id });
       }
@@ -117,4 +127,3 @@ export function planEstimates(plan: Plan): PlanEstimate[] {
   }
   return [...byKey.values()];
 }
-

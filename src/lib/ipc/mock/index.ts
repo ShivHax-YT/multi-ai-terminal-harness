@@ -1,7 +1,15 @@
 // Stateful mock of the Harness backend for dev and tests. Never part of a production build: the sentinel below
 // makes `make check` fail if this module reaches dist/.
 
-import type { ApprovalPort, CommandName, IpcClient, IpcError, IpcEventName, IpcEvents, PtyInputPort } from "../contract";
+import type {
+  ApprovalPort,
+  CommandName,
+  IpcClient,
+  IpcError,
+  IpcEventName,
+  IpcEvents,
+  PtyInputPort,
+} from "../contract";
 import { MOCK_SCENARIOS, MockBackend, type MockCall, type MockScenario } from "./backend";
 
 export { MOCK_SCENARIOS, MockBackend, LEAD_THINK_MS, SCROLLBACK_CAP_BYTES } from "./backend";
@@ -53,7 +61,12 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
     backend,
     sentinel: MOCK_SENTINEL,
   };
-  return { client: backend.client, approval: backend.approval, ptyInput: backend.ptyInput, control };
+  return {
+    client: backend.client,
+    approval: backend.approval,
+    ptyInput: backend.ptyInput,
+    control,
+  };
 }
 
 function isScenario(value: unknown): value is MockScenario {

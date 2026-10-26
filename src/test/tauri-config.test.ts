@@ -10,7 +10,13 @@ interface TauriConf {
   build: { devUrl: string; frontendDist: string };
   app: {
     withGlobalTauri: boolean;
-    windows: { label: string; title: string; dragDropEnabled: boolean; minWidth: number; minHeight: number }[];
+    windows: {
+      label: string;
+      title: string;
+      dragDropEnabled: boolean;
+      minWidth: number;
+      minHeight: number;
+    }[];
     security: { csp: string; devCsp: string; freezePrototype: boolean; capabilities: string[] };
   };
   bundle: Record<string, unknown>;

@@ -46,7 +46,7 @@ export function Meter({ label, current, limit, format = String, className }: Met
         aria-valuemax={limit}
         aria-valuenow={Math.min(current, Math.max(limit, 0))}
         aria-valuetext={`${valueText}, ${text.toLowerCase()}`}
-        className="bg-muted h-2 w-full overflow-hidden rounded-full"
+        className="h-2 w-full overflow-hidden rounded-full bg-muted"
       >
         <div className={cn("h-full rounded-full", bar)} style={{ width: `${String(pct)}%` }} />
       </div>

@@ -2,10 +2,7 @@
   {
     "provider": "claude",
     "adapter_available": true,
-    "auth_modes": [
-      "subscription",
-      "api_key"
-    ],
+    "auth_modes": ["subscription", "api_key"],
     "install": {
       "state": "installed",
       "version": "2.1.295"
@@ -50,10 +47,7 @@
   {
     "provider": "codex",
     "adapter_available": true,
-    "auth_modes": [
-      "subscription",
-      "api_key"
-    ],
+    "auth_modes": ["subscription", "api_key"],
     "install": {
       "state": "installed",
       "version": "0.162.0"
@@ -98,10 +92,7 @@
   {
     "provider": "grok",
     "adapter_available": false,
-    "auth_modes": [
-      "subscription",
-      "api_key"
-    ],
+    "auth_modes": ["subscription", "api_key"],
     "install": {
       "state": "not_installed"
     },
@@ -121,18 +112,13 @@
     "usable": {
       "lead": false,
       "worker": false,
-      "blockers": [
-        "adapter_unavailable"
-      ]
+      "blockers": ["adapter_unavailable"]
     }
   },
   {
     "provider": "kimi",
     "adapter_available": false,
-    "auth_modes": [
-      "subscription",
-      "api_key"
-    ],
+    "auth_modes": ["subscription", "api_key"],
     "install": {
       "state": "not_installed"
     },
@@ -152,17 +138,13 @@
     "usable": {
       "lead": false,
       "worker": false,
-      "blockers": [
-        "adapter_unavailable"
-      ]
+      "blockers": ["adapter_unavailable"]
     }
   },
   {
     "provider": "gemini",
     "adapter_available": true,
-    "auth_modes": [
-      "api_key"
-    ],
+    "auth_modes": ["api_key"],
     "install": {
       "state": "installed",
       "version": "0.21.0"
@@ -200,18 +182,13 @@
     "usable": {
       "lead": false,
       "worker": false,
-      "blockers": [
-        "api_key_missing"
-      ]
+      "blockers": ["api_key_missing"]
     }
   },
   {
     "provider": "glm",
     "adapter_available": false,
-    "auth_modes": [
-      "subscription",
-      "api_key"
-    ],
+    "auth_modes": ["subscription", "api_key"],
     "install": {
       "state": "not_installed"
     },
@@ -231,9 +208,7 @@
     "usable": {
       "lead": false,
       "worker": false,
-      "blockers": [
-        "adapter_unavailable"
-      ]
+      "blockers": ["adapter_unavailable"]
     }
   }
 ]

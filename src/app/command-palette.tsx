@@ -16,7 +16,11 @@ import {
 import { ABOUT_ITEM, NAV_ITEMS, modKeyLabel } from "./nav";
 import { THEME_LABELS, THEMES, useTheme, type ThemePreference } from "./theme";
 
-const THEME_ICONS: Record<ThemePreference, typeof Sun> = { light: Sun, dark: Moon, system: Monitor };
+const THEME_ICONS: Record<ThemePreference, typeof Sun> = {
+  light: Sun,
+  dark: Moon,
+  system: Monitor,
+};
 
 export function CommandPalette({
   open,

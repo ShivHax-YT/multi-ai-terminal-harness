@@ -22,7 +22,9 @@ export interface RenderRouteResult extends RenderResult {
 
 export function renderRoute(path: string, options: RenderRouteOptions = {}): RenderRouteResult {
   const mock =
-    typeof options.mock === "object" ? options.mock : createMockIpc({ scenario: options.mock ?? "ready" });
+    typeof options.mock === "object"
+      ? options.mock
+      : createMockIpc({ scenario: options.mock ?? "ready" });
   window.location.hash = `#${path}`;
   const user = userEvent.setup();
   const result = render(<App bundle={mock} />);

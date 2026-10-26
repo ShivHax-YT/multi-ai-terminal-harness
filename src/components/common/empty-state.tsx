@@ -17,14 +17,14 @@ export function EmptyState({ title, description, icon: Icon, action, className }
     <section
       aria-label={title}
       className={cn(
-        "bg-card text-card-foreground flex flex-col items-center gap-3 rounded-xl border px-6 py-12 text-center",
+        "flex flex-col items-center gap-3 rounded-xl border bg-card px-6 py-12 text-center text-card-foreground",
         className,
       )}
     >
-      {Icon !== undefined && <Icon aria-hidden="true" className="text-muted-foreground size-6" />}
+      {Icon !== undefined && <Icon aria-hidden="true" className="size-6 text-muted-foreground" />}
       <h2 className="text-base font-semibold">{title}</h2>
       {description !== undefined && (
-        <p className="text-muted-foreground max-w-[65ch] text-sm">{description}</p>
+        <p className="max-w-[65ch] text-sm text-muted-foreground">{description}</p>
       )}
       {action}
     </section>

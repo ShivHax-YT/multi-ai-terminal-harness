@@ -13,7 +13,7 @@ export function SessionTerminal(props: SessionTerminalProps) {
       aria-label="Terminal"
       data-session-id={props.sessionId}
       data-kind={props.kind}
-      className="bg-terminal-bg text-terminal-fg min-h-48 rounded-xl p-4 font-mono text-[13px] leading-[1.5]"
+      className="min-h-48 rounded-xl bg-terminal-bg p-4 font-mono text-[13px] leading-[1.5] text-terminal-fg"
     >
       The terminal view arrives with T-106.
     </div>
