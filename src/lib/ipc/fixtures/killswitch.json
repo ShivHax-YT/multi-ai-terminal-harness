@@ -1,0 +1,13 @@
+{
+  "source": "signed_remote",
+  "fetched_at": "2026-10-25T08:55:00Z",
+  "signature": "valid",
+  "adapters": [
+    { "provider": "claude", "state": "enabled" },
+    { "provider": "codex", "state": "enabled" },
+    { "provider": "grok", "state": "enabled" },
+    { "provider": "kimi", "state": "enabled" },
+    { "provider": "gemini", "state": "api_key_only", "reason": "Rule 7: API key only." },
+    { "provider": "glm", "state": "enabled" }
+  ]
+}

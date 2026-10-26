@@ -71,3 +71,44 @@ rm -rf "$FAKE_HOME"
 echo
 echo "selftest: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
+
+# ---- T-101: Tauri layout. Rule 3 via compliance/pty-boundary.conf (copied into each scratch repo, because the scan
+# sources the conf of the root it scans) and via the harness-core -> pty-view crate boundary check. ----
+echo
+echo "T-101 rule 3 (Tauri layout)"
+with_conf() { mkdir -p "$1/compliance"; cp "$REPO/compliance/pty-boundary.conf" "$1/compliance/"; }
+d="$(new_repo)"; with_conf "$d"; mkdir -p "$d/src-tauri/crates/harness-core"
+printf '[dependencies]\npty-view = { path = "../pty-view" }\n' > "$d/src-tauri/crates/harness-core/Cargo.toml"
+expect_scan dirty "R3 harness-core Cargo.toml names pty-view" "$d"
+d="$(new_repo)"; with_conf "$d"; mkdir -p "$d/src-tauri/crates/harness-core/src"
+echo 'use pty_view::spawn;' > "$d/src-tauri/crates/harness-core/src/lib.rs"
+expect_scan dirty "R3 harness-core source uses pty_view" "$d"
+d="$(new_repo)"; with_conf "$d"; mkdir -p "$d/src/features/lead"
+echo 'void ptyWrite({ session_id: "s", data: "x" });' > "$d/src/features/lead/x.ts"
+expect_scan dirty "R3 lead UI calls ptyWrite" "$d"
+d="$(new_repo)"; with_conf "$d"; mkdir -p "$d/src/features/lead"
+echo 'import { usePtyInput } from "@/lib/ipc/pty-input";' > "$d/src/features/lead/y.ts"
+expect_scan dirty "R3 lead UI imports the pty-input port" "$d"
+d="$(new_repo)"; with_conf "$d"; mkdir -p "$d/src-tauri/crates/pty-view/src"
+echo 'pub struct PtyWriter;' > "$d/src-tauri/crates/pty-view/src/lib.rs"
+expect_scan clean "R3 pty-view crate may define PtyWriter" "$d"
+d="$(new_repo)"; with_conf "$d"; mkdir -p "$d/src/features/sessions/terminal"
+echo 'const { pty_write } = usePtyInput(); // from "@/lib/ipc/pty-input"' > "$d/src/features/sessions/terminal/t.ts"
+expect_scan clean "R3 terminal view may use the pty-input port" "$d"
+
+CB="$REPO/scripts/ci/check-crate-boundary.sh"
+expect_tree() {  # expect_tree <want: pass|fail> <name> <tree text>
+  local want="$1" name="$2" t got
+  t="$(mktemp)"; printf '%s\n' "$3" > "$t"
+  if "$CB" --tree-file "$t" >/dev/null 2>&1; then got=pass; else got=fail; fi
+  rm -f "$t"
+  [ "$got" = "$want" ] && ok "crate-boundary $name -> $want" || bad "crate-boundary $name: wanted $want, got $got"
+}
+expect_tree pass "tree without pty-view" "$(printf 'harness-core v0.1.0 (/r/src-tauri/crates/harness-core)\nserde v1.0.228\nserde_derive v1.0.228 (proc-macro)')"
+expect_tree fail "tree with pty-view" "$(printf 'harness-core v0.1.0 (/r/src-tauri/crates/harness-core)\nserde v1.0.228\npty-view v0.1.0 (/r/src-tauri/crates/pty-view)')"
+expect_tree fail "tree with pty_view spelling" "$(printf 'harness-core v0.1.0 (/r)\nfoo v1.0.0\npty_view v0.1.0 (/r/x)')"
+expect_tree fail "tree not rooted at harness-core (fail closed)" "$(printf 'app v0.1.0 (/r/src-tauri)\nserde v1.0.228')"
+
+echo
+echo "selftest (with T-101 cases): $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

@@ -1,5 +1,5 @@
-# Sample CI. The compliance job runs today; the macOS stack job is a TODO until docs/adr/0001-stack.md exists.
-# Action versions are the ones in the research Page (Oct 2026) and were not re-checked; pin to commit SHAs before release.
+# CI == `make check` (Tauri 2 stack, docs/adr/0001-stack.md). Action versions were not re-checked; pin to commit SHAs
+# before release.
 name: ci
 on:
   pull_request:
@@ -16,37 +16,33 @@ jobs:
       - uses: actions/checkout@v4
       - name: Hard-rule static scan
         run: scripts/ci/compliance-scan.sh
-      - name: Compliance self-test (scan + hooks reject seeded violations)
+      - name: Compliance self-test (scan + hooks + crate boundary reject seeded violations)
         run: tests/compliance/selftest.sh
       - name: Validate JSON configs
         run: |
           jq empty .claude/settings.json .mcp.json
+          jq -e '.productName == "Harness" and .identifier == "dev.local.harness"' src-tauri/tauri.conf.json
+          jq -e '(.permissions | index("core:default")) != null' src-tauri/capabilities/main.json
       - name: Lint shell scripts
         run: |
-          shellcheck -S warning .claude/hooks/*.sh scripts/ci/*.sh tests/compliance/*.sh spike/lib/common.sh spike/preflight.sh spike/handoff/parse.sh spike/plan/hash.sh spike/tests/test_common.sh spike/tests/test_preflight.sh spike/tests/test_handoff.sh spike/tests/test_plan.sh
+          shellcheck -S warning .claude/hooks/*.sh scripts/ci/*.sh tests/compliance/*.sh
+          find spike -name '*.sh' -print0 | xargs -0 shellcheck -S warning
 
   stack:
     needs: compliance
     runs-on: macos-latest
-    # TODO(stack): replace these steps with ONE of the blocks below after the stack ADR.
     steps:
       - uses: actions/checkout@v4
-      - name: Checks (auto-detects stack; compliance-only until app code exists)
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: make check
         run: make check
 
-  # --- Tauri 2 path (uncomment after ADR) ---
-  #     - uses: dtolnay/rust-toolchain@stable
-  #       with: { components: "rustfmt, clippy", targets: aarch64-apple-darwin }
-  #     - uses: pnpm/action-setup@v4
-  #     - uses: actions/setup-node@v4
-  #       with: { node-version: 22, cache: pnpm }
-  #     - run: pnpm install --frozen-lockfile
-  #     - run: make check
-  #
-  # --- Swift / SwiftUI path (uncomment after ADR) ---
-  #     - run: brew install swiftlint
-  #     - run: swiftlint --strict
-  #     - run: make check
-  #     - run: xcodebuild -scheme <AppScheme> -destination 'platform=macOS' test
-  #
   # Release builds: notarized Developer ID, outside the Mac App Store (App Sandbox breaks child CLIs; hard rule 4).

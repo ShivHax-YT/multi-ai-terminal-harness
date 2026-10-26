@@ -1,0 +1,13 @@
+{
+  "summary_budget_tokens": 200,
+  "limits": {
+    "concurrent_sessions": 2,
+    "prompts_per_hour": 30,
+    "turns_per_task": 40,
+    "run_minutes_per_day": 480,
+    "idle_pause_minutes": 30,
+    "min_dispatch_gap_s": 5,
+    "backoff_base_s": 60,
+    "pause_after_limit_errors": 3
+  }
+}

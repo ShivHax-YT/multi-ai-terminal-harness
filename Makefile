@@ -1,14 +1,22 @@
 # Local checks == CI checks. The Stop hook runs `make -s check-fast`; CI runs `make check`.
-# Stack targets auto-detect what exists, so this works before and after the stack ADR (docs/adr/0001-stack.md).
-# TODO(stack): once Tauri or Swift is chosen, delete the other branch below and make the checks unconditional.
+# Stack: Tauri 2 (docs/adr/0001-stack.md). Cargo workspace in src-tauri/, UI in src/ (pnpm).
 
 SHELL := /bin/bash
 # No .ONESHELL: macOS ships GNU make 3.81, which lacks it, so multi-line recipes use backslashes.
-.PHONY: check-fast check compliance compliance-selftest spike-test stack-fast stack-full
 
-check-fast: compliance stack-fast
+# Homebrew's rustup is keg-only; put it first on PATH when it exists so rust-toolchain.toml is honoured.
+RUSTUP_BIN := /opt/homebrew/opt/rustup/bin
+ifneq ($(wildcard $(RUSTUP_BIN)),)
+export PATH := $(RUSTUP_BIN):$(PATH)
+endif
 
-check: compliance compliance-selftest spike-test stack-fast stack-full
+CARGO_MANIFEST := --manifest-path src-tauri/Cargo.toml
+
+.PHONY: check-fast check compliance compliance-selftest crate-boundary spike-test rust-fast rust-full ui-fast ui-full
+
+check-fast: compliance crate-boundary spike-test rust-fast ui-fast
+
+check: check-fast compliance-selftest rust-full ui-full
 
 compliance:
 	@scripts/ci/compliance-scan.sh
@@ -16,31 +24,39 @@ compliance:
 compliance-selftest:
 	@tests/compliance/selftest.sh
 
-# Phase 0 spike suites (offline; none sets SPIKE_LIVE). Not in check-fast: together they take a few minutes.
+# Rule 3: harness-core must have no dependency path (normal, build or dev) to the PTY crate.
+crate-boundary:
+	@scripts/ci/check-crate-boundary.sh
+
+# Phase 0 spike suites (offline; none sets SPIKE_LIVE). Each runs under /bin/bash; skipped when there are none.
 spike-test:
-	@set -eo pipefail; for t in spike/tests/*.sh; do echo "== $$t"; /bin/bash "$$t" 2>/dev/null | tail -1; done
+	@set -eo pipefail; \
+	shopt -s nullglob; \
+	tests=(spike/tests/*.sh); \
+	if [ "$${#tests[@]}" -eq 0 ]; then echo "spike-test: no spike tests"; exit 0; fi; \
+	for t in "$${tests[@]}"; do echo "== $$t"; /bin/bash "$$t" 2>/dev/null | tail -1; done
 
-stack-fast:
+rust-fast:
 	@set -e; \
-	if [ -f src-tauri/Cargo.toml ]; then \
-	  cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check; \
-	  cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings; \
-	  cargo test --manifest-path src-tauri/Cargo.toml --lib; \
-	fi; \
-	if [ -f package.json ] && grep -q '"typecheck"' package.json; then pnpm -s typecheck; fi; \
-	if [ -f Package.swift ]; then \
-	  swift build; \
-	  if swift format --help >/dev/null 2>&1; then swift format lint --recursive --strict Sources Tests; fi; \
-	fi; \
-	if [ ! -f src-tauri/Cargo.toml ] && [ ! -f Package.swift ]; then \
-	  echo "make: no app stack yet (see docs/adr/README.md); compliance only"; \
-	fi
+	cargo fmt $(CARGO_MANIFEST) --all -- --check; \
+	cargo clippy $(CARGO_MANIFEST) --workspace --all-targets -- -D warnings; \
+	cargo test $(CARGO_MANIFEST) --workspace --lib
 
-stack-full:
+rust-full:
+	@cargo test $(CARGO_MANIFEST) --workspace
+
+ui-fast:
 	@set -e; \
-	if [ -f src-tauri/Cargo.toml ]; then cargo test --manifest-path src-tauri/Cargo.toml; fi; \
-	if [ -f package.json ]; then \
-	  if grep -q '"lint"' package.json; then pnpm -s lint; fi; \
-	  if grep -q '"test"' package.json; then pnpm -s test; fi; \
+	pnpm -s typecheck; \
+	pnpm -s lint; \
+	pnpm -s test; \
+	pnpm -s format:check
+
+# The dev mock must never ship: fail if its sentinel reaches the production bundle.
+ui-full:
+	@set -e; \
+	pnpm -s build; \
+	if grep -rqF __HARNESS_MOCK__ dist; then \
+	  echo "ui-full: the IPC mock (__HARNESS_MOCK__) is in dist/; it must never ship" >&2; exit 1; \
 	fi; \
-	if [ -f Package.swift ]; then swift test --parallel; fi
+	echo "ui-full: dist/ is free of the IPC mock"

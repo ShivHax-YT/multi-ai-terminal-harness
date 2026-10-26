@@ -38,9 +38,7 @@ different provider, verification, and summaries. See [docs/ARCHITECTURE.md](docs
 adapters, compliance), `pty-view` (PTY spawn/write), `app` (Tauri shell); UI in `src/`. `harness-core` never depends
 on `pty-view` (rule 3). Pin `portable-pty`; avoid 0.9.0 on macOS.
 
-Still open, to land with the Phase 1 scaffold (not before: unconditional checks fail until `src-tauri/` exists): make
-the `Makefile` stack targets and the CI `stack` job Tauri-only, set `compliance/pty-boundary.conf` to the real crate
-paths and symbols, and pick a product name and bundle ID with no provider trademark (rule 8).
+Still open: "Harness" / `dev.local.harness` are placeholder names (rename before release, rule 8); the `Makefile`, CI and `compliance/pty-boundary.conf` are Tauri-only since T-101.
 Phase 0 spike scripts go in `spike/`.
 
 ## Coding conventions

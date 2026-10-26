@@ -1,0 +1,13 @@
+{
+  "rules": {
+    "concurrent_sessions": { "ceiling": 2, "stricter": "lower", "bound": 1, "unit": "count" },
+    "prompts_per_hour": { "ceiling": 30, "stricter": "lower", "bound": 1, "unit": "per_hour" },
+    "turns_per_task": { "ceiling": 40, "stricter": "lower", "bound": 1, "unit": "count" },
+    "run_minutes_per_day": { "ceiling": 480, "stricter": "lower", "bound": 30, "unit": "minutes" },
+    "idle_pause_minutes": { "ceiling": 30, "stricter": "lower", "bound": 5, "unit": "minutes" },
+    "min_dispatch_gap_s": { "ceiling": 5, "stricter": "higher", "bound": 600, "unit": "seconds" },
+    "backoff_base_s": { "ceiling": 60, "stricter": "higher", "bound": 3600, "unit": "seconds" },
+    "pause_after_limit_errors": { "ceiling": 3, "stricter": "lower", "bound": 1, "unit": "count" }
+  },
+  "spend_cap_max": { "daily_usd": 500, "weekly_usd": 2000 }
+}

@@ -1,0 +1,12 @@
+[package]
+name = "harness-core"
+description = "Lead, scheduler, adapters and compliance constants. Headless and ACP transports only (rule 3)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Rule 3: this crate never depends on the terminal crate. scripts/ci/check-crate-boundary.sh checks the resolved graph
+# (normal, build and dev edges) and the compliance scan checks every file under this directory.
+[dependencies]

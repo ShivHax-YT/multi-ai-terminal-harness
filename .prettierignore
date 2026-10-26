@@ -1,0 +1,12 @@
+# Docs and Markdown are hand-wrapped; the PostToolUse hook would otherwise reformat edited docs.
+docs/
+*.md
+spike/
+.claude/
+compliance/
+src-tauri/target
+src-tauri/gen
+dist
+coverage
+node_modules
+pnpm-lock.yaml
