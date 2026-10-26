@@ -563,5 +563,5 @@ type ClientCommandName = Exclude<keyof IpcClient, "listen">;
 type Equals<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 const commandsMatchClient: Equals<CommandName, ClientCommandName | PortCommandName> = true;
 const eventsMatch: Equals<(typeof EVENT_NAMES)[number], IpcEventName> = true;
-void commandsMatchClient;
-void eventsMatch;
+/** True by construction; a drift between the lists above fails to compile. */
+export const CONTRACT_SELF_CHECK: readonly [true, true] = [commandsMatchClient, eventsMatch];

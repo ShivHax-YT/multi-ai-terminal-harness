@@ -1,5 +1,5 @@
-// React wiring for the IPC bundle. Screens use `useIpc()` and `useIpcEvent()` from "@/lib/ipc". The two ports are
-// handed out only by ./approval (rule 9) and ./pty-input (rule 3); `useIpcBundle` is internal to src/lib/ipc
+// React wiring for the IPC bundle. Screens use `useIpc()` and `useIpcEvent()` from "@/lib/ipc". The two ports
+// (rules 3 and 9) are handed out only by their own port modules; `useIpcBundle` is internal to src/lib/ipc
 // (ESLint import zone + src/test/ipc-boundaries.test.ts).
 
 import { createContext, useContext, useEffect, useRef, type ReactNode } from "react";
@@ -19,7 +19,7 @@ export function useIpcBundle(): IpcBundle {
   return bundle;
 }
 
-/** The general client. It has no generic invoke and no approve_plan or pty_write. */
+/** The general client. It has no generic invoke and neither port command. */
 export function useIpc(): IpcClient {
   return useIpcBundle().client;
 }

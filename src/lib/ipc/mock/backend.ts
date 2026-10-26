@@ -87,6 +87,7 @@ const RULE_FOR_LIMIT: Record<LimitKey, 1 | 10> = {
   pause_after_limit_errors: 10,
 };
 
+// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- JSON fixtures are typed at the call site.
 function clone<T>(value: unknown): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
@@ -271,8 +272,8 @@ export class MockBackend {
     if (this.scenario === "errors") {
       throw new IpcRejection({ kind: "internal", message: "mock scenario: every command fails" });
     }
-    const result = await impl();
-    return result === undefined ? result : clone<T>(result);
+    const result: unknown = await impl();
+    return result === undefined ? (result as T) : clone<T>(result);
   }
 
   // ---- scenario setup --------------------------------------------------------------------------------------------
@@ -399,7 +400,7 @@ export class MockBackend {
       title: task.title,
       role: task.role,
       branch: `harness/${task.id}`,
-      worktree: `.claude/worktrees/${task.id}`,
+      worktree: `.harness/worktrees/${task.id}`,
       state: { kind: "running" },
       paused: null,
       turns: { current: 12, limit: this.settings.limits.turns_per_task },
@@ -933,7 +934,7 @@ export class MockBackend {
             const k = key as LimitKey;
             const rule = this.limits.rules[k];
             if (!Number.isInteger(value)) return invalid(`${k} must be an integer`);
-            const v = value as number;
+            const v = value;
             const looser = rule.stricter === "lower" ? v > rule.ceiling : v < rule.ceiling;
             if (looser) {
               return ruleBlocked(RULE_FOR_LIMIT[k], `${k} cannot be looser than its ceiling (${String(rule.ceiling)}).`);
@@ -1009,6 +1010,10 @@ export class MockBackend {
   }
 }
 
+function isAuthMode(value: unknown): value is AuthMode {
+  return value === "subscription" || value === "api_key";
+}
+
 function isLive(s: SessionView): boolean {
   return s.state.kind !== "killed" && s.state.kind !== "exited";
 }
@@ -1019,14 +1024,14 @@ function applyEdit(plan: Plan, edit: PlanEdit): void {
   switch (edit.kind) {
     case "set_provider":
       if (!isProviderId(edit.provider)) invalid("unknown provider");
-      if (edit.auth_mode !== "subscription" && edit.auth_mode !== "api_key") invalid("unknown auth_mode");
+      if (!isAuthMode(edit.auth_mode)) invalid("unknown auth_mode");
       task.provider = edit.provider;
       task.auth_mode = edit.auth_mode;
       return;
     case "set_fallbacks":
       if (!Array.isArray(edit.fallback_providers)) invalid("fallback_providers must be an array");
       for (const fb of edit.fallback_providers) {
-        if (!isProviderId(fb.provider) || (fb.auth_mode !== "subscription" && fb.auth_mode !== "api_key")) {
+        if (!isProviderId(fb.provider) || !isAuthMode(fb.auth_mode)) {
           invalid("each fallback needs a provider and an auth_mode");
         }
       }

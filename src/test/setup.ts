@@ -22,16 +22,15 @@ Object.defineProperty(window, "matchMedia", {
   configurable: true,
   value: (query: string): MediaQueryList => {
     const matches = query.includes("prefers-reduced-motion") ? reducedMotion : false;
-    return {
+    const mql = {
       matches,
       media: query,
       onchange: null,
-      addListener: () => undefined,
-      removeListener: () => undefined,
       addEventListener: () => undefined,
       removeEventListener: () => undefined,
       dispatchEvent: () => false,
     };
+    return mql as unknown as MediaQueryList;
   },
 });
 
@@ -53,9 +52,14 @@ class IntersectionObserverStub {
   }
 }
 
-globalThis.ResizeObserver ??= ResizeObserverStub as unknown as typeof ResizeObserver;
-globalThis.IntersectionObserver ??=
-  IntersectionObserverStub as unknown as typeof IntersectionObserver;
-Element.prototype.scrollIntoView ??= function scrollIntoView() {};
-Element.prototype.hasPointerCapture ??= () => false;
-Element.prototype.releasePointerCapture ??= () => undefined;
+function polyfill(target: object, key: string, value: unknown): void {
+  if (!(key in target)) {
+    Object.defineProperty(target, key, { value, configurable: true, writable: true });
+  }
+}
+
+polyfill(globalThis, "ResizeObserver", ResizeObserverStub);
+polyfill(globalThis, "IntersectionObserver", IntersectionObserverStub);
+polyfill(Element.prototype, "scrollIntoView", () => undefined);
+polyfill(Element.prototype, "hasPointerCapture", () => false);
+polyfill(Element.prototype, "releasePointerCapture", () => undefined);

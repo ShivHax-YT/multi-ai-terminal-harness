@@ -4,7 +4,7 @@
   "title": "<img src=x onerror=alert(1)> Build the usage panel",
   "provider": "codex",
   "branch": "harness/t2-usage-panel",
-  "worktree": ".claude/worktrees/t2-usage-panel",
+  "worktree": ".harness/worktrees/t2-usage-panel",
   "owned_files": [
     "src/features/usage/index.tsx"
   ],
@@ -57,7 +57,7 @@
       {
         "kind": "handoff",
         "task_id": "t2",
-        "path": ".claude/worktrees/t2-usage-panel/HANDOFF.md"
+        "path": ".harness/worktrees/t2-usage-panel/HANDOFF.md"
       }
     ]
   },

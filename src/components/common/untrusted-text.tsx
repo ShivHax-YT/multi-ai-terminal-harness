@@ -23,7 +23,7 @@ export function UntrustedText({ text, mono = false, block = false, className }: 
         className,
       )}
     >
-      {String(text)}
+      {text}
     </Tag>
   );
 }

@@ -33,7 +33,7 @@ function NavEntry({ item, active, mod }: { item: NavItem; active: boolean; mod: 
           <item.icon aria-hidden="true" />
           <span>{item.label}</span>
           {item.digit !== undefined && (
-            <kbd className="text-muted-foreground ml-auto font-mono text-xs">
+            <kbd className="ml-auto font-mono text-xs text-muted-foreground">
               {`${mod}${String(item.digit)}`}
             </kbd>
           )}
@@ -78,29 +78,36 @@ export function Shell() {
 
   return (
     <SidebarProvider>
-      <Sidebar collapsible="icon" aria-label="Main navigation">
+      <Sidebar collapsible="icon">
         <SidebarHeader>
           <div className="px-2 py-1.5 text-base font-semibold">Harness</div>
         </SidebarHeader>
-        <SidebarContent>
-          <SidebarGroup>
-            <SidebarGroupContent>
-              <SidebarMenu>
-                {NAV_ITEMS.map((item) => (
-                  <NavEntry key={item.id} item={item} active={current?.id === item.id} mod={mod} />
-                ))}
-              </SidebarMenu>
-            </SidebarGroupContent>
-          </SidebarGroup>
-        </SidebarContent>
-        <SidebarFooter>
-          <SidebarMenu>
-            <NavEntry item={ABOUT_ITEM} active={current?.id === "about"} mod={mod} />
-          </SidebarMenu>
-        </SidebarFooter>
+        <nav aria-label="Main navigation" className="flex min-h-0 flex-1 flex-col">
+          <SidebarContent>
+            <SidebarGroup>
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  {NAV_ITEMS.map((item) => (
+                    <NavEntry
+                      key={item.id}
+                      item={item}
+                      active={current?.id === item.id}
+                      mod={mod}
+                    />
+                  ))}
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+          </SidebarContent>
+          <SidebarFooter>
+            <SidebarMenu>
+              <NavEntry item={ABOUT_ITEM} active={current?.id === "about"} mod={mod} />
+            </SidebarMenu>
+          </SidebarFooter>
+        </nav>
       </Sidebar>
       <SidebarInset>
-        <header className="bg-background flex h-14 shrink-0 items-center gap-3 border-b px-4">
+        <header className="flex h-14 shrink-0 items-center gap-3 border-b bg-background px-4">
           <SidebarTrigger aria-label="Toggle sidebar" />
           <h1 className="text-2xl font-semibold">{title}</h1>
           <div className="ml-auto flex items-center gap-2">
@@ -114,7 +121,7 @@ export function Shell() {
             >
               <Search aria-hidden="true" />
               <span>Go to</span>
-              <kbd className="text-muted-foreground font-mono text-xs">{`${mod}K`}</kbd>
+              <kbd className="font-mono text-xs text-muted-foreground">{`${mod}K`}</kbd>
             </Button>
             <ThemeMenu />
           </div>
