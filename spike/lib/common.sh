@@ -396,19 +396,23 @@ spike_redact() {
 # set -u fails on an empty array). Values are data: they come after the constant interpreter path, so env never parses them.
 _SPIKE_IN=()
 # _spike_self_pid sets _SPIKE_SELF to the pid of the shell that is running (a subshell has its own pid, which is what a
-# command started from it gets as its parent). BASHPID exists in bash 4+; bash 3.2 (macOS) asks the sh it execs in place.
+# command started from it gets as its parent). BASHPID is trusted only on bash 4+ (_spike_bash4); bash 3.2 (macOS) has none,
+# so a plain or inherited BASHPID variable there is ignored and the sh it execs in place is asked instead.
 _SPIKE_SELF=""
+_spike_bash4() { [ "${BASH_VERSINFO[0]:-0}" -ge 4 ]; }
 _spike_self_pid() {
-  _SPIKE_SELF="${BASHPID:-}"
+  _SPIKE_SELF=""
+  if _spike_bash4; then _SPIKE_SELF="${BASHPID:-}"; fi
   case "$_SPIKE_SELF" in
     "" | *[!0-9]*) _SPIKE_SELF="$(exec /bin/sh -c 'echo $PPID')" ;;
   esac
 }
-# SPIKE_IN_PARENT is the pid the helper must have as its parent. If the shell died before the helper looked, the helper's
-# parent is already the reaper; it sees the mismatch and starts nothing (the run) or stops (the codesign watch).
+# _spike_inputs carries no parent pid: foreground helper calls run inside $(...), where some bash versions exec the last
+# command in place and the helper's parent is then the outer shell. Only _spike_exec (a command started with &, which always
+# forks) adds SPIKE_IN_PARENT, the pid the helper must have as its parent. If the shell died before the helper looked, its
+# parent is already the reaper; it sees the mismatch and starts nothing.
 _spike_inputs() {
-  _spike_self_pid
-  _SPIKE_IN=("SPIKE_IN_MARK=1" "SPIKE_IN_PARENT=$_SPIKE_SELF")
+  _SPIKE_IN=("SPIKE_IN_MARK=1")
   if [ "${PATH+set}" = "set" ]; then _SPIKE_IN[${#_SPIKE_IN[@]}]="SPIKE_IN_PATH=$PATH"; fi
   if [ "${HOME+set}" = "set" ]; then _SPIKE_IN[${#_SPIKE_IN[@]}]="SPIKE_IN_HOME=$HOME"; fi
   if [ "${TMPDIR+set}" = "set" ]; then _SPIKE_IN[${#_SPIKE_IN[@]}]="SPIKE_IN_TMPDIR=$TMPDIR"; fi
@@ -667,6 +671,8 @@ _spike_exec() {
   old_term="$(trap -p TERM)"
   old_hup="$(trap -p HUP)"
   _spike_inputs
+  _spike_self_pid
+  _SPIKE_IN[${#_SPIKE_IN[@]}]="SPIKE_IN_PARENT=$_SPIKE_SELF"
   _SPIKE_BG=""
   _SPIKE_BG_PENDING=""
   trap '_spike_forward 130' INT

@@ -801,6 +801,16 @@ rm -f "$FAKE"/ran-*
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude && spike_run_status 5 /dev/null "$SPIKE_VERIFIED_BIN" --version' _ "$COMMON" "$RG/claude" >/dev/null 2>&1
 eq "registered binary passes the identity check and runs through spike_run_status (rc 0)" "0" "$?"
 eq "registered binary ran once" "1" "$(ran)"
+# Foreground helper calls pass no SPIKE_IN_PARENT, so registering from a $(...) context (where some bash versions exec the
+# last command in place and the helper's parent is the outer shell) must succeed through the library, with no explicit parent.
+: >| "$FSDIR/log"
+o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$RG/claude" 2>&1; echo "RC=$?")"
+has "register in \$(...): spike_mark_verified as the last command registers (rc 0; got [$o])" "$o" "RC=0"
+has "register in \$(...): codesign was really asked about the binary" "$(cat "$FSDIR/log")" "--verify --strict $RG/claude"
+o="$(env -u SPIKE_LIVE PATH="$RG:$PATH" /bin/bash -c '. "$1"; spike_register_cli claude' _ "$COMMON" 2>&1; echo "RC=$?")"
+has "register in \$(...): spike_register_cli as the last command registers (rc 0; got [$o])" "$o" "RC=0"
+o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; echo "$(spike_mark_verified "$2" claude; echo "INNER=$?")"' _ "$COMMON" "$RG/claude" 2>&1)"
+has "register in nested \$(...): registers (rc 0; got [$o])" "$o" "INNER=0"
 
 # Verify in place: a CLI reached through a symlink on PATH is resolved ONCE to its real physical path; that real file is
 # verified, and that same real path is what executes. The executed path ($0 of the fixture) must equal the resolved real path,
@@ -1445,6 +1455,7 @@ wait
 EOF
 chmod +x "$SANDBOX/strl.sh"
 STRESS_BAD=0
+STRESS_INFO=""
 for i in 1 2 3 4 5 6 7 8 9 10; do
   rm -f "$SANDBOX/strl.pids"
   if [ $((i % 2)) -eq 0 ]; then sig=HUP; else sig=TERM; fi
@@ -1452,6 +1463,7 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
   STC=$!
   kill -s "$sig" "$STC" 2>/dev/null
   wait "$STC" 2>/dev/null
+  STRC=$?
   # Reset first: read leaves the variables alone when the file is missing (the launcher had not started yet).
   SL=""
   SG=""
@@ -1462,7 +1474,8 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
   while [ "$n" -lt 30 ] && { ours "$SL" strl.sh || ours "$SG" "sleep 33"; }; do sleep 0.1; n=$((n + 1)); done
   if ours "$SL" strl.sh || ours "$SG" "sleep 33"; then
     STRESS_BAD=$((STRESS_BAD + 1))
-    echo "stress survivor (iteration $i, signal $sig): launcher=$SL grandchild=$SG"
+    echo "stress survivor (iteration $i, signal $sig, caller pid $STC ended rc $STRC): launcher=[$SL] grandchild=[$SG] pidsfile=[$(cat "$SANDBOX/strl.pids" 2>/dev/null)]"
+    STRESS_INFO="$STRESS_INFO; it $i $sig rc=$STRC launcher=[$SL] grandchild=[$SG] ps=[$(ps -o pid=,ppid=,stat=,args= -p "${SL:-0},${SG:-0}" 2>/dev/null | tr '\n' '|')]"
     for p in "$SL" "$SG"; do
       if [ -n "$p" ]; then
         printf '  still alive: '
@@ -1472,7 +1485,7 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
     kill -9 "$SL" "$SG" 2>/dev/null
   fi
 done
-eq "stress: no command survives a TERM or HUP sent right after the start (bad runs of 10)" "0" "$STRESS_BAD"
+eq "stress: no command survives a TERM or HUP sent right after the start (bad runs of 10)$STRESS_INFO" "0" "$STRESS_BAD"
 
 # The caller's own TERM trap is restored after a run.
 out="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; trap "echo MYTRAP" TERM; spike_run_live 5 /dev/null true; trap -p TERM' _ "$COMMON" 2>/dev/null)"
@@ -1883,12 +1896,24 @@ for ppsub in run run-split; do
   done
 done
 PP_SELF="$(/bin/bash -c '. "$1"; _spike_self_pid; echo "$_SPIKE_SELF $$"' _ "$COMMON" 2>/dev/null)"
-eq "caller gone: _spike_self_pid is the shell's own pid" "${PP_SELF#* }" "${PP_SELF%% *}"
+eq "caller gone: _spike_self_pid is the shell's own pid [self/\$\$ = $PP_SELF]" "${PP_SELF#* }" "${PP_SELF%% *}"
 PP_SELF="$(/bin/bash -c '. "$1"; unset BASHPID; _spike_self_pid; echo "$_SPIKE_SELF $$"' _ "$COMMON" 2>/dev/null)"
-eq "caller gone: without BASHPID (bash 3.2) the pid comes from the exec'd sh and is the shell's own" "${PP_SELF#* }" "${PP_SELF%% *}"
-PP_SELF="$(/bin/bash -c '. "$1"; ( _spike_self_pid; echo "$_SPIKE_SELF $BASHPID" )' _ "$COMMON" 2>/dev/null)"
-eq "caller gone: inside a subshell it is the subshell's pid" "${PP_SELF#* }" "${PP_SELF%% *}"
-has "caller gone: common.sh passes the starting shell's pid to the helper" "$(cat "$COMMON_REAL")" 'SPIKE_IN_PARENT=$_SPIKE_SELF'
+eq "caller gone: without BASHPID (bash 3.2) the pid comes from the exec'd sh and is the shell's own [self/\$\$ = $PP_SELF]" "${PP_SELF#* }" "${PP_SELF%% *}"
+# Simulated bash 3.2 (we run bash 4+ here and BASH_VERSINFO is readonly): _spike_bash4 says no, and BASHPID is a plain, WRONG
+# variable (unset first so it is no longer special). The pid must still be the shell's own, never the planted value.
+PP_SELF="$(/bin/bash -c '. "$1"; _spike_bash4() { return 1; }; unset BASHPID; BASHPID=424242; _spike_self_pid; echo "$_SPIKE_SELF $$"' _ "$COMMON" 2>/dev/null)"
+eq "caller gone: on a simulated bash 3.2 a plain BASHPID variable is never trusted [self/\$\$ = $PP_SELF]" "${PP_SELF#* }" "${PP_SELF%% *}"
+PP_SELF="$(/bin/bash -c '. "$1"; _spike_bash4() { return 1; }; ( _spike_self_pid; sleep 2 & kid=$!; echo "$_SPIKE_SELF $(ps -o ppid= -p "$kid" 2>/dev/null | tr -d " ")"; kill "$kid" 2>/dev/null )' _ "$COMMON" 2>/dev/null)"
+eq "caller gone: on a simulated bash 3.2 inside a subshell it is the subshell's pid [self/ps ppid = $PP_SELF]" "${PP_SELF#* }" "${PP_SELF%% *}"
+# The expected subshell pid does not come from BASHPID or from the code under test: a child started in the subshell names the
+# subshell as its parent (ps), which is the very property the helper relies on.
+PP_SELF="$(/bin/bash -c '. "$1"; ( _spike_self_pid; sleep 2 & kid=$!; echo "$_SPIKE_SELF $(ps -o ppid= -p "$kid" 2>/dev/null | tr -d " ")"; kill "$kid" 2>/dev/null )' _ "$COMMON" 2>/dev/null)"
+eq "caller gone: inside a subshell it is the subshell's pid [self/ps ppid = $PP_SELF]" "${PP_SELF#* }" "${PP_SELF%% *}"
+PP_OUTER="$(/bin/bash -c '. "$1"; _spike_self_pid; outer=$_SPIKE_SELF; ( _spike_self_pid; echo "$outer $_SPIKE_SELF" )' _ "$COMMON" 2>/dev/null)"
+if [ "${PP_OUTER#* }" != "${PP_OUTER%% *}" ]; then ok "caller gone: the subshell's pid differs from the outer shell's [outer/sub = $PP_OUTER]"; else bad "caller gone: the subshell's pid differs from the outer shell's [outer/sub = $PP_OUTER]"; fi
+# Foreground helper calls carry no SPIKE_IN_PARENT; only _spike_exec (started with &) passes it.
+has "caller gone: _spike_exec passes the starting shell's pid" "$(cat "$COMMON_REAL")" 'SPIKE_IN_PARENT=$_SPIKE_SELF'
+lacks "caller gone: foreground helper calls (_spike_inputs) pass no parent pid" "$(sed -n '/^_spike_inputs() {/,/^}/p' "$COMMON_REAL")" "SPIKE_IN_PARENT"
 has "caller gone: runner.pl compares the parent pid before it starts the command" "$(cat "$RUNNER_REAL")" "the caller is already gone; nothing was started"
 # the live gate: no SPIKE_LIVE, no run
 rm -f "$SANDBOX/outprobe-ran" "$SANDBOX/sp-g-out" "$SANDBOX/sp-g-err"
