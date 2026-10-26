@@ -4,7 +4,7 @@ description: Runs builds, tests, linters and the compliance scan in a given work
 tools: Bash, Read, Grep, Glob
 disallowedTools: Edit, Write, NotebookEdit
 model: haiku
-effort: max
+effort: low
 maxTurns: 15
 color: green
 ---

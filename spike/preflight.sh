@@ -9,13 +9,15 @@
 #   - the CLI name is looked up on PATH inside the helper and resolved ONCE, physically;
 #   - a path inside a CLI home (compared by device and inode, for the account's password-database home and for an absolute
 #     HOME) is never read, except the provider binary itself: it is lstat-ed first (regular, owner-execute bit, >= 1 MiB, else refused
-#     without being opened), then the helper reads the magic and copies the binary for verification (the ratified narrow exception); a hard-linked file is refused before any read;
-#   - the file is opened once; a Mach-O is copied FROM THAT DESCRIPTOR into a private 0700 directory the helper made, and
-#     the COPY is checked with the fixed codesign (--verify --strict, a "Developer ID Application" authority, the pinned
-#     team of that CLI, and the chain-to-Apple requirement for that team); its sha256 is recorded;
-#   - only that registered copy is ever executed, for --version and for the status command, after its sha256 is checked
-#     again. The original path is never executed. If the copy cannot run, the row says "needs human review"; there is no
-#     fallback. Anything else (ad-hoc, unsigned, wrong team, script launcher, unknown file type) is never executed.
+#     without being opened), then the helper reads the magic and hashes the binary in place (the ratified narrow exception: it
+#     covers resolving, codesign-checking and executing the CLI binary path itself); a hard-linked file is refused before any read;
+#   - VERIFY IN PLACE (2026-10-26, no copy is made): the file is opened once, and the real physical path is checked with the
+#     fixed codesign (--verify --strict, a "Developer ID Application" authority, the pinned team of that CLI, and the
+#     chain-to-Apple requirement for that team); its sha256 is recorded;
+#   - only that registered real path is ever executed, for --version and for the status command, after its sha256 is checked
+#     again (a same-user process that replaces the binary between that check and exec is accepted for Phase 0; T-115/T-119
+#     own it). If it cannot run, the row says "needs human review"; there is no fallback. Anything else (ad-hoc, unsigned,
+#     wrong team, script launcher, unknown file type) is never executed.
 # jq and git are probed through the same helper with a closed environment (never with the caller's environment).
 # Sign-in state comes from the CLI's own status command and ONLY from its exit code: the output is discarded and never
 # printed or stored (it can contain account details).
@@ -91,14 +93,14 @@ check_tool() {
 }
 
 check_cli() { # check_cli <name> <signin-args...>
-  local name="$1" kind sig bin copy ver signin rc reg
+  local name="$1" kind sig bin vbin ver signin rc reg
   shift
   spike_register_cli "$name"
   reg=$?
   bin="$SPIKE_REG_PATH"
   kind="$SPIKE_REG_KIND"
   sig="$(printf '%s' "$SPIKE_SIG_TEXT" | clean | spike_redact | cut -c1-72)"
-  copy="$SPIKE_VERIFIED_COPY"
+  vbin="$SPIKE_VERIFIED_BIN"
   if [ "$SPIKE_REG_STATUS" = "notfound" ]; then
     printf "$ROW_FMT" "$name" "no" "-" "-" "-" "-" "not installed"
     return 0
@@ -106,7 +108,7 @@ check_cli() { # check_cli <name> <signin-args...>
   if [ "$reg" -ne 0 ]; then
     case "$SPIKE_REG_STATUS" in
       clihome)
-        add_note "$name resolves inside a CLI home directory and was NOT read (rule 4). Only the provider binary itself may be read, and only if it is a regular owner-executable file of at least 1 MiB; the helper reads the magic, then copies the binary for verification." ;;
+        add_note "$name resolves inside a CLI home directory and was NOT read (rule 4). Only the provider binary itself may be read, and only if it is a regular owner-executable file of at least 1 MiB; the helper reads the magic, then hashes and verifies the binary in place." ;;
       hardlink)
         add_note "$name is a hard-linked file; it could be a second name for a file inside a CLI home, so it was NOT read and NOT executed (rule 4)." ;;
       script)
@@ -115,8 +117,8 @@ check_cli() { # check_cli <name> <signin-args...>
         add_note "$name was NOT executed: its file type is not a Mach-O binary (rule 6)." ;;
       unresolvable|badpath|badcli|error)
         add_note "$name could not be resolved and opened safely and was NOT executed (rule 6)." ;;
-      copyfail)
-        add_note "$name could not be copied to a private directory and was NOT executed (rule 6)." ;;
+      recordfail)
+        add_note "$name verification could not be recorded and it was NOT executed (rule 6)." ;;
       *)
         add_note "$name was NOT executed because its code signature did not verify as the pinned vendor signer (rule 6)." ;;
     esac
@@ -125,7 +127,7 @@ check_cli() { # check_cli <name> <signin-args...>
   fi
 
   : > "$TMPOUT"
-  spike_run_status 20 "$TMPOUT" "$copy" --version
+  spike_run_status 20 "$TMPOUT" "$vbin" --version
   rc=$?
   if [ "$rc" -eq 0 ]; then
     ver="$(first_line "$TMPOUT" 26)"
@@ -133,13 +135,13 @@ check_cli() { # check_cli <name> <signin-args...>
     ver="timeout"
   elif [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
     ver="needs human review"
-    add_note "$name: the verified copy could not run (rc=$rc). Needs human review; the original path was NOT used."
+    add_note "$name: the registered, verified binary could not run (rc=$rc). Needs human review; no other path was tried (there is no fallback)."
   else
     ver="error (rc=$rc)"
   fi
 
   # Sign-in: documented status command, exit code only (output discarded).
-  spike_run_status 20 /dev/null "$copy" "$@"
+  spike_run_status 20 /dev/null "$vbin" "$@"
   rc=$?
   if [ "$rc" -eq 0 ]; then
     signin="signed in"

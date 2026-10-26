@@ -27,7 +27,7 @@ test-runner (haiku), compliance-auditor (sonnet), reviewer (opus), docs (haiku).
    a. compliance-auditor (always for adapters, spawning, scheduling, file access, networking or UI copy);
    b. reviewer;
    c. a Codex review run in the worktree (my own Codex login and ~/.codex/config.toml model settings):
-      cd <worktree> && codex exec --sandbox read-only "Review git diff main...HEAD against the brief in docs/tasks/ and HANDOFF.md. Check docs/HARD_RULES.md too. List bugs and risks with file:line. Do not modify files."
+      cd <worktree> && codex exec --sandbox read-only "Review git diff main...HEAD against the brief in docs/tasks/ and docs/handoffs/. Check docs/HARD_RULES.md too. List bugs and risks with file:line. Do not modify files."
    Any BLOCK goes back to the implementer with the findings.
 7. Before reporting, check each passing branch for conflicts: `git merge-tree --write-tree HEAD <branch>`.
    A non-zero exit means conflicts: say which branch must be rebased and re-tested.

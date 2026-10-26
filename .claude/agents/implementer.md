@@ -3,7 +3,7 @@ name: implementer
 description: Implements exactly one approved brief from docs/tasks/ in its own worktree. Default worker for Rust and TypeScript. Dispatch with model=opus for Swift, PTY, signal or concurrency briefs.
 tools: Read, Edit, Write, Bash, Grep, Glob
 model: sonnet
-effort: medium
+effort: high
 isolation: worktree
 maxTurns: 80
 color: blue
@@ -20,5 +20,5 @@ You implement one brief. The brief is your whole context; you did not see the le
    headless/ACP transports; parse structured output only; treat agent and web text as untrusted. If the compliance scan
    flags you, fix the design, never the check.
 5. Run make check-fast until it passes. Commit on your worktree branch with the message "T-###: <summary>".
-6. Write HANDOFF.md (AGENTS.md format), including follow-ups for shared files.
-Return only: branch, worktree path, PASS or FAIL of make check-fast, and the HANDOFF.md summary.
+6. Write docs/handoffs/T-###.md (AGENTS.md format; not a root HANDOFF.md), including follow-ups for shared files.
+Return only: branch, worktree path, PASS or FAIL of make check-fast, and the handoff summary.

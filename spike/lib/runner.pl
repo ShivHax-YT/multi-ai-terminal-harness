@@ -1,4 +1,6 @@
 #!/usr/bin/perl
+# FROZEN (ShivHax-YT, 2026-10-26): Phase 0 spike helper. No new hardening rounds; Phase 1 T-115 (binary verifier) and T-119 (runner) replace it in Rust.
+#
 # spike/lib/runner.pl: the ONE helper behind spike/lib/common.sh (round 7). Every security decision of the spike
 # scaffold is made here, in one process per call, by file identity instead of path strings:
 #
@@ -16,8 +18,9 @@
 #     compliance/denylist.txt (located from this file's own physical path), and every operation fails closed (rc 121 and one
 #     fixed message) if that file is missing, empty or malformed (round 8)
 #   - a file is opened ONCE (O_RDONLY|O_NOFOLLOW|O_NOCTTY|O_NONBLOCK), checked with fstat, read from that descriptor
-#   - registration copies from that descriptor into a private 0700 directory this helper creates, runs the fixed
-#     codesign on the COPY, records the copy's sha256, and a status run re-hashes the copy before it is executed
+#   - registration VERIFIES IN PLACE: it resolves the installed CLI to its real physical path, runs the fixed codesign on THAT
+#     file, records its sha256 in the registry of a private 0700 directory this helper creates (no copy of the binary is ever
+#     made), and a run re-hashes that file and then executes that same real path
 #   - a run puts the helper at the head of a NEW process group and forks the command into that group; the helper watches
 #     the timeout, its caller (parent pid changes when the caller dies) and TERM/INT/HUP, and kills the whole group
 #   - a run refuses (rc 125) unless the caller's HOME is the password-database home (same device and inode); the child's HOME
@@ -59,6 +62,8 @@ use constant DENY_FAIL_MSG => 'the CLI-home denylist (compliance/denylist.txt) i
 my %IN;      # the caller's inputs, copied from SPIKE_IN_* at start
 my $CWD;     # physical cwd at start (relative inputs are made absolute from it)
 my $ORIG_PPID = getppid();    # the caller; a different parent pid later means the caller died
+# run / run-split replace it with the pid the caller says it is (SPIKE_IN_PARENT): a caller that died before this process got
+# here has already been replaced by the reaper, and getppid() at start would then name the reaper as "the caller".
 
 $| = 1;
 
@@ -500,7 +505,7 @@ sub cmd_vdir_remove {
     return 0;
 }
 
-# registry: lines "<sha256>\t<cli>\t<physical copy path>\n" in <vdir>/.registry
+# registry: lines "<sha256>\t<cli>\t<physical path of the installed binary>\n" in <vdir>/.registry
 sub registry_add {
     my ($vdir, $sha, $cli, $path) = @_;
     my $fh;
@@ -508,6 +513,18 @@ sub registry_add {
     my $ok = syswrite($fh, "$sha\t$cli\t$path\n");
     close $fh;
     return $ok ? 1 : 0;
+}
+
+# registry_sha(path) -> the sha256 of a registered file, read in place, or undef. The registered file is the real installed
+# binary, which may lie inside a CLI home (the ratified narrow exception), so it is lstat-ed FIRST and opened only if it is a
+# regular, single-link file; inside a CLI home it must also look like a vendor binary (owner-execute bit, at least 1 MiB). A
+# credential file swapped in at that path is therefore never opened.
+sub registry_sha {
+    my ($path) = @_;
+    my @l = lstat($path);
+    return unless @l && S_ISREG($l[2]) && !S_ISLNK($l[2]) && $l[3] == 1;
+    return if under_cli_home($path) && !home_binary_ok(@l);
+    return sha_of_path($path);
 }
 
 # registry_ok(vdir, path) -> 1 only if <path> is registered and its CURRENT content still has the recorded sha256.
@@ -526,7 +543,7 @@ sub registry_ok {
         $want = $sha;
     }
     return 0 unless defined $want;
-    my $have = sha_of_path($path);
+    my $have = registry_sha($path);
     return (defined $have && $have eq $want) ? 1 : 0;
 }
 
@@ -540,6 +557,7 @@ my $CAP_SIG = 0;
 sub run_capture {
     my ($secs, @argv) = @_;
     my ($rd, $wr);
+    POSIX::_exit(143) if getppid() != $ORIG_PPID;    # the caller is already gone: start no codesign
     pipe($rd, $wr) or return (-1, '', 0);
     my $mask = POSIX::SigSet->new(POSIX::SIGTERM(), POSIX::SIGINT(), POSIX::SIGHUP());
     my $old  = POSIX::SigSet->new();
@@ -598,7 +616,7 @@ sub run_capture {
     return ($timed ? -1 : $rc, $out, $timed);
 }
 
-# verify_signer(copy, cli) -> (ok, signature text). Only CODESIGN_BIN is run, only on the copy path.
+# verify_signer(path, cli) -> (ok, signature text). Only CODESIGN_BIN is run, only on the real path being registered.
 sub verify_signer {
     my ($bin, $cli) = @_;
     my $want = $PINNED{$cli};
@@ -653,7 +671,7 @@ sub home_binary_ok {
     return 1;
 }
 
-# register <vdir> <cli> <path|name> <src>: one open, one copy, one signer check, one registry line.
+# register <vdir> <cli> <path|name> <src>: one open, one hash, one in-place signer check, one registry line (no copy).
 sub cmd_register {
     my ($vdir, $cli, $mode, $src) = @_;
     return usage('register <vdir> <cli> <path|name> <src>') unless defined $src;
@@ -728,8 +746,8 @@ sub cmd_register {
         return emit_result(%r);
     }
 
-    # The first read is the 4-byte magic. For a Mach-O the whole file is then copied (it IS the vendor binary: the ratified
-    # narrow exception for a binary inside a CLI home) so that the COPY can be verified and run.
+    # The first read is the 4-byte magic. For a Mach-O the whole file is then hashed and codesign-checked in place (it IS the
+    # vendor binary: the ratified narrow exception for a binary inside a CLI home covers reading, checking and running it).
     my $head = '';
     sysread($fh, $head, 4);
     if (!is_macho($head)) {
@@ -757,64 +775,35 @@ sub cmd_register {
         return emit_result(%r);
     }
 
-    # Copy from the SAME descriptor into the private directory.
-    my $old = umask(077);
-    my $copy = "$vdir/$cli";
-    my $n = 1;
-    while ((-e $copy || -l $copy) && $n < 1000) { $n++; $copy = "$vdir/$cli.$n"; }
-    my $out;
-    my $copied = 0;
-    if (sysopen($out, $copy, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0700)) {
-        sysseek($fh, 0, 0);
-        my $buf;
-        $copied = 1;
-        while (1) {
-            my $got = sysread($fh, $buf, 65536);
-            unless (defined $got) { $copied = 0; last; }
-            last unless $got;
-            my $off = 0;
-            while ($off < $got) {
-                my $w = syswrite($out, $buf, $got - $off, $off);
-                unless (defined $w) { $copied = 0; last; }
-                $off += $w;
-            }
-            last unless $copied;
-        }
-        close $out;
-    }
-    umask($old);
+    # VERIFY IN PLACE. Record the sha256 of the descriptor we opened, run the fixed codesign on the real physical path, then
+    # check that the file at that path is still the same file (identity) with the same content. No copy is made anywhere.
+    my $sha = sha_of_fh($fh);
     close $fh;
-    unless ($copied) {
-        unlink($copy);
-        $r{STATUS} = 'copyfail';
-        $r{SIG}    = 'NOT VERIFIED (private copy failed)';
-        return emit_result(%r);
-    }
-    chmod(0700, $copy);
-    my $sha = sha_of_path($copy);
     unless (defined $sha) {
-        unlink($copy);
-        $r{STATUS} = 'copyfail';
-        $r{SIG}    = 'NOT VERIFIED (private copy failed)';
+        $r{STATUS} = 'recordfail';
+        $r{SIG}    = 'NOT VERIFIED (cannot hash the binary)';
         return emit_result(%r);
     }
-    my ($ok, $text) = verify_signer($copy, $cli);
-    my $again = sha_of_path($copy);
-    if ($ok && (!defined $again || $again ne $sha)) { $ok = 0; $text = 'NOT VERIFIED (the private copy changed while it was checked)'; }
+    my ($ok, $text) = verify_signer($path, $cli);
+    my @after = lstat($path);
+    my $again = registry_sha($path);
+    if ($ok && (!@after || ident(@after) ne ident(@fs) || !defined $again || $again ne $sha)) {
+        $ok   = 0;
+        $text = 'NOT VERIFIED (the binary changed while it was checked)';
+    }
     if (!$ok) {
-        unlink($copy);
         $r{STATUS} = 'signer';
         $r{SIG}    = $text;
         return emit_result(%r);
     }
-    unless (registry_add($vdir, $sha, $cli, $copy)) {
-        unlink($copy);
-        $r{STATUS} = 'copyfail';
-        $r{SIG}    = 'NOT VERIFIED (cannot record the copy)';
+    unless (registry_add($vdir, $sha, $cli, $path)) {
+        $r{STATUS} = 'recordfail';
+        $r{SIG}    = 'NOT VERIFIED (cannot record the verification)';
         return emit_result(%r);
     }
+    # COPY is the historical field name (spike_register_cli / $SPIKE_VERIFIED_COPY): it is the verified REAL path now.
     $r{STATUS} = 'verified';
-    $r{COPY}   = $copy;
+    $r{COPY}   = $path;
     $r{SIG}    = $text;
     return emit_result(%r);
 }
@@ -921,7 +910,7 @@ sub tool_resolve {
 }
 
 # live_pinned_ok(vdir, cmd, resolved path) -> 0 if the command is named like a pinned CLI (claude, codex), by argv[0] or by the
-# resolved target, and is not the CURRENT registered, hash-verified copy (rule 6).
+# resolved target, and is not the CURRENT registered, hash-verified binary (rule 6).
 sub live_pinned_ok {
     my ($vdir, $cmd, $path) = @_;
     return 1 unless pinned_name(base_lc($cmd)) || pinned_name(base_lc($path));
@@ -1131,18 +1120,22 @@ sub run_core {
     return usage('bad timeout') unless $secs =~ /\A[0-9]{1,4}\z/ && $secs >= 1 && $secs <= 3600;
     $secs = $secs + 0;
     return usage('bad output file') unless defined $outfile && length $outfile && !has_ctl($outfile);
+    # The caller's pid arrives as input (digits only). If this process is no longer its child, the caller is already gone:
+    # nothing is started.
+    return usage('run: SPIKE_IN_PARENT is missing or not a pid') unless defined $IN{PARENT} && $IN{PARENT} =~ /\A[1-9][0-9]{0,9}\z/;
+    if (getppid() != $ORIG_PPID) { msg('run: the caller is already gone; nothing was started'); return 143; }
     my $r = resolve_phys($path);
     unless ($r && $r->{exists} && $r->{path} eq $path) { msg('run: not an exact physical path'); return 125; }
     # The policy is enforced again here, in the process that executes.
     if ($mode eq 'live') {
         unless (defined $IN{LIVE} && $IN{LIVE} eq '1') { msg('run: live mode needs SPIKE_LIVE=1'); return 125; }
         my ($v) = authorize('live', $vdir, $path, @args);
-        unless ($v eq 'ok') { msg('run: a pinned CLI name runs only as the current registered, hash-verified copy'); return 125; }
+        unless ($v eq 'ok') { msg('run: a pinned CLI name runs only as the current registered, hash-verified binary'); return 125; }
     } elsif ($mode eq 'ungated') {
         unless (ungated_ok($path, $path, $vdir, @args)) { msg('run: not ungated'); return 125; }
     } elsif ($mode eq 'status') {
         my ($v) = authorize('status', $vdir, $path, @args);
-        unless ($v eq 'ok') { msg('run: not a verified copy, or not a status shape'); return 125; }
+        unless ($v eq 'ok') { msg('run: not the registered, hash-verified binary, or not a status shape'); return 125; }
     } elsif ($mode eq 'tool') {
         my ($v) = authorize('tool', $vdir, $path, @args);
         unless ($v eq 'ok') { msg('run: not a tool probe'); return 125; }
@@ -1166,7 +1159,6 @@ sub run_core {
             return 125;
         }
     }
-    my $orig_ppid = getppid();
     my %env = child_env();
 
     my $mask = POSIX::SigSet->new(POSIX::SIGTERM(), POSIX::SIGINT(), POSIX::SIGHUP());
@@ -1207,7 +1199,7 @@ sub run_core {
         if ($w == $pid) { $status = $?; last; }
         if ($w < 0) { $status = 0; last; }
         if ($sigged) { sweep(1, $pid); waitpid($pid, 0); return $sigged; }
-        if (getppid() != $orig_ppid) { sweep(1, $pid); waitpid($pid, 0); return 143; }
+        if (getppid() != $ORIG_PPID) { sweep(1, $pid); waitpid($pid, 0); return 143; }
         if (((POSIX::times())[0] - $t0) / $hz >= $secs) { sweep(1, $pid); waitpid($pid, 0); return 124; }
         select(undef, undef, undef, 0.05);
     }
@@ -1258,10 +1250,11 @@ sub cmd_tool_path {
 sub main {
     my ($sub, @a) = @_;
     $CWD = Cwd::getcwd();
-    for my $k (qw(PATH HOME TMPDIR LANG TERM USER LOGNAME LIVE)) {
+    for my $k (qw(PATH HOME TMPDIR LANG TERM USER LOGNAME LIVE PARENT)) {
         $IN{$k} = $ENV{"SPIKE_IN_$k"} if exists $ENV{"SPIKE_IN_$k"};
     }
     %ENV = ();
+    $ORIG_PPID = $IN{PARENT} + 0 if defined $IN{PARENT} && $IN{PARENT} =~ /\A[1-9][0-9]{0,9}\z/;
     return usage('runner.pl <subcommand> ...') unless defined $sub;
     # Fail closed: without a usable compliance/denylist.txt no operation of this helper runs.
     unless (denylist_ok()) { msg(DENY_FAIL_MSG); return DENY_FAIL_RC; }

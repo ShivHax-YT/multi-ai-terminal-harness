@@ -10,13 +10,13 @@ all-Opus setup (illustrative API-price math; Anthropic doesn't publish per-model
 |---|---|---|---|---|
 | Lead (main session) | Opus, high; xhigh in plan mode | 1 | Shared-file integration commits only | Always |
 | architect | Opus, xhigh | 0-1 | No, docs/ only | Big designs (keeps the lead's context clean) |
-| implementer | Sonnet, medium; Opus per call for Swift/PTY/concurrency | 2-3 parallel, max 1 on Opus | Yes, own worktree | Each brief |
-| scout | Haiku, max | up to 4 parallel | No | Fact-finding before a brief |
-| test-runner | Haiku, max | 1 per finished branch | No | After each implementer |
-| compliance-auditor | Sonnet, medium | 1 per relevant branch | No | Branches touching adapters/spawning/scheduling/files/network/UI copy |
+| implementer | Sonnet, high; Opus per call for Swift/PTY/concurrency | 2-3 parallel, max 1 on Opus | Yes, own worktree | Each brief |
+| scout | Haiku, low | up to 4 parallel | No | Fact-finding before a brief |
+| test-runner | Haiku, low | 1 per finished branch | No | After each implementer |
+| compliance-auditor | Sonnet, high | 1 per relevant branch | No | Branches touching adapters/spawning/scheduling/files/network/UI copy |
 | reviewer | Opus, high | 1 per branch | No | Before merge |
 | GPT checker | Codex on your ChatGPT login (`/xreview` or codex-plugin-cc) | 1 per branch | No | Last gate before merge |
-| docs | Haiku, max | 1 | Markdown only | After merge |
+| docs | Haiku, low | 1 | Markdown only | After merge |
 
 Peak load: lead + 3 writers + 4 read-only scouts. Typical: 4-5 agents. On Max 5x start with 2 writers. All Claude
 subagents share the same 5-hour and weekly limits; parallel bursts cause 429/529 errors. When Claude limits run low,

@@ -3,7 +3,7 @@ name: scout
 description: Read-only codebase survey. Lists files, symbols, call chains and existing patterns with file:line refs. Use when the lead needs facts, not judgement.
 tools: Read, Grep, Glob
 model: haiku
-effort: max
+effort: low
 maxTurns: 30
 color: cyan
 ---

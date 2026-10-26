@@ -473,8 +473,9 @@ eq "run_timeout refuses an unverified claude auth status without SPIKE_LIVE (rc)
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/codex" login status' _ "$COMMON" "$FAKE" 2>/dev/null
 eq "run_timeout refuses an unverified codex login status without SPIKE_LIVE (rc)" "3" "$?"
 eq "refused unverified status calls did not start the CLIs" "0" "$(ran)"
-# The registered copies are Mach-O-headed fixtures whose signer passes the fake pinned check. Registration COPIES the source
-# into the private verify directory; spike_run_status takes the copy (SPIKE_VERIFIED_COPY), never the source.
+# The registered binaries are Mach-O-headed fixtures whose signer passes the fake pinned check. Registration VERIFIES IN PLACE
+# (2026-10-26; no copy is made): spike_run_status takes the verified real path ($SPIKE_VERIFIED_BIN; $SPIKE_VERIFIED_COPY is its
+# historical alias, the same value). In labels below, "copy" is that historical name for the registered, verified binary.
 REG="$FAKE/reg"
 sbx_mkdir "$REG"
 mkmacho "$REG/claude" <<EOF
@@ -498,10 +499,23 @@ rm -f "$FAKE"/ran-*
 o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude && spike_run_live 5 /dev/null "$SPIKE_VERIFIED_COPY" -p hi; echo CONTINUED' _ "$COMMON" "$REG" 2>/dev/null)"
 eq "spike_run_live of the registered copy still needs SPIKE_LIVE=1 (rc 3)" "3" "$?"
 eq "the registered copy was not started without SPIKE_LIVE=1" "0" "$(ran)"
-o="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude || exit 9; printf "%s\n" "#!/bin/sh" "touch \"$3/ran-swapped\"" >| "$SPIKE_VERIFIED_COPY"; spike_run_live 5 /dev/null "$SPIKE_VERIFIED_COPY" -p hi; echo CONTINUED' _ "$COMMON" "$REG" "$FAKE" 2>/dev/null)"
-eq "spike_run_live refuses a registered copy whose content changed after registration (rc 3)" "3" "$?"
+# Verify in place: the registered path IS the installed file, so a "swap after registration" test overwrites that file. Each swap
+# test therefore gets its own fixture (mkswap), never the shared $REG ones.
+mkswap() { # mkswap <dir>: a fresh registrable claude fixture in its own directory
+  sbx_mkdir "$1"
+  sbx_cp "$REG/claude" "$1/claude"
+}
+mkswap "$SANDBOX/swap-live"
+o="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude || exit 9; printf "%s\n" "#!/bin/sh" "touch \"$3/ran-swapped\"" >| "$SPIKE_VERIFIED_BIN"; spike_run_live 5 /dev/null "$SPIKE_VERIFIED_BIN" -p hi; echo CONTINUED' _ "$COMMON" "$SANDBOX/swap-live" "$FAKE" 2>/dev/null)"
+eq "spike_run_live refuses a registered binary whose content changed after registration, before exec (rc 3)" "3" "$?"
+lacks "spike_run_live: the swapped-binary refusal stops the caller" "$o" "CONTINUED"
 check_absent() { if [ ! -e "$2" ]; then ok "$1"; else bad "$1"; fi; }
-check_absent "the changed registered copy never ran under spike_run_live" "$FAKE/ran-swapped"
+check_absent "the changed registered binary never ran under spike_run_live" "$FAKE/ran-swapped"
+mkswap "$SANDBOX/swap-alias"
+o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude || exit 9; [ -n "$SPIKE_VERIFIED_BIN" ] && [ "$SPIKE_VERIFIED_COPY" = "$SPIKE_VERIFIED_BIN" ] && [ "$SPIKE_VERIFIED_BIN" = "$2/claude" ] && echo SAME' _ "$COMMON" "$SANDBOX/swap-alias" 2>/dev/null)"
+eq "SPIKE_VERIFIED_COPY (historical name) is the same value as SPIKE_VERIFIED_BIN, the verified real path" "SAME" "$o"
+o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude; [ -n "$SPIKE_VERIFIED_BIN" ]; spike_mark_verified "$3/claude" claude; echo "BIN=[$SPIKE_VERIFIED_BIN] COPY=[$SPIKE_VERIFIED_COPY]"' _ "$COMMON" "$SANDBOX/swap-alias" "$SANDBOX/no-such-dir" 2>/dev/null)"
+eq "after a refused registration both SPIKE_VERIFIED_BIN and SPIKE_VERIFIED_COPY are empty" "BIN=[] COPY=[]" "$o"
 eq "spike_run_live of a registered copy of codex under the codex name (rc 0)" "0" "$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_mark_verified "$2/codex" codex && spike_run_live 5 /dev/null "$SPIKE_VERIFIED_COPY" exec hi' _ "$COMMON" "$REG" >/dev/null 2>&1; echo $?)"
 rm -f "$FAKE"/ran-*
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_timeout 5 /dev/null "$2/claude" --version extra' _ "$COMMON" "$FAKE" 2>/dev/null
@@ -771,30 +785,81 @@ if [ "$(head -c 4 /bin/sh | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
   env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_run_status 5 /dev/null "$2" --version' _ "$COMMON" "$RG/dash-claude" >/dev/null 2>&1
   eq "a dash copy named claude is never run through spike_run_status (rc 3)" "3" "$?"
 fi
-# Positive: a Mach-O-headed copy that passes the fake pinned signer for claude registers (rc 0). The fake codesign was asked
-# about the COPY (inside the private verify directory) with the chain requirement. The status run reaches exec.
+# Positive (VERIFY IN PLACE, 2026-10-26): a Mach-O-headed binary that passes the fake pinned signer for claude registers (rc 0).
+# The fake codesign was asked about the REAL path (not a copy, nothing inside a verify directory) with the chain requirement.
+# The status run reaches exec.
 fsmode good
 : >| "$FSDIR/log"
-COPY="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude && printf "%s" "$SPIKE_VERIFIED_COPY"' _ "$COMMON" "$RG/claude" 2>/dev/null)"
-eq "registration accepts a Mach-O copy that passes the pinned signer (rc 0)" "0" "$?"
-case "$COPY" in "$SANDBOX"/spike-verify.*/claude) ok "the registered copy lives in the private verify directory" ;; *) bad "the registered copy lives in the private verify directory ($COPY)" ;; esac
-has "registration asked codesign about the COPY path (verify)" "$(cat "$FSDIR/log")" "--verify --strict $COPY"
-lacks "registration never asked codesign about the original path" "$(cat "$FSDIR/log")" "$RG/claude"
+COPY="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude && printf "%s" "$SPIKE_VERIFIED_BIN"' _ "$COMMON" "$RG/claude" 2>/dev/null)"
+eq "registration accepts a Mach-O binary that passes the pinned signer (rc 0)" "0" "$?"
+eq "the verified path is the real physical path of the installed file (no copy)" "$RG/claude" "$COPY"
+has "registration asked codesign to verify the REAL path in place" "$(cat "$FSDIR/log")" "--verify --strict $RG/claude"
+has "registration asked codesign for the signer details of the REAL path in place" "$(cat "$FSDIR/log")" "-dv --verbose=2 $RG/claude"
+lacks "no codesign call named a private verify directory (no copy exists)" "$(cat "$FSDIR/log")" "spike-verify."
 has "registration checked the chain-to-Apple requirement for the pinned team (round 8: with the Developer ID leaf OID)" "$(cat "$FSDIR/log")" 'anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "Q6L2SF6YDW"'
 rm -f "$FAKE"/ran-*
-env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude && spike_run_status 5 /dev/null "$SPIKE_VERIFIED_COPY" --version' _ "$COMMON" "$RG/claude" >/dev/null 2>&1
+env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude && spike_run_status 5 /dev/null "$SPIKE_VERIFIED_BIN" --version' _ "$COMMON" "$RG/claude" >/dev/null 2>&1
 eq "registered binary passes the identity check and runs through spike_run_status (rc 0)" "0" "$?"
 eq "registered binary ran once" "1" "$(ran)"
+# Foreground helper calls pass no SPIKE_IN_PARENT, so registering from a $(...) context (where some bash versions exec the
+# last command in place and the helper's parent is the outer shell) must succeed through the library, with no explicit parent.
+: >| "$FSDIR/log"
+o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude' _ "$COMMON" "$RG/claude" 2>&1; echo "RC=$?")"
+has "register in \$(...): spike_mark_verified as the last command registers (rc 0; got [$o])" "$o" "RC=0"
+has "register in \$(...): codesign was really asked about the binary" "$(cat "$FSDIR/log")" "--verify --strict $RG/claude"
+o="$(env -u SPIKE_LIVE PATH="$RG:$PATH" /bin/bash -c '. "$1"; spike_register_cli claude' _ "$COMMON" 2>&1; echo "RC=$?")"
+has "register in \$(...): spike_register_cli as the last command registers (rc 0; got [$o])" "$o" "RC=0"
+o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; echo "$(spike_mark_verified "$2" claude; echo "INNER=$?")"' _ "$COMMON" "$RG/claude" 2>&1)"
+has "register in nested \$(...): registers (rc 0; got [$o])" "$o" "INNER=0"
 
-# Sonnet audit: the registry binds CONTENT, not only a path. A copy changed after registration is refused before exec.
+# Verify in place: a CLI reached through a symlink on PATH is resolved ONCE to its real physical path; that real file is
+# verified, and that same real path is what executes. The executed path ($0 of the fixture) must equal the resolved real path,
+# and no copy of the binary may exist anywhere in the sandbox.
+IP="$SANDBOX/inplace"
+sbx_mkdir "$IP/real" "$IP/bin"
+mkmacho "$IP/real/claude" <<EOF
+# UNIQUE-INPLACE-9f3e1c
+echo "\$0" >> "$IP/exec.log"
+exit 0
+EOF
+sbx_ln "$IP/real/claude" "$IP/bin/claude"
+: >| "$FSDIR/log"
+o="$(env -u SPIKE_LIVE PATH="$IP/bin:$PATH" /bin/bash -c '. "$1"; spike_register_cli claude; r=$?; spike_run_status 5 /dev/null "$SPIKE_VERIFIED_BIN" --version; echo "REG=$r RUN=$? BIN=$SPIKE_VERIFIED_BIN COPY=$SPIKE_VERIFIED_COPY PATHREPORT=$SPIKE_REG_PATH VD=$(spike_verify_dir)"' _ "$COMMON" 2>/dev/null)"
+has "in place: registration through a symlink on PATH succeeded (rc 0)" "$o" "REG=0 "
+has "in place: the status run of the verified path succeeded (rc 0)" "$o" "RUN=0 "
+has "in place: SPIKE_VERIFIED_BIN is the resolved real path, not the symlink" "$o" "BIN=$IP/real/claude "
+has "in place: SPIKE_VERIFIED_COPY (historical name) is the same real path" "$o" "COPY=$IP/real/claude "
+has "in place: the reported resolved path is the real path" "$o" "PATHREPORT=$IP/real/claude "
+eq "in place: the executed path equals the resolved real path" "$IP/real/claude" "$(cat "$IP/exec.log" 2>/dev/null)"
+has "in place: codesign verified the resolved real path" "$(cat "$FSDIR/log")" "--verify --strict $IP/real/claude"
+lacks "in place: codesign was never asked about the symlink spelling" "$(cat "$FSDIR/log")" "$IP/bin/claude"
+lacks "in place: codesign was never asked about a verify directory" "$(cat "$FSDIR/log")" "spike-verify."
+IPVD="${o##*VD=}"
+check "in place: the verify directory exists (registry only)" test -f "$IPVD/.registry"
+eq "in place: the verify directory holds no binary (registry and owner file only)" ".owner
+.registry" "$(ls -A "$IPVD")"
+eq "in place: the binary exists exactly once in the sandbox (no copy anywhere)" "$IP/real/claude" "$(grep -r -D skip -l 'UNIQUE-INPLACE-9f3e1c' "$SANDBOX" 2>/dev/null)"
+
+# Sonnet audit: the registry binds CONTENT, not only a path. A binary changed after registration is refused before exec.
+# (The registered path IS the installed file, so each swap test uses its own fixture.)
+mkswap "$SANDBOX/swap-status"
 rm -f "$FAKE"/ran-*
-o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude || exit 9; printf "%s\n" "#!/bin/sh" "touch \"$3/ran-swapped\"" >| "$SPIKE_VERIFIED_COPY"; spike_run_status 5 /dev/null "$SPIKE_VERIFIED_COPY" --version; echo CONTINUED' _ "$COMMON" "$RG/claude" "$FAKE" 2>/dev/null)"
-eq "a registered copy swapped after registration is refused (rc 3)" "3" "$?"
-lacks "a swapped copy stops the caller" "$o" "CONTINUED"
-check "the swapped copy never ran" test ! -e "$FAKE/ran-swapped"
+o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude || exit 9; printf "%s\n" "#!/bin/sh" "touch \"$3/ran-swapped\"" >| "$SPIKE_VERIFIED_BIN"; spike_run_status 5 /dev/null "$SPIKE_VERIFIED_BIN" --version; echo CONTINUED' _ "$COMMON" "$SANDBOX/swap-status" "$FAKE" 2>/dev/null)"
+eq "a registered binary swapped after registration is refused before exec (rc 3)" "3" "$?"
+lacks "a swapped binary stops the caller" "$o" "CONTINUED"
+check "the swapped binary never ran" test ! -e "$FAKE/ran-swapped"
 eq "no registered fixture ran either" "0" "$(ran)"
-o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude || exit 9; rm -f "$SPIKE_VERIFIED_COPY"; ln -s "$2" "$SPIKE_VERIFIED_COPY"; spike_run_status 5 /dev/null "$SPIKE_VERIFIED_COPY" --version; echo CONTINUED' _ "$COMMON" "$RG/claude" 2>/dev/null)"
-eq "a registered copy replaced by a symlink to the (once verified) original is refused (rc 3)" "3" "$?"
+# Swapped for ANOTHER validly signed Mach-O (different content, new inode): the recorded sha256 no longer matches.
+mkswap "$SANDBOX/swap-other"
+sbx_cp "$REG/codex" "$SANDBOX/swap-other/other"
+o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude || exit 9; mv -f "$2/other" "$2/claude"; spike_run_status 5 /dev/null "$SPIKE_VERIFIED_BIN" --version; echo CONTINUED' _ "$COMMON" "$SANDBOX/swap-other" 2>/dev/null)"
+eq "a registered binary replaced by another Mach-O (new inode, new content) is refused before exec (rc 3)" "3" "$?"
+lacks "the replacement stops the caller" "$o" "CONTINUED"
+eq "the replacement Mach-O never ran" "0" "$(ran)"
+# Replaced by a symlink to the (once verified) original, which was moved aside: the symlink resolves to a different, unregistered path.
+mkswap "$SANDBOX/swap-link"
+o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude || exit 9; mv "$2/claude" "$2/claude.orig"; ln -s "$2/claude.orig" "$2/claude"; spike_run_status 5 /dev/null "$SPIKE_VERIFIED_BIN" --version; echo CONTINUED' _ "$COMMON" "$SANDBOX/swap-link" 2>/dev/null)"
+eq "a registered path replaced by a symlink to the (once verified) original is refused (rc 3)" "3" "$?"
 eq "the symlinked original never ran" "0" "$(ran)"
 
 # --- Opus finding 1: a fake perl first on PATH has no effect ---------------------------------------------------------------
@@ -1196,8 +1261,12 @@ PATH="$SANDBOX/probebin2:$PATH" spike_run_timed 5 "$PROBE" jq --version >/dev/nu
 eq "spike_run_timed refuses a native copy named jq in a user directory (rc 2)" "2" "$?"
 # tool-path (preflight's presence check) applies the same identity test.
 eq "spike_tool_path finds no wrapper first on PATH" "" "$(PATH="$SANDBOX/probebin:$PATH" spike_tool_path jq)"
-case "$JQ_PHYS" in
-  /bin/*|/usr/*|/opt/homebrew/*) eq "spike_tool_path finds the real jq" "$JQ_PHYS" "$(spike_tool_path jq)" ;;
+# The expected value is the physical path of the FIRST jq on this suite's own PATH (on macOS runners /usr/bin/jq can precede
+# the Homebrew jq that JQ_BIN names), not necessarily JQ_PHYS.
+JQ_FIRST="$(type -P jq)"
+JQ_FIRST_PHYS="$(spike_resolve_path "$JQ_FIRST")"
+case "$JQ_FIRST_PHYS" in
+  /bin/*|/usr/*|/opt/homebrew/*) eq "spike_tool_path finds the real jq" "$JQ_FIRST_PHYS" "$(spike_tool_path jq)" ;;
 esac
 
 # --- spike_resolve_path / spike_run_timeout --------------------------------------------------------------------------
@@ -1390,6 +1459,7 @@ wait
 EOF
 chmod +x "$SANDBOX/strl.sh"
 STRESS_BAD=0
+STRESS_INFO=""
 for i in 1 2 3 4 5 6 7 8 9 10; do
   rm -f "$SANDBOX/strl.pids"
   if [ $((i % 2)) -eq 0 ]; then sig=HUP; else sig=TERM; fi
@@ -1397,6 +1467,7 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
   STC=$!
   kill -s "$sig" "$STC" 2>/dev/null
   wait "$STC" 2>/dev/null
+  STRC=$?
   # Reset first: read leaves the variables alone when the file is missing (the launcher had not started yet).
   SL=""
   SG=""
@@ -1407,7 +1478,8 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
   while [ "$n" -lt 30 ] && { ours "$SL" strl.sh || ours "$SG" "sleep 33"; }; do sleep 0.1; n=$((n + 1)); done
   if ours "$SL" strl.sh || ours "$SG" "sleep 33"; then
     STRESS_BAD=$((STRESS_BAD + 1))
-    echo "stress survivor (iteration $i, signal $sig): launcher=$SL grandchild=$SG"
+    echo "stress survivor (iteration $i, signal $sig, caller pid $STC ended rc $STRC): launcher=[$SL] grandchild=[$SG] pidsfile=[$(cat "$SANDBOX/strl.pids" 2>/dev/null)]"
+    STRESS_INFO="$STRESS_INFO; it $i $sig rc=$STRC launcher=[$SL] grandchild=[$SG] ps=[$(ps -o pid=,ppid=,stat=,args= -p "${SL:-0},${SG:-0}" 2>/dev/null | tr '\n' '|')]"
     for p in "$SL" "$SG"; do
       if [ -n "$p" ]; then
         printf '  still alive: '
@@ -1417,7 +1489,7 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
     kill -9 "$SL" "$SG" 2>/dev/null
   fi
 done
-eq "stress: no command survives a TERM or HUP sent right after the start (bad runs of 10)" "0" "$STRESS_BAD"
+eq "stress: no command survives a TERM or HUP sent right after the start (bad runs of 10)$STRESS_INFO" "0" "$STRESS_BAD"
 
 # The caller's own TERM trap is restored after a run.
 out="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; trap "echo MYTRAP" TERM; spike_run_live 5 /dev/null true; trap -p TERM' _ "$COMMON" 2>/dev/null)"
@@ -1792,6 +1864,61 @@ eq "split: an empty errfile is a usage error (rc 2)" "2" "$?"
 rm -f "$SANDBOX/outprobe-ran"
 /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/perl "$RUNNER2" run-split ungated 5 "$SANDBOX/sp-ok" "$SANDBOX/sp-ok2" - /usr/bin/true >/dev/null 2>&1
 eq "split: the helper refuses the split form in a mode other than live (rc 2)" "2" "$?"
+# The caller's pid is an input (SPIKE_IN_PARENT). A helper whose real parent is another process was started by a caller that has
+# died already (the reaper is its parent): it starts nothing and ends 143. A missing or malformed pid is refused (rc 2).
+pp_run() { # pp_run <run|run-split> <pid | UNSET | text>: the helper started straight from this shell; sets PPRC
+  local par="SPIKE_IN_PARENT=$2"
+  if [ "$2" = "UNSET" ]; then par="SPIKE_IN_NOPARENT=1"; fi
+  rm -f "$SANDBOX/outprobe-ran" "$SANDBOX/pp-out" "$SANDBOX/pp-err"
+  if [ "$1" = "run" ]; then
+    /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C SPIKE_IN_PATH="$PATH" SPIKE_IN_TMPDIR="$SANDBOX" SPIKE_IN_HOME="$FH" SPIKE_IN_LIVE=1 "$par" \
+      /usr/bin/perl "$RUNNER2" run live 5 "$SANDBOX/pp-out" - "$SANDBOX/splitprobe.sh" </dev/null >/dev/null 2>&1
+  else
+    /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C SPIKE_IN_PATH="$PATH" SPIKE_IN_TMPDIR="$SANDBOX" SPIKE_IN_HOME="$FH" SPIKE_IN_LIVE=1 "$par" \
+      /usr/bin/perl "$RUNNER2" run-split live 5 "$SANDBOX/pp-out" "$SANDBOX/pp-err" - "$SANDBOX/splitprobe.sh" </dev/null >/dev/null 2>&1
+  fi
+  PPRC=$?
+}
+/bin/sh -c 'exit 0' &
+PP_DEAD=$!
+{ wait "$PP_DEAD"; } 2>/dev/null
+for ppsub in run run-split; do
+  pp_run "$ppsub" "$$"
+  eq "caller gone [$ppsub]: with the real parent pid the command runs (rc 0)" "0" "$PPRC"
+  check "caller gone [$ppsub]: ...and its marker appears" test -e "$SANDBOX/outprobe-ran"
+  pp_run "$ppsub" 1
+  eq "caller gone [$ppsub]: a parent pid that is not the real parent (1) ends 143" "143" "$PPRC"
+  check_absent "caller gone [$ppsub]: ...and the command was never started" "$SANDBOX/outprobe-ran"
+  check_absent "caller gone [$ppsub]: ...and no outfile was created" "$SANDBOX/pp-out"
+  pp_run "$ppsub" "$PP_DEAD"
+  eq "caller gone [$ppsub]: a dead parent pid ends 143" "143" "$PPRC"
+  check_absent "caller gone [$ppsub]: ...and the command was never started (dead pid)" "$SANDBOX/outprobe-ran"
+  for ppbad in UNSET "" abc "12x" "x12" 0 -1 "1 2" "007x" "99999999999"; do
+    pp_run "$ppsub" "$ppbad"
+    eq "caller gone [$ppsub]: SPIKE_IN_PARENT=[$ppbad] is refused (rc 2)" "2" "$PPRC"
+    check_absent "caller gone [$ppsub]: ...and nothing was started for [$ppbad]" "$SANDBOX/outprobe-ran"
+  done
+done
+PP_SELF="$(/bin/bash -c '. "$1"; _spike_self_pid; echo "$_SPIKE_SELF $$"' _ "$COMMON" 2>/dev/null)"
+eq "caller gone: _spike_self_pid is the shell's own pid [self/\$\$ = $PP_SELF]" "${PP_SELF#* }" "${PP_SELF%% *}"
+PP_SELF="$(/bin/bash -c '. "$1"; unset BASHPID; _spike_self_pid; echo "$_SPIKE_SELF $$"' _ "$COMMON" 2>/dev/null)"
+eq "caller gone: without BASHPID (bash 3.2) the pid comes from the exec'd sh and is the shell's own [self/\$\$ = $PP_SELF]" "${PP_SELF#* }" "${PP_SELF%% *}"
+# Simulated bash 3.2 (we run bash 4+ here and BASH_VERSINFO is readonly): _spike_bash4 says no, and BASHPID is a plain, WRONG
+# variable (unset first so it is no longer special). The pid must still be the shell's own, never the planted value.
+PP_SELF="$(/bin/bash -c '. "$1"; _spike_bash4() { return 1; }; unset BASHPID; BASHPID=424242; _spike_self_pid; echo "$_SPIKE_SELF $$"' _ "$COMMON" 2>/dev/null)"
+eq "caller gone: on a simulated bash 3.2 a plain BASHPID variable is never trusted [self/\$\$ = $PP_SELF]" "${PP_SELF#* }" "${PP_SELF%% *}"
+PP_SELF="$(/bin/bash -c '. "$1"; _spike_bash4() { return 1; }; ( _spike_self_pid; sleep 2 & kid=$!; echo "$_SPIKE_SELF $(ps -o ppid= -p "$kid" 2>/dev/null | tr -d " ")"; kill "$kid" 2>/dev/null )' _ "$COMMON" 2>/dev/null)"
+eq "caller gone: on a simulated bash 3.2 inside a subshell it is the subshell's pid [self/ps ppid = $PP_SELF]" "${PP_SELF#* }" "${PP_SELF%% *}"
+# The expected subshell pid does not come from BASHPID or from the code under test: a child started in the subshell names the
+# subshell as its parent (ps), which is the very property the helper relies on.
+PP_SELF="$(/bin/bash -c '. "$1"; ( _spike_self_pid; sleep 2 & kid=$!; echo "$_SPIKE_SELF $(ps -o ppid= -p "$kid" 2>/dev/null | tr -d " ")"; kill "$kid" 2>/dev/null )' _ "$COMMON" 2>/dev/null)"
+eq "caller gone: inside a subshell it is the subshell's pid [self/ps ppid = $PP_SELF]" "${PP_SELF#* }" "${PP_SELF%% *}"
+PP_OUTER="$(/bin/bash -c '. "$1"; _spike_self_pid; outer=$_SPIKE_SELF; ( _spike_self_pid; echo "$outer $_SPIKE_SELF" )' _ "$COMMON" 2>/dev/null)"
+if [ "${PP_OUTER#* }" != "${PP_OUTER%% *}" ]; then ok "caller gone: the subshell's pid differs from the outer shell's [outer/sub = $PP_OUTER]"; else bad "caller gone: the subshell's pid differs from the outer shell's [outer/sub = $PP_OUTER]"; fi
+# Foreground helper calls carry no SPIKE_IN_PARENT; only _spike_exec (started with &) passes it.
+has "caller gone: _spike_exec passes the starting shell's pid" "$(cat "$COMMON_REAL")" 'SPIKE_IN_PARENT=$_SPIKE_SELF'
+lacks "caller gone: foreground helper calls (_spike_inputs) pass no parent pid" "$(sed -n '/^_spike_inputs() {/,/^}/p' "$COMMON_REAL")" "SPIKE_IN_PARENT"
+has "caller gone: runner.pl compares the parent pid before it starts the command" "$(cat "$RUNNER_REAL")" "the caller is already gone; nothing was started"
 # the live gate: no SPIKE_LIVE, no run
 rm -f "$SANDBOX/outprobe-ran" "$SANDBOX/sp-g-out" "$SANDBOX/sp-g-err"
 o="$(env -u SPIKE_LIVE HOME="$FH" /bin/bash -c '. "$1"; spike_run_live_split 5 "$2" "$3" "$4"; echo CONTINUED' _ "$COMMON2" "$SANDBOX/sp-g-out" "$SANDBOX/sp-g-err" "$SANDBOX/splitprobe.sh" 2>/dev/null)"
@@ -1809,7 +1936,8 @@ rm -f "$FAKE"/ran-*
 o="$(env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude && spike_run_live_split 5 /dev/null "$2/sp-reg-err" "$SPIKE_VERIFIED_COPY" -p hi; echo CONTINUED' _ "$COMMON" "$REG" 2>/dev/null)"
 eq "split: the registered copy still needs SPIKE_LIVE=1 (rc 3)" "3" "$?"
 eq "split: the registered copy was not started without SPIKE_LIVE=1" "0" "$(ran)"
-o="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude || exit 9; printf "%s\n" "#!/bin/sh" "touch \"$3/ran-swapped\"" >| "$SPIKE_VERIFIED_COPY"; spike_run_live_split 5 /dev/null "$2/sp-reg-err" "$SPIKE_VERIFIED_COPY" -p hi; echo CONTINUED' _ "$COMMON" "$REG" "$FAKE" 2>/dev/null)"
+mkswap "$SANDBOX/swap-split"
+o="$(SPIKE_LIVE=1 /bin/bash -c '. "$1"; spike_mark_verified "$2/claude" claude || exit 9; printf "%s\n" "#!/bin/sh" "touch \"$3/ran-swapped\"" >| "$SPIKE_VERIFIED_COPY"; spike_run_live_split 5 /dev/null "$2/sp-reg-err" "$SPIKE_VERIFIED_COPY" -p hi; echo CONTINUED' _ "$COMMON" "$SANDBOX/swap-split" "$FAKE" 2>/dev/null)"
 eq "split: a registered copy whose content changed is refused (rc 3)" "3" "$?"
 lacks "split: ...and the caller is stopped" "$o" "CONTINUED"
 check_absent "split: the changed registered copy never ran" "$FAKE/ran-swapped"
@@ -1904,7 +2032,12 @@ r="$(reg2 "$NB")"
 has "narrow exception: the same big file WITH the owner-execute bit is registered (status verified)" "$r" "STATUS=verified"
 has "narrow exception: ...as a mach-o" "$r" "KIND=mach-o"
 CPY="${r#*COPY=}"
-eq "narrow exception: the WHOLE vendor binary is copied for verification (same size)" "$(wc -c < "$FH/.claude/bigplain" | tr -d ' ')" "$(wc -c < "$CPY" 2>/dev/null | tr -d ' ')"
+# CHANGED (verify in place, 2026-10-26): the vendor binary inside the CLI home is no longer copied out for verification; the
+# ratified exception covers resolving, hashing, codesign-checking and executing that path itself. (It was: "the WHOLE vendor
+# binary is copied for verification (same size)".)
+eq "narrow exception: the verified path is the real vendor binary inside the CLI home (verified in place)" "$FH/.claude/bigplain" "$CPY"
+eq "narrow exception: no copy of the vendor binary exists in any verify directory (no file over 1000 KiB there)" "0" "$(find "$SANDBOX" -path '*/spike-verify.*' -type f -size +1000k 2>/dev/null | wc -l | tr -d ' ')"
+has "narrow exception: codesign was asked about the vendor binary in place" "$(cat "$FSDIR/log")" "--verify --strict $FH/.claude/bigplain"
 printf '\317\372\355\376\nexit 0\n' | sbx_put "$FH/.claude/edge-low"
 padexact "$FH/.claude/edge-low" 1048575
 chmod 700 "$FH/.claude/edge-low"
@@ -1947,6 +2080,39 @@ r="$(seam_register "$FH/.claude/smallexec")"
 lacks "seam: a small executable file inside a CLI home was never opened" "$r" "smallexec"
 r="$(seam_register "$FH/.claude/bigplain")"
 has "seam control: the big executable vendor-like file IS opened (the seam sees opens)" "$r" "bigplain"
+# In-place registration means the registered path stays inside the CLI home, and a run re-hashes it. A credential-like file
+# swapped in at that path must not be opened by that re-hash (registry_sha applies the same vendor-binary test before opening).
+seam_swap() { # seam_swap <path> <big|small>: register <path>, replace its content, then run registry_ok; prints OK= and the opens AFTER the swap
+  /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/perl -e '
+    my ($rf, $vd, $p, $kind) = @ARGV;
+    require $rf;
+    no warnings "redefine";
+    my @opened;
+    my $orig = \&main::open_ro;
+    *main::open_ro = sub { push @opened, $_[0]; return $orig->(@_); };
+    open(my $save, ">&", \*STDOUT);
+    open(STDOUT, ">", "/dev/null");
+    main::cmd_register($vd, "claude", "path", $p);
+    open(STDOUT, ">&", $save);
+    @opened = ();
+    open(my $w, ">", $p) or die "cannot rewrite the fixture";
+    print $w ($kind eq "big" ? "\xcf\xfa\xed\xfe\n" . ("B" x 1200000) : "CANARY-SWAP-55d2\n");
+    close $w;
+    my $ok = main::registry_ok($vd, $p);
+    print "OK=$ok OPENED_AFTER=" . join(",", @opened) . "\n";' "$RUNNER2" "$VD2" "$1" "$2"
+}
+printf '\317\372\355\376\nexit 0\n' | sbx_put "$FH/.claude/swapsmall"
+padexact "$FH/.claude/swapsmall" 1100000
+chmod 700 "$FH/.claude/swapsmall"
+r="$(seam_swap "$FH/.claude/swapsmall" small)"
+has "in place: a vendor binary in a CLI home replaced by a small credential-like file fails the hash check" "$r" "OK=0 "
+lacks "in place: ...and that small file was never opened by the re-hash" "$r" "swapsmall"
+printf '\317\372\355\376\nexit 0\n' | sbx_put "$FH/.claude/swapbig"
+padexact "$FH/.claude/swapbig" 1100000
+chmod 700 "$FH/.claude/swapbig"
+r="$(seam_swap "$FH/.claude/swapbig" big)"
+has "in place seam control: a replacement that still looks like a vendor binary fails the hash check (OK=0)" "$r" "OK=0 "
+has "in place seam control: ...and the re-hash did open it (the seam sees the open)" "$r" "swapbig"
 if command -v strace >/dev/null 2>&1 && strace -f -o "$SANDBOX/strace.probe" -e trace=file /usr/bin/true >/dev/null 2>&1; then
   chmod 700 "$FH/.claude/smallcred"
   sbx_ln "$FH/.claude/smallcred" "$NB/claude"
@@ -2041,6 +2207,10 @@ kill -9 "$CSCALLER" 2>/dev/null
 cs_gone "codesign watch: after kill -9 of the caller, the codesign and its child are gone within 3 s (no orphan under init)"
 { wait "$CSCALLER"; } 2>/dev/null
 rm -f "$FSDIR/cs.pids"
+# A registration whose caller is already gone (SPIKE_IN_PARENT names a process that is not its parent) starts no codesign.
+/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C SPIKE_IN_PATH="$PATH" SPIKE_IN_TMPDIR="$SANDBOX" SPIKE_IN_HOME="$SANDBOX/home" SPIKE_IN_PARENT=1 /usr/bin/perl "$RUNNER" register "$CSVD" claude path "$RG/claude" >/dev/null 2>&1
+eq "codesign watch: with the caller already gone the registration ends 143" "143" "$?"
+check_absent "codesign watch: ...and no codesign was started" "$FSDIR/cs.pids"
 env -u SPIKE_LIVE /bin/bash -c '. "$1"; spike_mark_verified "$2" claude; echo "AFTER rc=$?"' _ "$COMMON" "$RG/claude" >| "$SANDBOX/cs-term.out" 2>&1 &
 CSCALLER=$!
 n=0

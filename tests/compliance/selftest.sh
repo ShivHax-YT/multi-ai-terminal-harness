@@ -68,10 +68,6 @@ hook guard-docs-only.sh 2 "docs agent edits HARD_RULES" '{"tool_name":"Edit","to
 mkdir -p "$FAKE_HOME/.claude"; CLAUDE_PROJECT_DIR="$FAKE_HOME" hook log-subagent.sh 0 "SubagentStop logger never blocks" '{"agent_type":"scout","agent_id":"a1","session_id":"s1"}'
 rm -rf "$FAKE_HOME"
 
-echo
-echo "selftest: $pass passed, $fail failed"
-[ "$fail" -eq 0 ]
-
 # ---- T-101: Tauri layout. Rule 3 via compliance/pty-boundary.conf (copied into each scratch repo, because the scan
 # sources the conf of the root it scans) and via the harness-core -> pty-view crate boundary check. ----
 echo
@@ -110,5 +106,5 @@ expect_tree fail "tree with pty_view spelling" "$(printf 'harness-core v0.1.0 (/
 expect_tree fail "tree not rooted at harness-core (fail closed)" "$(printf 'app v0.1.0 (/r/src-tauri)\nserde v1.0.228')"
 
 echo
-echo "selftest (with T-101 cases): $pass passed, $fail failed"
+echo "selftest: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

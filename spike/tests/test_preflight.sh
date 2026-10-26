@@ -228,10 +228,12 @@ EOF
 B1="$SANDBOX/b1"
 mkbin "$B1"
 LOG1="$SANDBOX/log1"
+VDLIST1="$SANDBOX/vdlist1"
 mkcodesign "$CS" good "$SANDBOX/codesign1.log"
 for n in claude codex; do
   mkmacho "$B1/$n" <<EOF
 echo "\$0 \$*" >> "$LOG1"
+ls -A "$SANDBOX"/spike-verify.*/ >| "$VDLIST1" 2>/dev/null
 case "\$1" in
   --version) printf 'v9.9.9 (Fake)\033[31mRED\033]0;title\007\n'; exit 0 ;;
   auth|login) echo "SECRET jane@example.com token=abc123"; echo "SECRET2 on stderr" >&2; [ "$n" = claude ] && exit 0; exit 1 ;;
@@ -259,12 +261,19 @@ has "scenario 1: footer explains the path display" "$OUT1" "any at-sign in a pat
 has "scenario 1: claude was run with --version" "$(cat "$LOG1")" "claude --version"
 has "scenario 1: claude was run with auth status" "$(cat "$LOG1")" "claude auth status"
 has "scenario 1: codex was run with login status" "$(cat "$LOG1")" "codex login status"
-has "scenario 1: the commands ran from the private copy directory (not the original)" "$(cat "$LOG1")" "$SANDBOX/spike-verify."
-lacks "scenario 1: the original path was never executed" "$(cat "$LOG1")" "$B1/claude"
+# CHANGED (verify in place, 2026-10-26): the commands run the REAL installed path; no copy is made anywhere.
+has "scenario 1: the version and status commands ran the real installed path (claude)" "$(cat "$LOG1")" "$B1/claude --version"
+has "scenario 1: the status command ran the real installed path (codex)" "$(cat "$LOG1")" "$B1/codex login status"
+lacks "scenario 1: nothing ran from a private verify directory (no copy exists)" "$(cat "$LOG1")" "spike-verify."
+eq "scenario 1: the private verify directory held no copy of a binary while the CLIs ran (registry and scratch only)" ".owner
+.registry
+out.tmp" "$(cat "$VDLIST1")"
+eq "scenario 1: no other file named claude or codex was created anywhere in the sandbox by the run" "$B1/claude
+$B1/codex" "$(find "$SANDBOX" \( -name claude -o -name codex \) -type f | sort)"
 has "scenario 1: the chain-to-Apple requirement for the pinned team was checked" "$(cat "$SANDBOX/codesign1.log")" 'anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "Q6L2SF6YDW"'
 lacks "scenario 1: no prompt was ever sent" "$(cat "$LOG1")" " -p "
 lacks "scenario 1: no exec subcommand was run" "$(cat "$LOG1")" "codex exec"
-eq "scenario 1: the private copy directory is removed on exit" "" "$(ls -d "$SANDBOX"/spike-verify.* 2>/dev/null)"
+eq "scenario 1: the private verify directory is removed on exit" "" "$(ls -d "$SANDBOX"/spike-verify.* 2>/dev/null)"
 eq "scenario 1: no scratch file is left in the temporary directory" "" "$(ls -d "$SANDBOX"/spike-preflight* 2>/dev/null)"
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -351,41 +360,37 @@ has "scenario 3: version is skipped" "$(row "$OUT3" claude)" "skipped (unverifie
 has "scenario 3: note says the launcher was NOT executed" "$OUT3" "script launcher and was NOT executed"
 if [ -s "$LOG3" ]; then bad "scenario 3: no launcher was executed"; else ok "scenario 3: no launcher was executed"; fi
 
-# Scenario 3b: a symlinked CLI is resolved ONCE. The RESOLVED file is copied, the COPY is verified, and only the copy runs.
+# Scenario 3b (verify in place): a symlinked CLI is resolved ONCE to its real physical path. That real file is verified where
+# it is, and that same real path is what runs (never the symlink spelling, never a copy).
 B3B="$SANDBOX/b3b"
 mkbin "$B3B"
 CS3B="$SANDBOX/codesign3b.log"
 mkcodesign "$CS" good "$CS3B"
 sbx_mkdir "$SANDBOX/real3b"
 LOG3B="$SANDBOX/log3b"
-DIR3B="$SANDBOX/dir3b"
 mkmacho "$SANDBOX/real3b/claude-real" <<EOF
 echo "RAN \$0 \$*" >> "$LOG3B"
-ls -ld "\$(dirname "\$0")" > "$DIR3B"
 exit 0
 EOF
 sbx_ln "$SANDBOX/real3b/claude-real" "$B3B/claude"
 OUT3B="$(run_preflight "$B3B")"
-has "scenario 3b: codesign was asked about the private copy (verify the copy, not the original)" "$(cat "$CS3B")" "--verify --strict $SANDBOX/spike-verify."
-lacks "scenario 3b: codesign was never asked about the original" "$(cat "$CS3B")" "claude-real"
+has "scenario 3b: codesign was asked about the resolved real path (verified in place)" "$(cat "$CS3B")" "--verify --strict $SANDBOX/real3b/claude-real"
+lacks "scenario 3b: no codesign call named a private verify directory (no copy exists)" "$(cat "$CS3B")" "spike-verify."
 lacks "scenario 3b: codesign was never asked about the symlink path" "$(cat "$CS3B")" "$B3B/claude"
 case "$(cat "$LOG3B")" in
-  *"RAN $SANDBOX/spike-verify."*"/claude --version"*) ok "scenario 3b: the private copy is what ran (version)" ;;
-  *) bad "scenario 3b: the private copy is what ran (version)" ;;
+  *"RAN $SANDBOX/real3b/claude-real --version"*) ok "scenario 3b: the resolved real path is what ran (version)" ;;
+  *) bad "scenario 3b: the resolved real path is what ran (version)" ;;
 esac
 case "$(cat "$LOG3B")" in
-  *"RAN $SANDBOX/spike-verify."*"/claude auth status"*) ok "scenario 3b: the private copy is what ran (status)" ;;
-  *) bad "scenario 3b: the private copy is what ran (status)" ;;
+  *"RAN $SANDBOX/real3b/claude-real auth status"*) ok "scenario 3b: the resolved real path is what ran (status)" ;;
+  *) bad "scenario 3b: the resolved real path is what ran (status)" ;;
 esac
-lacks "scenario 3b: the original was never executed (its marker is absent)" "$(cat "$LOG3B")" "claude-real"
-case "$(cat "$DIR3B")" in
-  drwx------*) ok "scenario 3b: the private copy directory is mode 700" ;;
-  *) bad "scenario 3b: the private copy directory is mode 700 (got: $(cat "$DIR3B"))" ;;
-esac
+lacks "scenario 3b: the symlink spelling was never the executed path" "$(cat "$LOG3B")" "RAN $B3B/claude"
+lacks "scenario 3b: nothing ran from a private verify directory" "$(cat "$LOG3B")" "spike-verify."
 has "scenario 3b: the resolved path is shown" "$(row "$OUT3B" claude)" "claude-real"
 
-# Scenario 3c: a copy that cannot run (its interpreter is missing) is reported "needs human review". The original path is
-# never used as a fallback.
+# Scenario 3c: a verified binary that cannot run (its interpreter is missing) is reported "needs human review". No other path
+# is tried as a fallback.
 B3C="$SANDBOX/b3c"
 mkbin "$B3C"
 mkcodesign "$CS" good
@@ -395,9 +400,9 @@ exec /nonexistent/interpreter
 EOF
 done
 OUT3C="$(run_preflight "$B3C")"
-has "scenario 3c: a copy that cannot run is 'needs human review' for the version" "$(row "$OUT3C" claude)" "needs human review"
-has "scenario 3c: a copy that cannot run is 'needs human review' for sign-in" "$(row "$OUT3C" claude)" "needs human review"
-has "scenario 3c: a note says the original path was NOT used" "$OUT3C" "the original path was NOT used"
+has "scenario 3c: a binary that cannot run is 'needs human review' for the version" "$(row "$OUT3C" claude)" "needs human review"
+has "scenario 3c: a binary that cannot run is 'needs human review' for sign-in" "$(row "$OUT3C" claude)" "needs human review"
+has "scenario 3c: a note says no other path was tried (no fallback)" "$OUT3C" "no other path was tried"
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Scenario 4: no CLIs installed -> still exit 0, rows say not installed.
@@ -507,7 +512,10 @@ OUT9B="$(run_preflight "$B9B")"
 has "scenario 8b: the Mach-O provider binary inside a CLI home is allowed (kind mach-o)" "$(row "$OUT9B" claude)" "mach-o"
 has "scenario 8b: it is then verified like any copy (valid signer)" "$(row "$OUT9B" claude)" "valid; Developer ID Application"
 has "scenario 8b: the copy runs (its body wrote the log; the version column cannot show a fixture's first line on Linux)" "$(cat "$LOG9B")" "RAN9B"
-lacks "scenario 8b: the copy that ran is not the one inside the CLI home" "$(cat "$LOG9B")" "$SANDBOX/home/.claude"
+# CHANGED (verify in place): the ratified narrow exception covers EXECUTING the binary path itself, so what ran is the real
+# file inside the CLI home (it used to be a copy outside it). Nothing else under that home is touched.
+has "scenario 8b: the real binary path inside the CLI home is what ran (no copy)" "$(cat "$LOG9B")" "RAN9B $SANDBOX/home/.claude/bin/claude-real"
+lacks "scenario 8b: nothing ran from a private verify directory" "$(cat "$LOG9B")" "spike-verify."
 
 # Scenario 8c (Opus finding 5): a HARD LINK to the canary, placed outside every CLI home, is refused before any read.
 B9C="$SANDBOX/b9c"
