@@ -49,8 +49,13 @@ case "$CAP" in
   *) spike_err "not a codex capture directory under $CAPROOT: $1"; exit 2 ;;
 esac
 [ -d "$CAP" ] && [ -f "$CAP/raw.jsonl" ] && [ -f "$CAP/worktree.txt" ] || { spike_err "not a run.sh capture (raw.jsonl or worktree.txt missing): $CAP"; exit 2; }
-if [ -e "$CAP/resume.combined.txt" ]; then
-  spike_err "this capture was already resumed once; one resume per capture"
+# reserve_resume: the one-resume guard. mkdir either creates the directory or fails, in one step, so two resumes of the same
+# capture cannot both pass. The reservation is made before the CLI call and is never removed (a failed resume is not retried).
+reserve_resume() {
+  mkdir "$1/resume.lock" 2>/dev/null
+}
+if [ -e "$CAP/resume.combined.txt" ] || [ -e "$CAP/resume.lock" ]; then
+  spike_err "this capture was already resumed once (or is being resumed); one resume per capture"
   exit 2
 fi
 
@@ -86,6 +91,9 @@ if [ "$?" -ne 0 ]; then
   exit 1
 fi
 
+# ---- atomic one-resume reservation, before the CLI call; never removed ---------------------------------------------------------
+reserve_resume "$CAP" || { spike_err "this capture was already resumed once (or is being resumed); one resume per capture"; exit 2; }
+
 # ---- the one invocation (no retry, no loop) ------------------------------------------------------------------------------------
 spike_run_live "$WATCHDOG_SECS" "$CAP/resume.combined.txt" "$SPIKE_VERIFIED_COPY" exec --json --sandbox workspace-write -C "$WT" resume "$THREAD_ID" "$PROMPT"
 RUN_RC=$?
@@ -98,22 +106,39 @@ if [ -f "$CAP/resume.combined.txt" ]; then
   awk -v raw="$CAP/resume.raw.jsonl" -v err="$CAP/resume.stderr.txt" '/^\{/ { print > raw; next } { print > err }' "$CAP/resume.combined.txt"
 fi
 jq -n -R -f "$HERE/parse.jq" < "$CAP/resume.raw.jsonl" > "$CAP/resume.parsed.json" 2> "$CAP/resume.parse.err"
+PARSE_RC=$?
 spike_redact < "$CAP/resume.raw.jsonl" > "$CAP/resume.observed.redacted.jsonl"
 
 # ---- result --------------------------------------------------------------------------------------------------------------------
+# completion_verdict RUN_RC PARSE_RC STATUS THREAD_ID [EXPECTED_THREAD_ID]: prints one fixed reason per failure and returns 1 if there is any.
+# The run counts as good only if ALL hold: codex exited 0 (not the 124 of the watchdog), parse.jq itself succeeded
+# (jq exit 0), the parsed final status is exactly "completed" (the resume must have reported it), and the thread id is usable (letters, digits and dashes,
+# 8 to 64 characters), and equal to EXPECTED_THREAD_ID. The reasons never repeat text from the stream. hello.txt is checked separately; a matching
+# hello.txt never rescues a run that fails here.
+completion_verdict() {
+  local bad=0 tid=$4
+  if [ "$1" = "124" ]; then echo "timed out after ${WATCHDOG_SECS:-120}s; the child's process group was killed"; bad=1
+  elif [ "$1" != "0" ]; then echo "codex exited with a non-zero status"; bad=1; fi
+  if [ "$2" != "0" ]; then echo "parse.jq failed (jq exited non-zero): the event stream could not be summarised"; bad=1; fi
+  if [ "$3" != "completed" ]; then echo "the parsed final status is not 'completed' (no turn.completed as the last terminal event)"; bad=1; fi
+  case "$tid" in
+    ""|*[!A-Za-z0-9-]*) echo "no usable thread id in the event stream"; bad=1 ;;
+    *) if [ "${#tid}" -lt 8 ] || [ "${#tid}" -gt 64 ]; then echo "the thread id has an unexpected length"; bad=1; fi ;;
+  esac
+  if [ -n "${5:-}" ] && [ "$tid" != "$5" ]; then echo "the thread id after resume differs from the first run's"; bad=1; fi
+  [ "$bad" -eq 0 ]
+}
+STATUS="$(jq -r '.final.status // empty' "$CAP/resume.parsed.json" 2>/dev/null | LC_ALL=C tr -d '\000-\037\177')"
+NEW_ID="$(jq -r '.thread_id // empty' "$CAP/resume.parsed.json" 2>/dev/null | LC_ALL=C tr -d '\000-\037\177')"
 OK=1
-if [ "$RUN_RC" -eq 124 ]; then
-  spike_err "timed out after ${WATCHDOG_SECS}s; the child's process group was killed"
+REASONS="$(completion_verdict "$RUN_RC" "$PARSE_RC" "$STATUS" "$NEW_ID" "$THREAD_ID")" || {
+  spike_err "not a good run: $(printf '%s' "$REASONS" | tr '\n' ';') (see $CAP/resume.stderr.txt and resume.parse.err)"
   OK=0
-elif [ "$RUN_RC" -ne 0 ]; then
-  spike_err "codex exec resume exited with status $RUN_RC (see $CAP/resume.stderr.txt)"
-  OK=0
-fi
-NEW_ID="$(jq -r '.thread_id // "none"' "$CAP/resume.parsed.json" 2>/dev/null | LC_ALL=C tr -d '\000-\037\177')"
+}
 if [ "$NEW_ID" = "$THREAD_ID" ]; then
   echo "thread id after resume: same as before (OK)"
 else
-  echo "thread id after resume: differs or missing ($NEW_ID); record this in EVENTS.md"
+  echo "thread id after resume: differs or missing; record this in EVENTS.md"
   OK=0
 fi
 # hello_ok: the file holds exactly "hello from codex" and "resumed" as two lines, the second with or without a trailing

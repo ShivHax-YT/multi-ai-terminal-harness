@@ -305,6 +305,72 @@ hello_case resume.sh "only the first line is refused" 'hello from codex\n' 1
 hello_case resume.sh "a different second line is refused" 'hello from codex\nresumed twice\n' 1
 hello_case resume.sh "a missing file is refused" '@none' 1
 
+# ---- completion_verdict (post-gate decision) is exercised offline by extracting the function from each script --------------
+GOODID="0199a213-81c0-7800-8aa1-bbab2a035a53"
+verdict_case() { # script label want(0|1) args...
+  local script=$1 label=$2 want=$3 d got out
+  shift 3
+  d=$(mktemp -d "$TMP/verdict.XXXXXX")
+  awk '/^completion_verdict\(\) \{/ { p = 1 } p { print } p && /^\}/ { exit }' "$CODEX/$script" > "$d/fn.sh"
+  [ -s "$d/fn.sh" ] || { fail "$script: completion_verdict function not found"; return; }
+  out=$("$SH" -c '. "$1"; shift; completion_verdict "$@"' _ "$d/fn.sh" "$@")
+  got=$?
+  [ "$got" -ne 0 ] && got=1
+  eq "$script completion_verdict: $label" "$got" "$want"
+  if [ "$want" = "1" ]; then check "$script completion_verdict: [$label] prints a reason" test -n "$out"; fi
+}
+verdict_case run.sh "all good" 0 0 0 completed "$GOODID"
+verdict_case run.sh "CLI exit non-zero" 1 1 0 completed "$GOODID"
+verdict_case run.sh "watchdog timeout (124)" 1 124 0 completed "$GOODID"
+verdict_case run.sh "parse.jq failed (jq exit non-zero) even if the status text says completed" 1 0 5 completed "$GOODID"
+verdict_case run.sh "status failed" 1 0 0 failed "$GOODID"
+verdict_case run.sh "status incomplete" 1 0 0 incomplete "$GOODID"
+verdict_case run.sh "status empty" 1 0 0 "" "$GOODID"
+verdict_case run.sh "missing thread id" 1 0 0 completed ""
+verdict_case run.sh "thread id none" 1 0 0 completed "none" 
+verdict_case run.sh "thread id with a bad character" 1 0 0 completed "0199a213;81c0"
+verdict_case run.sh "thread id too short" 1 0 0 completed "abc"
+verdict_case run.sh "thread id too long" 1 0 0 completed "$(printf 'a%.0s' $(seq 1 65))"
+verdict_case run.sh "everything wrong" 1 124 5 "" ""
+verdict_case resume.sh "all good, same id" 0 0 0 completed "$GOODID" "$GOODID"
+verdict_case resume.sh "CLI exit non-zero" 1 1 0 completed "$GOODID" "$GOODID"
+verdict_case resume.sh "watchdog timeout (124)" 1 124 0 completed "$GOODID" "$GOODID"
+verdict_case resume.sh "parse.jq failed" 1 0 5 completed "$GOODID" "$GOODID"
+verdict_case resume.sh "status failed" 1 0 0 failed "$GOODID" "$GOODID"
+verdict_case resume.sh "status incomplete" 1 0 0 incomplete "$GOODID" "$GOODID"
+verdict_case resume.sh "missing thread id" 1 0 0 completed "" "$GOODID"
+verdict_case resume.sh "thread id differs from the first run's" 1 0 0 completed "0199a213-81c0-7800-8aa1-bbab2a035a99" "$GOODID"
+verdict_case resume.sh "bad thread id" 1 0 0 completed "bad id!!!" "bad id!!!"
+# the scripts feed the verdict with the parser's real exit status and the parsed status/thread id
+for s in run.sh resume.sh; do
+  check "$s: PARSE_RC is taken right after the parse.jq call" "$SH" -c 'grep -A1 "parse.jq\" < .*raw.jsonl\" > " "$1" | grep -q "^PARSE_RC=\$?$"' _ "$CODEX/$s"
+  check "$s: the verdict is called with the run status, the parse status, the parsed status and the thread id" grep -q 'completion_verdict "\$RUN_RC" "\$PARSE_RC" "\$STATUS"' "$CODEX/$s"
+  check "$s: a failing verdict sets OK=0" grep -q '^REASONS="\$(completion_verdict .*)" || {$' "$CODEX/$s"
+done
+
+# ---- the one-resume reservation is atomic (mkdir), made before the CLI call, and never removed ----------------------------
+RD=$(mktemp -d "$TMP/resv.XXXXXX")
+awk '/^reserve_resume\(\) \{/ { p = 1 } p { print } p && /^\}/ { exit }' "$CODEX/resume.sh" > "$RD/fn.sh"
+check "reserve_resume function found" test -s "$RD/fn.sh"
+mkdir "$RD/cap"
+"$SH" -c '. "$1"; reserve_resume "$2"' _ "$RD/fn.sh" "$RD/cap"
+eq "first reservation succeeds" "$?" "0"
+check "the reservation directory exists" test -d "$RD/cap/resume.lock"
+"$SH" -c '. "$1"; reserve_resume "$2"' _ "$RD/fn.sh" "$RD/cap"
+check "second reservation of the same capture fails" test "$?" -ne 0
+# two racing reservations: exactly one wins
+mkdir "$RD/cap2"
+for i in 1 2 3 4 5 6; do
+  ( "$SH" -c '. "$1"; reserve_resume "$2" && echo won' _ "$RD/fn.sh" "$RD/cap2" > "$RD/race.$i" 2>/dev/null ) &
+done
+wait
+eq "six racing reservations: exactly one wins" "$(cat "$RD"/race.* | grep -c '^won$')" "1"
+RLINE=$(grep -n '^reserve_resume "\$CAP"' "$CODEX/resume.sh" | head -n 1 | cut -d: -f1)
+LLINE=$(grep -nE '^[[:space:]]*spike_run_live ' "$CODEX/resume.sh" | head -n 1 | cut -d: -f1)
+check "the reservation call comes before the live CLI call" test -n "$RLINE" -a -n "$LLINE" -a "${RLINE:-999999}" -lt "${LLINE:-0}"
+check "resume.sh never removes the reservation (no rm/rmdir)" test "$(grep -vE '^[[:space:]]*#' "$CODEX/resume.sh" | grep -cE '(^|[[:space:];|&])(rm|rmdir)[[:space:]]')" = "0"
+check "resume.sh refuses an existing lock early" grep -q 'resume.lock' "$CODEX/resume.sh"
+
 # ---- the split used by run.sh and resume.sh (same awk program) ------------------------------------------------------------------
 printf '{"type":"turn.started"}\nWARN something on stderr\n{"type":"turn.completed","usage":{"input_tokens":1}}\nmore text\n' > "$TMP/comb.txt"
 SPLIT_AWK=$(grep -m1 "awk -v raw=" "$CODEX/run.sh" | sed -e "s/.*'\\(\\/.*\\)' .*/\\1/")

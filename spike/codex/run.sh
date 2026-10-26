@@ -78,17 +78,34 @@ if [ -f "$CAP/combined.txt" ]; then
   awk -v raw="$CAP/raw.jsonl" -v err="$CAP/stderr.txt" '/^\{/ { print > raw; next } { print > err }' "$CAP/combined.txt"
 fi
 jq -n -R -f "$HERE/parse.jq" < "$CAP/raw.jsonl" > "$CAP/parsed.json" 2> "$CAP/parse.err"
+PARSE_RC=$?
 spike_redact < "$CAP/raw.jsonl" > "$CAP/observed.redacted.jsonl"
 
 # ---- result --------------------------------------------------------------------------------------------------------------------
+# completion_verdict RUN_RC PARSE_RC STATUS THREAD_ID: prints one fixed reason per failure and returns 1 if there is any.
+# The run counts as good only if ALL hold: codex exited 0 (not the 124 of the watchdog), parse.jq itself succeeded
+# (jq exit 0), the parsed final status is exactly "completed", and the thread id is usable (letters, digits and dashes,
+# 8 to 64 characters). The reasons never repeat text from the stream. hello.txt is checked separately; a matching
+# hello.txt never rescues a run that fails here.
+completion_verdict() {
+  local bad=0 tid=$4
+  if [ "$1" = "124" ]; then echo "timed out after ${WATCHDOG_SECS:-120}s; the child's process group was killed"; bad=1
+  elif [ "$1" != "0" ]; then echo "codex exited with a non-zero status"; bad=1; fi
+  if [ "$2" != "0" ]; then echo "parse.jq failed (jq exited non-zero): the event stream could not be summarised"; bad=1; fi
+  if [ "$3" != "completed" ]; then echo "the parsed final status is not 'completed' (no turn.completed as the last terminal event)"; bad=1; fi
+  case "$tid" in
+    ""|*[!A-Za-z0-9-]*) echo "no usable thread id in the event stream"; bad=1 ;;
+    *) if [ "${#tid}" -lt 8 ] || [ "${#tid}" -gt 64 ]; then echo "the thread id has an unexpected length"; bad=1; fi ;;
+  esac
+  [ "$bad" -eq 0 ]
+}
+STATUS="$(jq -r '.final.status // empty' "$CAP/parsed.json" 2>/dev/null | LC_ALL=C tr -d '\000-\037\177')"
+THREAD="$(jq -r '.thread_id // empty' "$CAP/parsed.json" 2>/dev/null | LC_ALL=C tr -d '\000-\037\177')"
 OK=1
-if [ "$RUN_RC" -eq 124 ]; then
-  spike_err "timed out after ${WATCHDOG_SECS}s; the child's process group was killed"
+REASONS="$(completion_verdict "$RUN_RC" "$PARSE_RC" "$STATUS" "$THREAD")" || {
+  spike_err "not a good run: $(printf '%s' "$REASONS" | tr '\n' ';') (see $CAP/stderr.txt and parse.err)"
   OK=0
-elif [ "$RUN_RC" -ne 0 ]; then
-  spike_err "codex exec exited with status $RUN_RC (see $CAP/stderr.txt)"
-  OK=0
-fi
+}
 # hello_ok: the file holds exactly "hello from codex", with or without ONE trailing newline (no extra blank lines).
 # The added "x" keeps command substitution from stripping trailing newlines, so the bytes are compared as they are.
 hello_ok() {
