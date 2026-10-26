@@ -1,23 +1,23 @@
-'use client';
-import { ReactNode, useRef, useState } from 'react';
+// Motion Primitives: In View (vendored, typed for strict mode). Use only through src/components/motion/Reveal.
+import { useRef, useState, type ReactNode } from "react";
 import {
   motion,
   useInView,
-  Variant,
-  Transition,
-  UseInViewOptions,
-} from 'motion/react';
+  type Transition,
+  type UseInViewOptions,
+  type Variant,
+} from "motion/react";
 
 export type InViewProps = {
   children: ReactNode;
+  className?: string;
   variants?: {
     hidden: Variant;
     visible: Variant;
   };
   transition?: Transition;
   viewOptions?: UseInViewOptions;
-  as?: React.ElementType;
-  once?: boolean
+  once?: boolean;
 };
 
 const defaultVariants = {
@@ -27,32 +27,29 @@ const defaultVariants = {
 
 export function InView({
   children,
+  className,
   variants = defaultVariants,
   transition,
   viewOptions,
-  as = 'div',
-  once
+  once,
 }: InViewProps) {
-  const ref = useRef(null);
+  const ref = useRef<HTMLDivElement>(null);
   const isInView = useInView(ref, viewOptions);
-
-  const [isViewed, setIsViewed] = useState(false)
-
-  const MotionComponent = motion[as as keyof typeof motion] as typeof as;
+  const [isViewed, setIsViewed] = useState(false);
 
   return (
-    <MotionComponent
+    <motion.div
       ref={ref}
-      initial='hidden'
+      className={className}
+      initial="hidden"
       onAnimationComplete={() => {
-        if (once) setIsViewed(true)
+        if (once === true) setIsViewed(true);
       }}
-      animate={(isInView || isViewed) ? "visible" : "hidden"}
-
+      animate={isInView || isViewed ? "visible" : "hidden"}
       variants={variants}
-      transition={transition}
+      {...(transition === undefined ? {} : { transition })}
     >
       {children}
-    </MotionComponent>
+    </motion.div>
   );
 }

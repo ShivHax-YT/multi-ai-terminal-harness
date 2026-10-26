@@ -1,20 +1,16 @@
-'use client';
-import {
-  AnimatePresence,
-  Transition,
-  Variant,
-  motion,
-  MotionProps,
-} from 'motion/react';
-import { cn } from '@/lib/utils';
+// Motion Primitives: Transition Panel (vendored, typed for strict mode). Use only through
+// src/components/motion/PanelSwitch.
+import type { ReactNode } from "react";
+import { AnimatePresence, motion, type Transition, type Variant } from "motion/react";
+import { cn } from "@/lib/utils";
 
 export type TransitionPanelProps = {
-  children: React.ReactNode[];
+  children: ReactNode[];
   className?: string;
   transition?: Transition;
   activeIndex: number;
   variants?: { enter: Variant; center: Variant; exit: Variant };
-} & MotionProps;
+};
 
 export function TransitionPanel({
   children,
@@ -22,23 +18,17 @@ export function TransitionPanel({
   transition,
   variants,
   activeIndex,
-  ...motionProps
 }: TransitionPanelProps) {
   return (
-    <div className={cn('relative', className)}>
-      <AnimatePresence
-        initial={false}
-        mode='popLayout'
-        custom={motionProps.custom}
-      >
+    <div className={cn("relative", className)}>
+      <AnimatePresence initial={false} mode="popLayout">
         <motion.div
           key={activeIndex}
-          variants={variants}
-          transition={transition}
-          initial='enter'
-          animate='center'
-          exit='exit'
-          {...motionProps}
+          {...(variants === undefined ? {} : { variants })}
+          {...(transition === undefined ? {} : { transition })}
+          initial="enter"
+          animate="center"
+          exit="exit"
         >
           {children[activeIndex]}
         </motion.div>
