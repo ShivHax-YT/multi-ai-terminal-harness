@@ -1,7 +1,7 @@
 # Codex headless events (`codex exec --json`), T-003
 
 Input for T-004 (adapter interface and normalized event schema). Everything here is marked **observed** (seen in a real
-run on the human's Mac) or **from docs** (taken from official material, not yet seen). Nothing is observed yet: the live
+run on the human's Mac) or **from docs** (taken from official material, not yet seen). Only the CLI flag placement is observed (via `--help`, codex-cli 0.162.0); no event stream is observed yet: the live
 run is the human's step, and the implementer of T-003 never ran a Codex binary. When the human has run `run.sh` and
 `resume.sh`, change "from docs" to "observed" row by row, add `spike/fixtures/codex/observed.jsonl` (redacted with
 `spike_redact`, read by a human first), and record differences in the last section.
@@ -12,7 +12,7 @@ run is the human's step, and the implementer of T-003 never ran a Codex binary. 
 |---|---|---|
 | S1 | The official `@openai/codex-sdk` TypeScript package, version 0.164.0, type definitions (`dist/index.d.ts`) and source (`dist/index.js`), downloaded from the npm registry. It documents `ThreadEvent` and `ThreadItem`, "Top-level JSONL events emitted by codex exec". | every event and item shape; usage fields; how the SDK builds the `exec` and `resume` command line |
 | S2 | The same package's README | threads persist in Codex's own session store and are resumed by thread id |
-| S3 | Official Codex non-interactive documentation (`codex exec`, `codex exec resume`) and `codex exec --help`, `codex exec resume --help` | flag names `--json`, `--sandbox`, `-C`. **Not re-read this session**: the docs host was not reachable from the build sandbox, so these flag names rest on S1 (which uses `--sandbox` and `--cd`) and on the implementer's recollection of the docs. The human confirms them with `--help` on the Mac. |
+| S3 | `codex exec --help` and `codex exec resume --help` of the installed codex-cli 0.162.0 (checked by the T-003 reviewer; also the official non-interactive docs, which the build sandbox could not reach) | flag names and placement of `--json`, `--sandbox`, `-C`: **observed via --help, codex-cli 0.162.0** (see "CLI facts") |
 
 Flag names are never guessed beyond that list. Anything the scripts depend on and S1 does not show is listed under "To
 confirm on the Mac" at the end.
@@ -23,8 +23,9 @@ confirm on the Mac" at the end.
 |---|---|---|
 | `codex exec` is the headless mode; with `--json` stdout is one JSON object per line (JSONL) | from docs | S1, S3 |
 | The first event of a run is `thread.started` with the `thread_id`, "can be used to resume the thread later" | from docs | S1 |
-| Options such as `--sandbox <mode>` and `--cd <dir>` belong to `codex exec` and are placed before the `resume` word; the SDK builds `exec <options> resume <thread_id>` and passes the prompt separately | from docs | S1 |
-| `run.sh` runs `exec --json --sandbox workspace-write -C <worktree> "<task>"`; `resume.sh` runs `exec --json --sandbox workspace-write -C <worktree> resume <thread_id> "<prompt>"` | design | brief T-003, S1 |
+| `-C <dir>` and `--sandbox <mode>` are options of `codex exec` only and must be placed before the `resume` word. `codex exec resume -C ...` fails with "unexpected argument". Options before `resume` parse. The SDK builds `exec <options> resume <thread_id>` the same way | observed via --help, codex-cli 0.162.0 | S3, S1 |
+| `--json` is accepted by both `codex exec` and `codex exec resume` (the SDK passes `--experimental-json`; plain `--json` is what 0.162.0 documents) | observed via --help, codex-cli 0.162.0 | S3 |
+| `run.sh` runs `exec --json --sandbox workspace-write -C <worktree> "<task>"`; `resume.sh` runs `exec --json --sandbox workspace-write -C <worktree> resume <thread_id> "<prompt>"`. The test pins this exact argument vector on the single `spike_run_live` line of each script: nothing may be appended after `-C "$WT"` (or after the prompt), and `--enable`, `--disable`, `--ignore-user-config`, `--strict-config`, `--ignore-rules`, `-c`/`-ckey=value`, `--config`, `--profile` are explicitly rejected | design | brief T-003, S1, S3 |
 | Sandbox modes: `read-only`, `workspace-write`, `danger-full-access`; the scripts use only `workspace-write` | from docs | S1 |
 | A thread has many turns; each `exec` or `exec resume` call is one turn (`turn.started` ... `turn.completed` or `turn.failed`) | from docs | S1 |
 | A resumed run is expected to report the same `thread_id` in its own `thread.started` | to confirm | `resume.sh` prints whether it did |
@@ -81,8 +82,12 @@ item type, `future_item_kind`.
 non-fatal `error` item. There is **no dedicated rate-limit event or field** in S1. A rate or usage limit therefore
 arrives, if at all, as text in one of those messages. `parse.jq` classifies each such carrier into
 `limit_or_error_events` with `kind: "rate_limit"` when its message matches a case-insensitive text heuristic (rate limit,
-usage limit, quota, too many requests, a standalone 429, "try again in/later", limit reached/exceeded) and `kind: "error"`
-otherwise. Agent text (`agent_message`, `reasoning`) is never classified, because the model can write any words. The
+usage limit, `insufficient_quota`, quota exceeded/reached, too many requests, a standalone 429) and `kind: "error"`
+otherwise. The heuristic is deliberately narrow: "try again in/later" and "exceeded ... limit" were removed because
+ordinary 5xx and retry-exhaustion texts (for example "exceeded retry limit, last status: 503") contain them and are not
+limits. **Residual false-positive risk for T-004**: any error whose text merely mentions a rate limit, a quota or a number
+429 (a request id, a port, a line count) is flagged, and a real limit worded differently is missed (a false negative). One
+carrier is listed once: error items are de-duplicated by item id before listing. Agent text (`agent_message`, `reasoning`) is never classified, because the model can write any words. The
 heuristic is **not observed**: the fixture `failure.jsonl` uses synthetic messages written to exercise it. T-004 must
 treat the text match as a hint and keep exit status and the human's report as the other signals. Limits were never
 provoked for this spike.
@@ -139,9 +144,10 @@ and is only data.
 
 ## To confirm on the Mac (live run)
 
-1. `codex exec --help` lists `--json`, `--sandbox`, and `-C`/`--cd`; `codex exec resume --help` shows where its options go.
-   If `resume` does not accept the options before the word `resume` (or needs `--json` after it), `resume.sh` fails
-   with a usage error from Codex and nothing else; record the working order here and report it to the lead.
+1. Flag placement is already **observed via --help, codex-cli 0.162.0**: `-C` and `--sandbox` are `codex exec` options only
+   (before `resume`; `codex exec resume -C ...` fails "unexpected argument"), `--json` works on `exec` and `exec resume`.
+   The human only re-checks that `codex exec --help` and `codex exec resume --help` still say so for the installed
+   version, and records a changed order here.
 2. The real event stream matches this file. Differences (extra fields, extra event or item types, `thread_id` format,
    whether `item.updated` appears, whether usage has all five numbers) go in a new "Observed differences" table.
 3. Exit statuses of a normal run, a failed turn and a killed run.

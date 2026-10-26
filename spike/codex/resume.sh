@@ -11,9 +11,9 @@
 #   4. Runs once, from the same worktree, under a 120 s watchdog (no retry, no loop; a second resume of the same capture
 #      is refused):
 #        codex exec --json --sandbox workspace-write -C <worktree> resume <thread_id> "<prompt>"
-#      Flag placement: the options belong to `codex exec` and come BEFORE the `resume` word, exactly as the official
-#      TypeScript SDK builds this command line (see EVENTS.md, "CLI facts"). The human confirms with
-#      `codex exec resume --help` on the Mac and records any difference in the T-003 notes.
+#      Flag placement (verified with `--help`, codex-cli 0.162.0): `-C` and `--sandbox` are options of `codex exec` only and
+#      must come BEFORE the `resume` word; `codex exec resume -C ...` fails with "unexpected argument". `--json` is accepted
+#      by both `exec` and `exec resume`. Nothing may be added after `resume <id> <prompt>` (see EVENTS.md, "CLI facts").
 #   5. Writes resume.combined.txt, resume.raw.jsonl, resume.stderr.txt, resume.parsed.json, resume.exit_code.txt and
 #      resume.observed.redacted.jsonl next to the first capture.
 # Everything the child printed is untrusted data: counted and parsed with jq only.
@@ -87,8 +87,7 @@ if [ "$?" -ne 0 ]; then
 fi
 
 # ---- the one invocation (no retry, no loop) ------------------------------------------------------------------------------------
-spike_run_live "$WATCHDOG_SECS" "$CAP/resume.combined.txt" "$SPIKE_VERIFIED_COPY" \
-  exec --json --sandbox workspace-write -C "$WT" resume "$THREAD_ID" "$PROMPT"
+spike_run_live "$WATCHDOG_SECS" "$CAP/resume.combined.txt" "$SPIKE_VERIFIED_COPY" exec --json --sandbox workspace-write -C "$WT" resume "$THREAD_ID" "$PROMPT"
 RUN_RC=$?
 printf '%s\n' "$RUN_RC" > "$CAP/resume.exit_code.txt"
 
@@ -117,8 +116,15 @@ else
   echo "thread id after resume: differs or missing ($NEW_ID); record this in EVENTS.md"
   OK=0
 fi
-if [ -f "$WT/hello.txt" ] && [ "$(sed -n 1p "$WT/hello.txt")" = "hello from codex" ] \
-  && [ "$(sed -n 2p "$WT/hello.txt")" = "resumed" ] && [ "$(wc -l < "$WT/hello.txt" | tr -d ' ')" = "2" ]; then
+# hello_ok: the file holds exactly "hello from codex" and "resumed" as two lines, the second with or without a trailing
+# newline (no extra lines). The added "x" keeps command substitution from stripping trailing newlines.
+hello_ok() {
+  local got
+  [ -f "$1/hello.txt" ] || return 1
+  got="$(cat "$1/hello.txt" 2>/dev/null; printf x)"
+  [ "$got" = "hello from codex"$'\n'"resumedx" ] || [ "$got" = "hello from codex"$'\n'"resumed"$'\n'"x" ]
+}
+if hello_ok "$WT"; then
   echo "hello.txt: OK (two lines: hello from codex / resumed)"
 else
   echo "hello.txt: second line missing or content differs"

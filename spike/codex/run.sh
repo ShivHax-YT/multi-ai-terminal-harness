@@ -67,8 +67,7 @@ printf '%s\n' "$WT" > "$CAP/worktree.txt"
 printf '%s\n' "$TASK" > "$CAP/task.txt"
 
 # ---- the one invocation (no retry, no loop) ------------------------------------------------------------------------------------
-spike_run_live "$WATCHDOG_SECS" "$CAP/combined.txt" "$SPIKE_VERIFIED_COPY" \
-  exec --json --sandbox workspace-write -C "$WT" "$TASK"
+spike_run_live "$WATCHDOG_SECS" "$CAP/combined.txt" "$SPIKE_VERIFIED_COPY" exec --json --sandbox workspace-write -C "$WT" "$TASK"
 RUN_RC=$?
 printf '%s\n' "$RUN_RC" > "$CAP/exit_code.txt"
 
@@ -90,7 +89,15 @@ elif [ "$RUN_RC" -ne 0 ]; then
   spike_err "codex exec exited with status $RUN_RC (see $CAP/stderr.txt)"
   OK=0
 fi
-if [ -f "$WT/hello.txt" ] && [ "$(cat "$WT/hello.txt")" = "hello from codex" ]; then
+# hello_ok: the file holds exactly "hello from codex", with or without ONE trailing newline (no extra blank lines).
+# The added "x" keeps command substitution from stripping trailing newlines, so the bytes are compared as they are.
+hello_ok() {
+  local got
+  [ -f "$1/hello.txt" ] || return 1
+  got="$(cat "$1/hello.txt" 2>/dev/null; printf x)"
+  [ "$got" = "hello from codexx" ] || [ "$got" = "hello from codex"$'\n'"x" ]
+}
+if hello_ok "$WT"; then
   echo "hello.txt: OK (exactly one line: hello from codex)"
 else
   echo "hello.txt: MISSING or different content"

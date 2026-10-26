@@ -29,7 +29,9 @@ def is_item_event: isobj and (.type == "item.started" or .type == "item.updated"
 def etype: if isobj then (.type | clip(64)) else null end;
 def keys_of: if isobj then [keys_unsorted[:20][] | clip(64)] else [] end;
 def count_by_key(f): reduce f as $k ({}; .[$k] += 1);
-def ratelimit_text: test("rate.?limit|usage.?limit|quota|too many requests|\\b429\\b|try again (in|later)|limit (reached|exceeded)|exceeded.*limit"; "i");
+# Deliberately narrow: only wording that names a rate or usage limit, a quota, or HTTP 429. Retry-exhaustion and 5xx texts
+# ("exceeded retry limit, last status: 503", "try again later") are ordinary errors, not limits. Still a hint only.
+def ratelimit_text: test("rate.?limit|usage.?limit|insufficient_quota|quota (exceeded|reached)|exceeded.{0,20}quota|too many requests|\\b429\\b"; "i");
 
 [ inputs
   | select(type == "string" and length > 0)
@@ -71,13 +73,16 @@ def ratelimit_text: test("rate.?limit|usage.?limit|quota|too many requests|\\b42
       last_message_excerpt: ( [ $final_items[] | select(.type == "agent_message") | .item.text | clip(200) ] | last )
     },
     limit_or_error_events: (
-      [ $events[]
-        | if isobj and .type == "error" then {type: "error", msg: .message}
-          elif isobj and .type == "turn.failed" then {type: "turn.failed", msg: (.error | if isobj then .message else . end)}
-          elif is_item_event and (.item | isobj) and .item.type == "error" then {type: "item.error", msg: .item.message}
-          else empty end
-        | {type, kind: (if (.msg | type == "string") and (.msg | ratelimit_text) then "rate_limit" else "error" end),
-           message: (.msg | clip(200))} ] ),
+      ( [ $events | to_entries[]
+          | .key as $idx | .value
+          | if isobj and .type == "error" then {idx: $idx, type: "error", msg: .message}
+            elif isobj and .type == "turn.failed" then {idx: $idx, type: "turn.failed", msg: (.error | if isobj then .message else . end)}
+            else empty end ]
+        # error items come from the de-duplicated items: one entry per item id, not one per started/updated/completed event
+        + [ $final_items[] | select(.type == "error") | {idx: .idx, type: "item.error", msg: .item.message} ] )
+      | sort_by(.idx)
+      | map({type, kind: (if (.msg | type == "string") and (.msg | ratelimit_text) then "rate_limit" else "error" end),
+             message: (.msg | clip(200))}) ),
     unknown: (
       [ $events[] | select(is_known(known_events; etype) | not)
         | {kind: "event", type: etype, keys: keys_of} ]

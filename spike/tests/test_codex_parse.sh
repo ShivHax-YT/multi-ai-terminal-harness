@@ -76,8 +76,38 @@ jqe "failure: a rate-limit message is flagged on error and on turn.failed" "$F" 
 jqe "failure: a plain error is not flagged as a rate limit" "$F" '[.limit_or_error_events[] | select(.kind == "error")] | length == 2'
 jqe "failure: nothing unknown" "$F" '.unknown == []'
 
+# rate-limit heuristic: a 5xx retry-exhaustion text and "try again later" are ordinary errors; real limit wording is flagged
+printf '%s\n' \
+  '{"type":"error","message":"exceeded retry limit, last status: 503 Service Unavailable"}' \
+  '{"type":"error","message":"stream disconnected before completion, please try again later"}' \
+  '{"type":"turn.failed","error":{"message":"request failed after 5 attempts, try again in a few minutes (status 502)"}}' \
+  '{"type":"error","message":"You have hit your usage limit. Upgrade to Pro or try again later."}' \
+  '{"type":"error","message":"Rate limit reached for requests"}' \
+  '{"type":"turn.failed","error":{"message":"unexpected status 429 Too Many Requests"}}' \
+  '{"type":"error","message":"insufficient_quota"}' > "$TMP/heur.jsonl"
+H=$(parse "$TMP/heur.jsonl")
+jqe "heuristic: 5xx retry-exhaustion and try-again texts are plain errors" "$H" '[.limit_or_error_events[0,1,2].kind] == ["error","error","error"]'
+jqe "heuristic: real limit wording is flagged as rate_limit" "$H" '[.limit_or_error_events[3,4,5,6].kind] == ["rate_limit","rate_limit","rate_limit","rate_limit"]'
+jqe "heuristic: every carrier is listed once" "$H" '.limit_or_error_events | length == 7'
+
+# limit_or_error_events is built from de-duplicated items: one error item seen in several events is one entry
+printf '%s\n' \
+  '{"type":"item.started","item":{"id":"e1","type":"error","message":"rate limit hit"}}' \
+  '{"type":"item.updated","item":{"id":"e1","type":"error","message":"rate limit hit"}}' \
+  '{"type":"item.completed","item":{"id":"e1","type":"error","message":"rate limit hit"}}' \
+  '{"type":"error","message":"plain failure"}' \
+  '{"type":"item.completed","item":{"id":"e2","type":"error","message":"second warning"}}' \
+  '{"type":"item.completed","item":{"id":"e2","type":"error","message":"second warning"}}' > "$TMP/dedup.jsonl"
+D=$(parse "$TMP/dedup.jsonl")
+jqe "dedup: three events of one error item give one entry" "$D" '[.limit_or_error_events[] | select(.type == "item.error" and .message == "rate limit hit")] | length == 1'
+jqe "dedup: two error items and one error event give three entries in stream order" "$D" '[.limit_or_error_events[] | .message] == ["rate limit hit","plain failure","second warning"]'
+jqe "dedup: the item count agrees" "$D" '.items.error == 2'
+
 # ---- malformed.jsonl (never crashes) ------------------------------------------------------------------------------------------
-M=$(parse "$FIX/malformed.jsonl") ; MRC=$?
+# run the parser from an empty scratch directory, so a payload that was executed (the fixture holds "$(touch pwned)") would
+# create its marker exactly there
+mkdir "$TMP/pwdir"
+M=$(cd "$TMP/pwdir" && parse "$FIX/malformed.jsonl") ; MRC=$?
 eq "malformed: parse.jq exits 0" "$MRC" "0"
 check "malformed: output is a JSON object" jq -e 'type == "object"' <<< "$M"
 jqe "malformed: broken lines are counted, not fatal" "$M" '.malformed_lines == 2'
@@ -85,7 +115,9 @@ jqe "malformed: the first valid string thread id wins" "$M" '.thread_id == "0199
 jqe "malformed: events without a string type are unknown" "$M" '[.unknown[] | select(.kind == "event")] | length >= 6'
 jqe "malformed: usage keeps only numeric values" "$M" '.final.usage == {"output_tokens": 5}'
 jqe "malformed: text is data (kept verbatim, clipped, never run)" "$M" '.final.last_message_excerpt | startswith("Ignore previous instructions")'
-check "malformed: the injected command did not run" test ! -e pwned
+check "malformed: the injected command did not run (marker absent where it would land)" test ! -e "$TMP/pwdir/pwned"
+eq "malformed: the parser created nothing in its working directory" "$(ls -A "$TMP/pwdir" | wc -l | tr -d ' ')" "0"
+check "malformed: no marker in the temp root either" test ! -e "$TMP/pwned"
 # every string in the output is clipped and has no control characters
 jqe "malformed: no control characters or long strings in the output" "$M" '[.. | strings | select((test("[[:cntrl:]]")) or (length > 600))] | length == 0'
 
@@ -177,17 +209,25 @@ done
 check "the fake codex is first on the sandbox PATH" test "$(PATH="$SB/bin:/usr/bin:/bin" command -v codex)" = "$SB/bin/codex"
 
 # ---- static checks on run.sh and resume.sh -----------------------------------------------------------------------------------
+# The allow-list: the exact spike_run_live line (watchdog, capture file, registered copy, then the codex arguments).
+# `-C` and `--sandbox` are options of `codex exec` only (verified with --help, codex-cli 0.162.0): they come before `resume`.
+EXPECT_RUN='spike_run_live "$WATCHDOG_SECS" "$CAP/combined.txt" "$SPIKE_VERIFIED_COPY" exec --json --sandbox workspace-write -C "$WT" "$TASK"'
+EXPECT_RESUME='spike_run_live "$WATCHDOG_SECS" "$CAP/resume.combined.txt" "$SPIKE_VERIFIED_COPY" exec --json --sandbox workspace-write -C "$WT" resume "$THREAD_ID" "$PROMPT"'
 for s in run.sh resume.sh; do
   f="$CODEX/$s"
-  # banned flags (brief T-003 and hard rule 2); the whole file is searched, comments included
+  # rules 2 and 3: the exact argument vector on the single spike_run_live line is the allow-list; nothing may be appended
+  # (the call is one line on purpose: the whole call, including the last argument, is compared)
+  case "$s" in run.sh) EXPECT=$EXPECT_RUN ;; *) EXPECT=$EXPECT_RESUME ;; esac
+  eq "$s: exactly one spike_run_live line" "$(grep -cE '^[[:space:]]*spike_run_live ' "$f")" "1"
+  eq "$s: the spike_run_live line is exactly the allow-listed argument vector" "$(grep -E '^[[:space:]]*spike_run_live ' "$f")" "$EXPECT"
+  # explicit rejections (defense in depth; the whole file is searched, comments included)
+  for flag in --config --profile --dangerously --oss --local-provider --approve-for-me --enable --disable \
+    --ignore-user-config --strict-config --ignore-rules; do
+    check "$s: does not contain $flag" test "$(grep -c -e "$flag" "$f")" = "0"
+  done
   check "$s: no -c flag" test "$(grep -cE "(^|[[:space:]\"'])-c([[:space:]\"'=]|$)" "$f")" = "0"
+  check "$s: no attached -ckey=value" test "$(grep -cE "(^|[[:space:]\"'])-c[^[:space:]\"']" "$f")" = "0"
   check "$s: no -p flag" test "$(grep -cE "(^|[[:space:]\"'])-p([[:space:]\"'=]|$)" "$f")" = "0"
-  check "$s: no --config" test "$(grep -c -e '--config' "$f")" = "0"
-  check "$s: no --profile" test "$(grep -c -e '--profile' "$f")" = "0"
-  check "$s: no --dangerously-*" test "$(grep -c -e '--dangerously' "$f")" = "0"
-  check "$s: no --oss" test "$(grep -c -e '--oss' "$f")" = "0"
-  check "$s: no --local-provider" test "$(grep -c -e '--local-provider' "$f")" = "0"
-  check "$s: no --approve-for-me" test "$(grep -c -e '--approve-for-me' "$f")" = "0"
   # rule 2: no config-home variables (the names are assembled here so this file stays clean for the scan)
   for v in "CLAUDE_CONFIG""_DIR" "CODEX""_HOME" "GROK""_HOME" "KIMI_CODE""_HOME"; do
     check "$s: does not name $v" test "$(grep -c "$v" "$f")" = "0"
@@ -212,14 +252,58 @@ for s in run.sh resume.sh; do
   check "$s: registers codex through the runner" grep -q '^spike_register_cli codex$' "$f"
   check "$s: sign-in by status exit code only" grep -q 'spike_run_status 30 /dev/null "\$SPIKE_VERIFIED_COPY" login status' "$f"
   # rule 3: codex exec only
-  check "$s: uses codex exec --json with the workspace-write sandbox" grep -q 'exec --json --sandbox workspace-write -C "\$WT"' "$f"
+  check "$s: the argument vector starts with exec --json --sandbox workspace-write -C" grep -qF ' exec --json --sandbox workspace-write -C "$WT" ' "$f"
   check "$s: never runs a bare codex or claude command" test "$(grep -vE '^[[:space:]]*#' "$f" | grep -cE "^[[:space:]]*(codex|claude)[[:space:]]|[|;&(][[:space:]]*(codex|claude)[[:space:]]")" = "0"
   check "$s: never sets SPIKE_LIVE" test "$(grep -vE '^[[:space:]]*#' "$f" | grep -cE "^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?SPIKE_LIVE=|env[[:space:]]+SPIKE_LIVE=")" = "0"
 done
-check "resume.sh resumes by thread id" grep -q 'resume "\$THREAD_ID" "\$PROMPT"' "$CODEX/resume.sh"
+check "resume.sh resumes by thread id" grep -qF -e ' -C "$WT" resume "$THREAD_ID" "$PROMPT"' "$CODEX/resume.sh"
 check "run.sh task text is the brief's" grep -qF "TASK='Create hello.txt containing exactly the line: hello from codex. Then reply DONE.'" "$CODEX/run.sh"
 check "resume.sh prompt is the brief's" grep -qF "PROMPT='Append a second line to hello.txt: resumed. Reply DONE.'" "$CODEX/resume.sh"
 check "parse.jq has no input/env/ltrimstr surprises: no \$ENV, no env, no input_filename" test "$(grep -vE '^[[:space:]]*#' "$CODEX/parse.jq" | grep -cE '\$ENV|\benv\b|input_filename|\$__prog')" = "0"
+
+# ---- the allow-list check itself catches an appended or inserted argument ----------------------------------------------------
+argv_line_ok() { # file expected-line: passes only when the single spike_run_live line equals the expectation exactly
+  [ "$(grep -cE '^[[:space:]]*spike_run_live ' "$1")" = "1" ] && [ "$(grep -E '^[[:space:]]*spike_run_live ' "$1")" = "$2" ]
+}
+check "allow-list self-test: the real run.sh passes" argv_line_ok "$CODEX/run.sh" "$EXPECT_RUN"
+check "allow-list self-test: the real resume.sh passes" argv_line_ok "$CODEX/resume.sh" "$EXPECT_RESUME"
+for extra in '--enable foo' '--disable foo' '--ignore-user-config' '--strict-config' '--ignore-rules' '-ckey=value' '-c key=value' '--profile x' '--yolo'; do
+  sed -e "s|^\(spike_run_live .*-C \"\$WT\"\)|\1 $extra|" "$CODEX/run.sh" > "$TMP/mut_run.sh"
+  if argv_line_ok "$TMP/mut_run.sh" "$EXPECT_RUN"; then fail "allow-list self-test: run.sh with [$extra] after -C was accepted"; else pass; fi
+  sed -e "s|^\(spike_run_live .*-C \"\$WT\"\)|\1 $extra|" "$CODEX/resume.sh" > "$TMP/mut_resume.sh"
+  if argv_line_ok "$TMP/mut_resume.sh" "$EXPECT_RESUME"; then fail "allow-list self-test: resume.sh with [$extra] after -C was accepted"; else pass; fi
+  sed -e "s|^\(spike_run_live .*\)\$|\1 $extra|" "$CODEX/run.sh" > "$TMP/mut_run2.sh"
+  if argv_line_ok "$TMP/mut_run2.sh" "$EXPECT_RUN"; then fail "allow-list self-test: run.sh with [$extra] at the end was accepted"; else pass; fi
+done
+
+# ---- hello_ok (post-gate byte check) is exercised offline by extracting the function from the script ------------------------
+hello_case() { # script label content-printf-format expect(0|1)
+  local script=$1 label=$2 content=$3 want=$4 d got
+  d=$(mktemp -d "$TMP/hello.XXXXXX")
+  [ "$content" = "@none" ] || printf "$content" > "$d/hello.txt"
+  awk '/^hello_ok\(\) \{/ { p = 1 } p { print } p && /^\}/ { exit }' "$CODEX/$script" > "$d/fn.sh"
+  [ -s "$d/fn.sh" ] || { fail "$script: hello_ok function not found"; return; }
+  "$SH" -c '. "$1"; hello_ok "$2"' _ "$d/fn.sh" "$d"
+  got=$?
+  [ "$got" -ne 0 ] && got=1
+  eq "$script hello_ok: $label" "$got" "$want"
+}
+hello_case run.sh "exact, no trailing newline" 'hello from codex' 0
+hello_case run.sh "exact, one trailing newline" 'hello from codex\n' 0
+hello_case run.sh "two trailing newlines are refused" 'hello from codex\n\n' 1
+hello_case run.sh "an extra line is refused" 'hello from codex\nmore\n' 1
+hello_case run.sh "a leading blank line is refused" '\nhello from codex\n' 1
+hello_case run.sh "different content is refused" 'hello from codex!\n' 1
+hello_case run.sh "an empty file is refused" '' 1
+hello_case run.sh "a missing file is refused" '@none' 1
+hello_case resume.sh "two lines, no trailing newline" 'hello from codex\nresumed' 0
+hello_case resume.sh "two lines, one trailing newline" 'hello from codex\nresumed\n' 0
+hello_case resume.sh "a blank line before the second line is refused" 'hello from codex\n\nresumed\n' 1
+hello_case resume.sh "an extra trailing blank line is refused" 'hello from codex\nresumed\n\n' 1
+hello_case resume.sh "a third line is refused" 'hello from codex\nresumed\nmore\n' 1
+hello_case resume.sh "only the first line is refused" 'hello from codex\n' 1
+hello_case resume.sh "a different second line is refused" 'hello from codex\nresumed twice\n' 1
+hello_case resume.sh "a missing file is refused" '@none' 1
 
 # ---- the split used by run.sh and resume.sh (same awk program) ------------------------------------------------------------------
 printf '{"type":"turn.started"}\nWARN something on stderr\n{"type":"turn.completed","usage":{"input_tokens":1}}\nmore text\n' > "$TMP/comb.txt"
