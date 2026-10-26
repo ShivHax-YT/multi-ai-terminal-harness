@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a54"}
+{"type":"turn.started"}
+{"type":"error","message":"synthetic: stream error, last status: 429 Too Many Requests"}
+{"type":"turn.failed","error":{"message":"synthetic: usage limit reached, try again in 3 hours"}}
+{"type":"error","message":"synthetic: sandbox could not start"}
+{"type":"turn.failed","error":{"message":"synthetic: sandbox could not start"}}
