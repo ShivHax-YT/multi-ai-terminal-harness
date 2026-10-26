@@ -31,6 +31,9 @@ most Linux have it; only core modules are used).
     is gone). The tool must be a native executable (not a `#!` script), owned by you or root and not group/world writable,
     in `/bin /usr/bin /usr/sbin /sbin /usr/local /opt/homebrew`. A wrapper or copy first on `PATH` is refused and never run
     (preflight then reports the tool MISSING and exits 1). The closed environment and watchdog are the same as for every run.
+  - **`spike_run_live_split` (T-008)** is `spike_run_live` with stdout and stderr in separate files. Same gate,
+    verified-copy rule, environment, watchdog and signals. The errfile gets the outfile policy (O_NOFOLLOW, 0600; no
+    symlink, hard link, FIFO or CLI-home parent), and an errfile that resolves to the outfile is refused.
   - **A pinned CLI name runs live only as the registered copy.** `spike_run_live` (and `spike_run_timeout` after its gate)
     refuses, rc 3 and the script stops, a command whose basename or resolved basename is `claude` or `codex` (also
     `claude.exe`, `claude-real`) unless it is the current registered, hash-verified copy (`$SPIKE_VERIFIED_COPY`).
@@ -117,7 +120,7 @@ most Linux have it; only core modules are used).
 
 | Path | Status | Purpose |
 |---|---|---|
-| `lib/common.sh` | done (T-001) | sourced helpers: `spike_scratch_repo`, `spike_worktree_add`, `spike_cleanup`, `spike_require_live`, `spike_capture_dir`, `spike_redact`, `spike_resolve_path`, `spike_run_timeout`, `spike_run_live`, `spike_run_status <seconds> <out> "$SPIKE_VERIFIED_COPY" ...`, `spike_run_timed`, `spike_mark_verified <path> <cli>`, `spike_register_cli <name>`, `spike_under_cli_home`, `spike_verify_init`, `spike_verify_dir`, `spike_verify_cleanup`, `spike_tool_path` |
+| `lib/common.sh` | done (T-001) | sourced helpers: `spike_scratch_repo`, `spike_worktree_add`, `spike_cleanup`, `spike_require_live`, `spike_capture_dir`, `spike_redact`, `spike_resolve_path`, `spike_run_timeout`, `spike_run_live`, `spike_run_live_split <seconds> <outfile> <errfile> <cmd> ...` (T-008: stderr to its own file under the outfile policy), `spike_run_status <seconds> <out> "$SPIKE_VERIFIED_COPY" ...`, `spike_run_timed`, `spike_mark_verified <path> <cli>`, `spike_register_cli <name>`, `spike_under_cli_home`, `spike_verify_init`, `spike_verify_dir`, `spike_verify_cleanup`, `spike_tool_path` |
 | `lib/runner.pl` | done (T-001) | the one Perl helper behind `common.sh` (resolve, CLI-home identity check, registration, gate, run with an in-group watchdog); not called directly |
 | `preflight.sh` | done (T-001) | table of install path, version, code-signature result and sign-in state for each CLI; verifies and runs only a private copy |
 | `tests/test_common.sh` | done (T-001) | offline tests for `lib/common.sh` and `lib/runner.pl` |
