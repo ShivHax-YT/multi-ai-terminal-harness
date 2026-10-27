@@ -110,7 +110,7 @@ def step($seq; $st):
     elif $rk == "turn.completed" then
       (if ($o.usage | isobj) then $o.usage else {} end) as $u
       | {ev: [ ev($seq; "result"; $rk;
-                  {is_error: false, turns: 1,
+                  {is_error: false, turns: 1, turns_known: true,
                    tokens: {input: ($u.input_tokens | int0), output: ($u.output_tokens | int0),
                             cache_read: ($u.cached_input_tokens | int0), cache_write: ($u.cache_write_input_tokens | int0),
                             reasoning: ($u.reasoning_output_tokens | int0)},
@@ -121,7 +121,7 @@ def step($seq; $st):
       ($o.error | if isobj then .message else . end) as $msg
       | {ev: [ fatal_events($seq; $rk; "turn_failed"; $msg),
                ev($seq; "result"; $rk;
-                  {is_error: true, turns: 1, tokens: zero_tokens, tokens_known: false, cost_usd: null, cost_is_estimate: true}) ],
+                  {is_error: true, turns: 1, turns_known: true, tokens: zero_tokens, tokens_known: false, cost_usd: null, cost_is_estimate: true}) ],
          st: $st}
     elif $rk == "error" then
       {ev: [ fatal_events($seq; $rk; "stream_error"; $o.message) ], st: $st}

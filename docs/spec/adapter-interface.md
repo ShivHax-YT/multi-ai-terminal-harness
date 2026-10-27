@@ -144,12 +144,12 @@ row says "`exited` event" when it means the trigger.)
 | 7 | `spawning`, `running` | `rate_limited` seen (any number of times) | stays in that state; sets the invocation's `limit_seen` flag; when the child ends (the `exited` event) the state becomes `rate_limited` | counted once per invocation; later ones only raise `reset_at`; a `rate_limited` seen while `spawning` is not lost |
 | 8 | `rate_limited` | backoff over (rule 10) or the user resumes (`resume`) | `idle` | the scheduler decides; a limit never starts a new session on the same provider [2] |
 | 9 | `idle` | `send(prompt)` | `spawning` | next invocation, resume by id; the invocation flags are empty |
-| 10 | `spawning`, `running`, `idle`, `rate_limited` | `cancel()` or watchdog | `killed` | the adapter feeds no further event of that child to the function (not even its `exited` event); the turn reservation stays |
+| 10 | `spawning`, `running`, `idle`, `rate_limited` | `cancel()` or watchdog | `killed` | the adapter feeds no further event of that child to the function (not even its `exited` event), but it still reaps the child and drains its stdout and stderr to EOF (no zombie process, no blocked pipe); the invocation flags are dropped; the turn reservation stays |
 | 11 | `running` | `result{is_error:false}` seen, then a non-zero exit or death by a signal that was not a `cancel()`, no `rate_limited` seen | `exited` | the invocation's `is_error` is derived from the exit code or signal (true); the `result` event itself is not rewritten; an `exited` event with neither code nor signal is not a clean exit either |
 | 12 | `spawning` | `warning`, `limit_notice`, `unknown`, `error{fatal:false}` | `spawning` | routine; no flag changes |
 | 13 | `spawning` | `error{fatal:true}` | `spawning` | decision: a fatal error is information, not an exit; the state changes only when the child ends (row 3, or row 7 when `limit_seen`), because the `rate_limited` that a Codex limit message emits before its `error` must still win at exit |
 | 14 | `running` | `message`, `tool_call`, `tool_result`, `warning`, `limit_notice`, `error` (fatal or not), `unknown` | `running` | routine; no flag changes |
-| 15 | `running` | `result{is_error}` | `running` | sets `result_seen` and `is_error`; with several `result` events the last one counts (its `is_error` replaces the earlier one) |
+| 15 | `running` | `result{is_error}` | `running` | sets `result_seen` and `is_error`; with several `result` events the last one counts for the flags (its `is_error` replaces the earlier one); the turns settle separately, on the highest known number (see "Turns") |
 | 16 | `exited`, `killed` | `cancel()` or watchdog | unchanged | idempotent no-op, so a second `cancel()` is not an error |
 
 **Illegal transitions.** Any other (state, trigger) pair is an illegal transition and an error in T-120's pure transition
@@ -160,13 +160,16 @@ function; it changes neither the state nor the flags. The ones that matter, list
 - Every normalized event, including the `exited` event, while in `idle` or `rate_limited` (no child is running), and in
   `exited` or `killed` (events after a terminal state).
 - `send(prompt)` in any state but `idle`; `resume` in any state but `rate_limited`; `start` when a state already exists.
-- `cancel()` is legal everywhere (rows 10 and 16).
+- `cancel()` is legal in every state that exists (rows 10 and 16). Before row 1 there is no state and nothing to cancel, so
+  `cancel()` with no state is illegal.
 
 **Invocation flags.** Rows 7 and 15 need memory that a single event cannot give: whether a `rate_limited` was seen earlier in
 this invocation, and what the `result` said. The transition function therefore takes `(state, event, invocation_flags)` and
 returns the new state and the new flags, not `(state, event)`. The flags are `limit_seen` (with the highest `reset_at` seen),
 `result_seen` and `is_error` (that of the last `result`); they start empty at row 1 or 9 and are dropped when the invocation
-ends. Only rows 7 and 15 change them.
+ends. Only rows 7 and 15 change them. An invocation ends at the `exited` event (rows 3 to 7 and 11) or at `cancel()` of a live
+invocation (row 10); the function then returns empty flags. The scheduler takes the highest `reset_at` for its backoff from the
+`rate_limited` events themselves, not from the flags, which are gone by then.
 
 **Precedence when the child ends.** The `exited` event applies it. `limit_seen` wins over rows 3 to 6 and 11: an invocation in
 which a limit was seen ends in `rate_limited` even when it also produced a successful or failed `result`, produced no
@@ -180,25 +183,40 @@ transition and the expected end state of each fixture.
 
 **Turns (rule 1: never more than 40 per task).** `result.turns` is the number of turns used by that invocation: for Claude
 the `num_turns` of its `result`; for Codex 1 per `exec` call (human decision 2026-10-26; the 120 s watchdog bounds one call).
-A Claude call can use up to its `--max-turns`, so the scheduler (T-124) does not count after the fact; it reserves before it
-dispatches. The task's count is always turns used plus turns reserved:
+`result.turns_known` is true only when that number is real: for Claude only when `num_turns` is a number of at least 0
+(missing, a string or a negative number gives `turns_known` false and `turns` 0); for Codex always. A Claude call can use up to
+its `--max-turns`, so the scheduler (T-124) does not count after the fact; it reserves before it dispatches. The task's count is
+always turns used plus turns reserved:
 
+- **Atomic check and reserve.** For one task, computing the remainder, deciding to dispatch or refuse, and recording the
+  reservation are one serialized step (one lock per task, nothing can run between the check and the record). Two concurrent
+  dispatches can never both reserve against the same count.
 - **Reserve at dispatch.** Before every invocation the scheduler reserves that invocation's maximum: for Claude its
   `--max-turns` value, for Codex 1.
 - **Cap Claude to what is left.** For Claude, `--max-turns` is set to min(5, 40 minus turns already used or reserved), where 5
-  is the adapter default. A Claude invocation is never started with `--max-turns` 0.
+  is the adapter default. A Claude invocation is never started with `--max-turns` 0 (or less): the value is always at least
+  1, because the next bullet refuses the dispatch before it could be lower.
 - **Refuse when nothing fits.** The scheduler refuses the dispatch (no child process is started) when the reservation does
-  not fit under 40: Claude when 40 minus turns already used or reserved is 0, Codex when it is less than 1.
-- **A result settles the count.** When a `result` arrives, the reservation is replaced by max(1, `result.turns`). A result
-  that is an error still counts its turns. If an invocation produces several `result` events, the last one settles. A
-  `result.turns` above the reservation (the CLI overshot its own cap) is counted as reported and shrinks what the next
-  dispatch can get.
-- **No result keeps the reservation.** When no `result` arrives (a crash, the watchdog, `cancel()`, a Codex bare top-level
-  `error`), the full reservation stays counted. No failure path can make a run cheaper than its reservation.
+  not fit under 40: for Claude and for Codex alike when 40 minus turns already used or reserved is 0 or less.
+- **A result settles the count.** When `result` events arrive, the reservation is replaced by max(1, the highest `turns`
+  among the invocation's `result` events that have `turns_known` true). The highest counts, not the last, so a later `result`
+  can never lower what an earlier one already counted: once settled, the count of an invocation never goes down. A result that
+  is an error still counts its turns. A settled number above the reservation (the CLI overshot its own cap) is counted as
+  reported and shrinks what the next dispatch can get. The `is_error` flag still follows the last `result` (row 15); the two
+  rules are independent.
+- **No usable result keeps the reservation.** When no `result` arrives (a crash, the watchdog, `cancel()`, a Codex bare
+  top-level `error`), or every `result` has `turns_known` false, the full reservation stays counted: a `result` with
+  `turns_known` false is treated exactly as if no result had arrived. No failure path can make a run cheaper than its
+  reservation.
+- **The count belongs to the task.** The 40 turns are counted per task, not per provider or session, and carry across a
+  failover to another provider: a failover never resets the count (fail-safe reading; round 5 decision C, pending the human's
+  confirmation).
 
 Worked example. At 38 turns used, Claude gets `--max-turns` 2 (min(5, 40 minus 38)). At 40 turns used or reserved, nothing
 is dispatched. A Claude call reserved at 5 and killed before its `result` counts 5. A Claude call reserved at 5 whose `result`
-says `num_turns` 2 counts 2, which frees 3 for the next call.
+says `num_turns` 2 counts 2, which frees 3 for the next call. A Claude call reserved at 5 whose `result` has no `num_turns`
+(`turns_known` false) counts 5. At 38 used, Claude is given 2 and reports `num_turns` 3: 41 is counted as reported, 40 minus 41
+is -1, which is 0 or less, and the next dispatch is refused.
 
 ## Event schema
 
@@ -213,7 +231,9 @@ Rules fixed by the schema and the mappings below:
   toward rule 10 backoff.
 - `rate_limited` is a limit hit, or a limit state this spec does not know (fail safe, human decision 2026-10-26). It carries
   `raw_kind`, and `reset_at` (epoch seconds) or `retry_after_s` when the CLI gave them.
-- `result` always has a numeric `turns` and five numeric token fields (rule 1 accounting). `tokens_known` is false when the
+- `result` always has a numeric `turns`, a boolean `turns_known` and five numeric token fields (rule 1 accounting).
+  `turns_known` is false when Claude's `num_turns` is missing, not a number or negative (`turns` is then 0, and the scheduler
+  keeps the full turn reservation, see "Turns"); for Codex it is always true. `tokens_known` is false when the
   CLI reported no usage (a failed Codex turn), and the five fields are then 0. `cost_usd` is a number or null.
   `cost_is_estimate` is always true for subscription logins (human decision 2026-10-26).
 - `unknown` carries `raw_type` and the key names only, never values. Anything that is neither mapped nor ignored is
@@ -231,13 +251,13 @@ Source column: **observed** = seen in a real run (Claude Code 2.1.310, the human
 | `assistant:tool_use` | observed | `tool_call{id, name}` | the tool input is never copied |
 | `user:tool_result` | observed | `tool_result{id, is_error}` | content is never copied |
 | `assistant` with `error` = `rate_limit` | from docs | `rate_limited{raw_kind:"claude_assistant_rate_limit"}` | no reset information in this shape |
-| `assistant` with any other `error` | from docs | `error{kind, fatal:false, message}` | kind and message are the error code, clipped |
+| `assistant` with any other `error` | from docs | `error{kind, fatal:false, message}` | kind and message are the error code, clipped; an empty error string gives kind `unknown_error` (kind is never empty) and an empty message |
 | `rate_limit_event`, status `allowed` or `allowed_warning` | observed (`allowed`); `allowed_warning` from docs | `limit_notice{status, utilization?, reset_at?}` | routine; `reset_at` = `resetsAt` |
 | `rate_limit_event`, status `rejected` | from docs | `rate_limited{raw_kind:"claude_rejected", reset_at?}` | `claude_credits_required` when `errorCode` is `credits_required` |
 | `rate_limit_event`, any other or missing status | from docs | `rate_limited{raw_kind:"claude_unknown_limit_status", reset_at?}` | fail safe [10] |
 | `system/api_retry` | from docs | `warning{kind:"api_retry"}` | the CLI retries by itself; never `rate_limited`, even for status 429 |
 | `system/permission_denied` | from docs | `warning{kind:"permission_denied"}` | |
-| `result/*` | observed (`result/success`) | `result{is_error, subtype, turns, tokens, tokens_known, cost_usd, cost_is_estimate, stop_reason?, duration_ms?}` | input = `input_tokens`, output = `output_tokens`, cache_read = `cache_read_input_tokens`, cache_write = `cache_creation_input_tokens`, reasoning = 0, turns = `num_turns`, cost = `total_cost_usd`; `is_error` = the field (missing: subtype is not `success`) |
+| `result/*` | observed (`result/success`) | `result{is_error, subtype, turns, turns_known, tokens, tokens_known, cost_usd, cost_is_estimate, stop_reason?, duration_ms?}` | input = `input_tokens`, output = `output_tokens`, cache_read = `cache_read_input_tokens`, cache_write = `cache_creation_input_tokens`, reasoning = 0, turns = `num_turns` (`turns_known` true only when it is a number >= 0, else turns 0 and `turns_known` false), cost = `total_cost_usd`; `is_error` = the field (missing: subtype is not `success`) |
 | `result/*` with `is_error` and `api_error_status` 429 | from docs | `rate_limited{raw_kind:"claude_result_429"}` before the `result` | |
 
 Ignored (no event, no `unknown`):
@@ -266,8 +286,8 @@ Same Source rules (Codex 0.162.0, observed 2026-10-26). Raw key for items is `it
 | `item.completed:` of the same four item types | as above | `tool_call` first if none was seen for that id, then `tool_result{id, is_error}` | `is_error`: status `failed`, or a non-zero `exit_code` |
 | `item.completed:agent_message` | from docs | `message{role:"assistant", text, truncated}` | agent text is never classified |
 | `item.started:error`, `item.completed:error` | observed | `warning{kind:"item_error"}` | one warning per item id. Never `error`, never `rate_limited`: config warnings arrived as items during a successful run |
-| `turn.completed` | observed | `result{is_error:false, turns:1, tokens, tokens_known, cost_usd:null, cost_is_estimate:true}` | input = `input_tokens`, output = `output_tokens`, cache_read = `cached_input_tokens`, cache_write = `cache_write_input_tokens`, reasoning = `reasoning_output_tokens` (all five seen) |
-| `turn.failed` | from docs | `error{kind:"turn_failed", fatal:true}` then `result{is_error:true, turns:1, tokens 0, tokens_known:false}` | |
+| `turn.completed` | observed | `result{is_error:false, turns:1, turns_known:true, tokens, tokens_known, cost_usd:null, cost_is_estimate:true}` | input = `input_tokens`, output = `output_tokens`, cache_read = `cached_input_tokens`, cache_write = `cache_write_input_tokens`, reasoning = `reasoning_output_tokens` (all five seen) |
+| `turn.failed` | from docs | `error{kind:"turn_failed", fatal:true}` then `result{is_error:true, turns:1, turns_known:true, tokens 0, tokens_known:false}` | |
 | `error` | from docs | `error{kind:"stream_error", fatal:true}` | |
 
 On the two fatal carriers (`turn.failed`, top-level `error`) only, a message that matches T-003's rate-limit text heuristic
@@ -301,6 +321,10 @@ Every `item.updated` is ignored whatever its item type.
   valid); `assistant:tool_use` `id` and `name`, and `user:tool_result` `tool_use_id` (non-empty strings); Codex
   `item.completed:agent_message` `text` (a string; an empty string is valid). A Codex tool item without an id is not
   malformed: it gets the id `line<N>` (N = the raw line of its `item.completed`; its `item.started` without an id is dropped), so its call and result match.
+- By design, `error` and `warning` events keep an empty `message` (and an `error` with no message text is still an `error`):
+  a fatal error must never degrade to `unknown` because its text is missing, since the state machine and the rate-limit
+  precedence depend on seeing it. Their `kind` is never empty (the schema says `minLength` 1; an empty Claude `assistant` error
+  string gives kind `unknown_error`), and `tool_call` `id` and `name` and `tool_result` `id` are never empty either.
 - Text: control characters except newline and tab become spaces; message text is clipped to 4000 characters
   (`truncated:true` when clipped), all other text to 300, names and ids to 64 and 100. Nothing is ever executed.
 - Never copied into any event: init tool, MCP, plugin and skill lists, `cwd`, tool inputs, commands, file paths.
