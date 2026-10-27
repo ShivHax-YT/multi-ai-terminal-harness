@@ -78,8 +78,11 @@ Static facts about the adapter, see `$defs.capabilities` in the schema.
 
 - `transport` is `headless` or `acp`. There is no other value, and the registry rejects an adapter that reports neither [3].
 - `resume`: the CLI can continue a conversation by id. `mcp`, `hooks`: the CLI supports them (informational).
-- `native_turn_cap`: the CLI can cap turns inside one invocation by itself (Claude `--max-turns`; Codex has none). The
-  scheduler enforces rule 1's 40 turns per task regardless.
+- `native_turn_cap`: the CLI can cap turns inside one invocation by itself (Claude `--max-turns`; Codex has none). Claude's
+  native cap is what makes the turn reservation enforceable: the scheduler passes the reserved number as `--max-turns` and
+  the CLI itself stops there. Codex has no native cap; 1 turn per `exec` call is the approved rule (human decision
+  2026-10-26) and the 120 s watchdog bounds one call. The scheduler enforces rule 1's 40 turns per task regardless; see
+  "Turns" under the state machine.
 
 ### usage() -> { tokens, requests, estimated_share, cost_usd, cost_is_estimate }
 
@@ -104,7 +107,8 @@ changes the account, the config home or the credential store [2, 4]. It returns 
 ## Invocation rules (apply to every method)
 
 - Headless invocations use the flags recorded in `spike/README.md` (Claude: `-p --output-format stream-json --verbose
-  --permission-mode acceptEdits --max-turns 5`; Codex: `exec --json --sandbox workspace-write -C <worktree>`), resume by id.
+  --permission-mode acceptEdits --max-turns 5`, where 5 is the adapter default that the scheduler may only lower, see "Turns";
+  Codex: `exec --json --sandbox workspace-write -C <worktree>`), resume by id.
 - The child's standard input is `/dev/null` (or closed). The adapter has no method that writes to a child, and the scheduler
   and lead have no access to a terminal write function [3].
 - A hard time limit (watchdog, default 120 s per spike call) bounds every invocation.
@@ -123,38 +127,78 @@ States: `spawning`, `running`, `idle`, `rate_limited`, `exited`, `killed` (the T
 T-124, not a state. `exited` and `killed` are terminal. An invocation is one child process; `idle` means no child is
 running and the conversation can be resumed.
 
+**Triggers.** A trigger is one of the 11 normalized event types, or one of four commands: `start` (row 1), `send(prompt)`,
+`cancel()` (the watchdog calls it too) and `resume` (backoff over, or the user resumes). Rows 3 to 7 and 11 say "child ends":
+that trigger is the **`exited` event** (`exited{code?, signal?}`), which the adapter appends when the process is reaped. It
+is the only event that applies the end-of-invocation precedence below. (`exited` is both an event name and a state name; a
+row says "`exited` event" when it means the trigger.)
+
 | # | From | Trigger | To | Notes |
 |---|---|---|---|---|
-| 1 | (none) | child process started (`start`, or `send` from `idle`) | `spawning` | |
+| 1 | (none) | child process started (`start`, or `send` from `idle`) | `spawning` | the invocation flags are empty |
 | 2 | `spawning` | `session_started` | `running` | a resumed invocation announces the same id again |
-| 3 | `spawning` | child exits before `session_started`, no `rate_limited` seen | `exited` | |
-| 4 | `running` | invocation ends: `result{is_error:false}` seen, exit code 0, no `rate_limited` seen | `idle` | resumable |
-| 5 | `running` | `result{is_error:true}` seen, no `rate_limited` seen, then the child ends | `exited` | |
-| 6 | `running` | child exits without any `result`, no `rate_limited` seen | `exited` | includes a non-zero exit, a crash, a watchdog kill that was not a `cancel()`, and a Codex bare top-level `error` |
-| 7 | `spawning`, `running` | `rate_limited` seen (any number of times) | stays in that state; sets the invocation's `limit_seen` flag; when the child ends the state becomes `rate_limited` | counted once per invocation; later ones only raise `reset_at`; a `rate_limited` seen while `spawning` is not lost |
-| 8 | `rate_limited` | backoff over (rule 10) or the user resumes | `idle` | the scheduler decides; a limit never starts a new session on the same provider [2] |
-| 9 | `idle` | `send(prompt)` | `spawning` | next invocation, resume by id |
-| 10 | `spawning`, `running`, `idle`, `rate_limited` | `cancel()` or watchdog | `killed` | |
-| 11 | `running` | `result{is_error:false}` seen, then a non-zero exit or death by a signal that was not a `cancel()`, no `rate_limited` seen | `exited` | the invocation's `is_error` is derived from the exit code or signal (true); the `result` event itself is not rewritten |
+| 3 | `spawning` | `exited` event before `session_started`, no `rate_limited` seen | `exited` | |
+| 4 | `running` | `exited` event with exit code 0 and no signal, a `result{is_error:false}` seen, no `rate_limited` seen | `idle` | resumable |
+| 5 | `running` | `exited` event after a `result{is_error:true}` seen, no `rate_limited` seen | `exited` | whatever the exit code |
+| 6 | `running` | `exited` event without any `result`, no `rate_limited` seen | `exited` | includes a non-zero exit, a crash, a kill from outside the adapter (neither `cancel()` nor the watchdog, which are row 10), and a Codex bare top-level `error` |
+| 7 | `spawning`, `running` | `rate_limited` seen (any number of times) | stays in that state; sets the invocation's `limit_seen` flag; when the child ends (the `exited` event) the state becomes `rate_limited` | counted once per invocation; later ones only raise `reset_at`; a `rate_limited` seen while `spawning` is not lost |
+| 8 | `rate_limited` | backoff over (rule 10) or the user resumes (`resume`) | `idle` | the scheduler decides; a limit never starts a new session on the same provider [2] |
+| 9 | `idle` | `send(prompt)` | `spawning` | next invocation, resume by id; the invocation flags are empty |
+| 10 | `spawning`, `running`, `idle`, `rate_limited` | `cancel()` or watchdog | `killed` | the adapter feeds no further event of that child to the function (not even its `exited` event); the turn reservation stays |
+| 11 | `running` | `result{is_error:false}` seen, then a non-zero exit or death by a signal that was not a `cancel()`, no `rate_limited` seen | `exited` | the invocation's `is_error` is derived from the exit code or signal (true); the `result` event itself is not rewritten; an `exited` event with neither code nor signal is not a clean exit either |
+| 12 | `spawning` | `warning`, `limit_notice`, `unknown`, `error{fatal:false}` | `spawning` | routine; no flag changes |
+| 13 | `spawning` | `error{fatal:true}` | `spawning` | decision: a fatal error is information, not an exit; the state changes only when the child ends (row 3, or row 7 when `limit_seen`), because the `rate_limited` that a Codex limit message emits before its `error` must still win at exit |
+| 14 | `running` | `message`, `tool_call`, `tool_result`, `warning`, `limit_notice`, `error` (fatal or not), `unknown` | `running` | routine; no flag changes |
+| 15 | `running` | `result{is_error}` | `running` | sets `result_seen` and `is_error`; with several `result` events the last one counts (its `is_error` replaces the earlier one) |
+| 16 | `exited`, `killed` | `cancel()` or watchdog | unchanged | idempotent no-op, so a second `cancel()` is not an error |
 
-Any other (state, trigger) pair is an illegal transition and an error in T-120's pure transition function.
+**Illegal transitions.** Any other (state, trigger) pair is an illegal transition and an error in T-120's pure transition
+function; it changes neither the state nor the flags. The ones that matter, listed explicitly:
 
-**Invocation flags.** Row 7 needs memory that a single event cannot give: whether a `rate_limited` was seen earlier in this
-invocation. The transition function therefore takes `(state, event, invocation_flags)` and returns the new state and the new
-flags, not `(state, event)`. The flags are `limit_seen` (with the highest `reset_at` seen), `result_seen` and the `is_error`
-of that result; they start empty at row 1 or 9 and are dropped when the invocation ends.
+- `session_started` while in `running` (it is legal only in `spawning`, row 2), or in any state with no child.
+- `message`, `tool_call`, `tool_result` and `result` while in `spawning` (they come after `session_started`).
+- Every normalized event, including the `exited` event, while in `idle` or `rate_limited` (no child is running), and in
+  `exited` or `killed` (events after a terminal state).
+- `send(prompt)` in any state but `idle`; `resume` in any state but `rate_limited`; `start` when a state already exists.
+- `cancel()` is legal everywhere (rows 10 and 16).
 
-**Precedence when the child ends.** `limit_seen` wins over rows 3 to 6 and 11: an invocation in which a limit was seen ends
-in `rate_limited` even when it also produced a successful or failed `result`, produced no `result` at all (a Codex limit
-`error` with no `turn.failed`), or ended before `session_started`. Without `limit_seen`, the rows apply in this order: 3, 11,
-4, 5, 6 (a `result{is_error:false}` with a non-zero exit or a signal is row 11, never row 4).
+**Invocation flags.** Rows 7 and 15 need memory that a single event cannot give: whether a `rate_limited` was seen earlier in
+this invocation, and what the `result` said. The transition function therefore takes `(state, event, invocation_flags)` and
+returns the new state and the new flags, not `(state, event)`. The flags are `limit_seen` (with the highest `reset_at` seen),
+`result_seen` and `is_error` (that of the last `result`); they start empty at row 1 or 9 and are dropped when the invocation
+ends. Only rows 7 and 15 change them.
 
-**Turns.** `result.turns` is the number of turns used by that invocation: for Claude the `num_turns` of its `result`; for
-Codex 1 per `exec` call (human decision 2026-10-26; the 120 s watchdog bounds one call). T-124 adds them up toward rule 1's
-40 turns per task. A result that is an error still counts its turns. **An invocation that ends without any `result` (a Codex
-bare top-level `error`, a crash, a watchdog kill, a killed Claude run) still counts at least 1 turn** toward the 40-turn
-ceiling: the scheduler counts 1 turn at dispatch of every invocation, then reconciles with `result.turns` when a `result`
-arrives and that number is larger. The count never goes down, so no failure path can make a run free.
+**Precedence when the child ends.** The `exited` event applies it. `limit_seen` wins over rows 3 to 6 and 11: an invocation in
+which a limit was seen ends in `rate_limited` even when it also produced a successful or failed `result`, produced no
+`result` at all (a Codex limit `error` with no `turn.failed`), or ended before `session_started`. Without `limit_seen`, the
+rows apply in this order: 3, 11, 4, 5, 6 (a `result{is_error:false}` with a non-zero exit or a signal is row 11, never
+row 4). The `result` events and `error` events of the stream are not rewritten by any of this.
+
+Proof: `spike/tests/test_normalize.sh` carries a jq reference `transition(state; event; flags)` that implements this table and
+nothing more, replays every fixture's normalized output (plus an appended `exited` event) through it, and asserts no illegal
+transition and the expected end state of each fixture.
+
+**Turns (rule 1: never more than 40 per task).** `result.turns` is the number of turns used by that invocation: for Claude
+the `num_turns` of its `result`; for Codex 1 per `exec` call (human decision 2026-10-26; the 120 s watchdog bounds one call).
+A Claude call can use up to its `--max-turns`, so the scheduler (T-124) does not count after the fact; it reserves before it
+dispatches. The task's count is always turns used plus turns reserved:
+
+- **Reserve at dispatch.** Before every invocation the scheduler reserves that invocation's maximum: for Claude its
+  `--max-turns` value, for Codex 1.
+- **Cap Claude to what is left.** For Claude, `--max-turns` is set to min(5, 40 minus turns already used or reserved), where 5
+  is the adapter default. A Claude invocation is never started with `--max-turns` 0.
+- **Refuse when nothing fits.** The scheduler refuses the dispatch (no child process is started) when the reservation does
+  not fit under 40: Claude when 40 minus turns already used or reserved is 0, Codex when it is less than 1.
+- **A result settles the count.** When a `result` arrives, the reservation is replaced by max(1, `result.turns`). A result
+  that is an error still counts its turns. If an invocation produces several `result` events, the last one settles. A
+  `result.turns` above the reservation (the CLI overshot its own cap) is counted as reported and shrinks what the next
+  dispatch can get.
+- **No result keeps the reservation.** When no `result` arrives (a crash, the watchdog, `cancel()`, a Codex bare top-level
+  `error`), the full reservation stays counted. No failure path can make a run cheaper than its reservation.
+
+Worked example. At 38 turns used, Claude gets `--max-turns` 2 (min(5, 40 minus 38)). At 40 turns used or reserved, nothing
+is dispatched. A Claude call reserved at 5 and killed before its `result` counts 5. A Claude call reserved at 5 whose `result`
+says `num_turns` 2 counts 2, which frees 3 for the next call.
 
 ## Event schema
 
@@ -252,7 +296,11 @@ Every `item.updated` is ignored whatever its item type.
   capture shows them and a row is added here.
 - A line that is not JSON, or JSON that is not an object, becomes `unknown` with `raw_type` `malformed_line`.
 - A mapped event whose required field is missing or the wrong type (for example `system/init` without a `session_id`) becomes
-  `unknown`.
+  `unknown` with the raw key as `raw_type` (for example `assistant:tool_use`) and the key names of the object. The required
+  fields are: `session_id` / `thread_id` (a non-empty string); Claude `assistant:text` `text` (a string; an empty string is
+  valid); `assistant:tool_use` `id` and `name`, and `user:tool_result` `tool_use_id` (non-empty strings); Codex
+  `item.completed:agent_message` `text` (a string; an empty string is valid). A Codex tool item without an id is not
+  malformed: it gets the id `line<N>` (N = the raw line of its `item.completed`; its `item.started` without an id is dropped), so its call and result match.
 - Text: control characters except newline and tab become spaces; message text is clipped to 4000 characters
   (`truncated:true` when clipped), all other text to 300, names and ids to 64 and 100. Nothing is ever executed.
 - Never copied into any event: init tool, MCP, plugin and skill lists, `cwd`, tool inputs, commands, file paths.
