@@ -1,0 +1,6 @@
+{"type":"session_started","provider":"claude","seq":1,"ts":null,"raw":"system/init","session_id":"33333333-3333-4333-8333-333333333333"}
+{"type":"tool_call","provider":"claude","seq":3,"ts":null,"raw":"assistant:tool_use","id":"toolu_routine_1","name":"Write"}
+{"type":"tool_result","provider":"claude","seq":4,"ts":null,"raw":"user:tool_result","id":"toolu_routine_1","is_error":false}
+{"type":"limit_notice","provider":"claude","seq":5,"ts":null,"raw":"rate_limit_event","status":"allowed","reset_at":1790000000}
+{"type":"message","provider":"claude","seq":6,"ts":null,"raw":"assistant:text","role":"assistant","text":"DONE","truncated":false}
+{"type":"result","provider":"claude","seq":7,"ts":null,"raw":"result/success","is_error":false,"subtype":"success","turns":2,"tokens":{"input":40,"output":24,"cache_read":40,"cache_write":5,"reasoning":0},"tokens_known":true,"cost_usd":0.0042,"cost_is_estimate":true,"stop_reason":"end_turn","duration_ms":3100}

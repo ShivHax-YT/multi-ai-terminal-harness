@@ -1,0 +1,14 @@
+{"type":"session_started","provider":"codex","seq":1,"ts":null,"raw":"thread.started","session_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}
+{"type":"tool_call","provider":"codex","seq":4,"ts":null,"raw":"item.started:command_execution","id":"item_1","name":"command_execution"}
+{"type":"tool_result","provider":"codex","seq":5,"ts":null,"raw":"item.completed:command_execution","id":"item_1","is_error":false}
+{"type":"tool_call","provider":"codex","seq":6,"ts":null,"raw":"item.completed:file_change","id":"item_2","name":"file_change"}
+{"type":"tool_result","provider":"codex","seq":6,"ts":null,"raw":"item.completed:file_change","id":"item_2","is_error":false}
+{"type":"tool_call","provider":"codex","seq":10,"ts":null,"raw":"item.started:mcp_tool_call","id":"item_4","name":"mcp_tool_call"}
+{"type":"tool_result","provider":"codex","seq":11,"ts":null,"raw":"item.completed:mcp_tool_call","id":"item_4","is_error":false}
+{"type":"tool_call","provider":"codex","seq":12,"ts":null,"raw":"item.completed:web_search","id":"item_5","name":"web_search"}
+{"type":"tool_result","provider":"codex","seq":12,"ts":null,"raw":"item.completed:web_search","id":"item_5","is_error":false}
+{"type":"warning","provider":"codex","seq":13,"ts":null,"raw":"item.completed:error","kind":"item_error","message":"example non-fatal warning item"}
+{"type":"unknown","provider":"codex","seq":14,"ts":null,"raw":"item.completed:future_item_kind","raw_type":"item.completed:future_item_kind","keys":["item","type"]}
+{"type":"unknown","provider":"codex","seq":15,"ts":null,"raw":"future.event.kind","raw_type":"future.event.kind","keys":["note","type"]}
+{"type":"message","provider":"codex","seq":16,"ts":null,"raw":"item.completed:agent_message","role":"assistant","text":"DONE","truncated":false}
+{"type":"result","provider":"codex","seq":17,"ts":null,"raw":"turn.completed","is_error":false,"turns":1,"tokens":{"input":24763,"output":122,"cache_read":24448,"cache_write":0,"reasoning":64},"tokens_known":true,"cost_usd":null,"cost_is_estimate":true}
