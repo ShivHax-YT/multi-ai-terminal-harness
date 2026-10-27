@@ -135,7 +135,7 @@ running and the conversation can be resumed.
 | 8 | `rate_limited` | backoff over (rule 10) or the user resumes | `idle` | the scheduler decides; a limit never starts a new session on the same provider [2] |
 | 9 | `idle` | `send(prompt)` | `spawning` | next invocation, resume by id |
 | 10 | `spawning`, `running`, `idle`, `rate_limited` | `cancel()` or watchdog | `killed` | |
-| 11 | `running` | `result{is_error:false}` seen, then a non-zero exit, no `rate_limited` seen | `exited` | the invocation's `is_error` is derived from the exit code (true); the `result` event itself is not rewritten |
+| 11 | `running` | `result{is_error:false}` seen, then a non-zero exit or death by a signal that was not a `cancel()`, no `rate_limited` seen | `exited` | the invocation's `is_error` is derived from the exit code or signal (true); the `result` event itself is not rewritten |
 
 Any other (state, trigger) pair is an illegal transition and an error in T-120's pure transition function.
 
@@ -147,7 +147,7 @@ of that result; they start empty at row 1 or 9 and are dropped when the invocati
 **Precedence when the child ends.** `limit_seen` wins over rows 3 to 6 and 11: an invocation in which a limit was seen ends
 in `rate_limited` even when it also produced a successful or failed `result`, produced no `result` at all (a Codex limit
 `error` with no `turn.failed`), or ended before `session_started`. Without `limit_seen`, the rows apply in this order: 3, 11,
-4, 5, 6 (a `result{is_error:false}` with a non-zero exit is row 11, never row 4).
+4, 5, 6 (a `result{is_error:false}` with a non-zero exit or a signal is row 11, never row 4).
 
 **Turns.** `result.turns` is the number of turns used by that invocation: for Claude the `num_turns` of its `result`; for
 Codex 1 per `exec` call (human decision 2026-10-26; the 120 s watchdog bounds one call). T-124 adds them up toward rule 1's
