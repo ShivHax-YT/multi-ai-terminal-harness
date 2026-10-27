@@ -903,7 +903,7 @@ if [ "${FAKE_CODEX_REPOLINK:-}" = "1" ]; then
   mv "$REPO" "$REPO.real"
   ln -s "$OREPO" "$REPO"
   printf 'other %s\n' "$OREPO" >> "$FAKE_LOG"
-  { git -C "$OREPO" worktree list; find "$OREPO" | sort; } > "$FAKE_LOG.other.before" 2>&1
+  { LC_ALL=C git -C "$OREPO" worktree list; find "$OREPO" | LC_ALL=C sort; } > "$FAKE_LOG.other.before" 2>&1
 fi
 if [ "${FAKE_CODEX_LATE:-}" = "1" ]; then
   : > "$FAKE_SLOWFLAG"
@@ -1267,7 +1267,10 @@ rc="$(run_sb "$SB/$FASTP" "FAKE_CODEX_REPOLINK=1" --)"
 eq "N5: a redirected repo: exit 1" "1" "$rc"
 OREPO="$(grep '^other ' "$SB/log" | cut -d' ' -f2)"
 check "N5: the other repo exists" test -d "$OREPO/.git"
-{ git -C "$OREPO" worktree list; find "$OREPO" | sort; } > "$SB/other.after" 2>&1
+# the snapshot is taken with the same PATH, HOME and C locale as the "before" one inside the sandboxed fake run.sh: on macOS
+# the suite's own PATH finds a different git and its UTF-8 sort orders the listing differently
+env -i PATH="$SB/bin:/usr/bin:/bin" HOME="$SB/home" LC_ALL=C /bin/sh -c 'git -C "$1" worktree list; find "$1" | sort' _ "$OREPO" \
+  > "$SB/other.after" 2>&1
 check "N5: nothing in the other repo changed (git worktree list and file listing, before and after)" cmp -s "$SB/log.other.before" "$SB/other.after"
 check "N5: the other repo still has its worktrees/codex-1 entry" test -d "$OREPO/.git/worktrees/codex-1"
 expect "N5: the codex row is FAIL with exactly the fixed reason" "$(cat "$(root_of)/run-both.json")" '.rows[1].verdict == "FAIL" and .rows[1].reasons == ["scratch repo config changed"]'
