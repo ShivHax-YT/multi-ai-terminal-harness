@@ -140,7 +140,7 @@ row says "`exited` event" when it means the trigger.)
 | 3 | `spawning` | `exited` event before `session_started`, no `rate_limited` seen | `exited` | |
 | 4 | `running` | `exited` event with exit code 0 and no signal, a `result{is_error:false}` seen, no `rate_limited` seen | `idle` | resumable |
 | 5 | `running` | `exited` event after a `result{is_error:true}` seen, no `rate_limited` seen | `exited` | whatever the exit code |
-| 6 | `running` | `exited` event without any `result`, no `rate_limited` seen | `exited` | includes a non-zero exit, a crash, a watchdog kill that was not a `cancel()`, and a Codex bare top-level `error` |
+| 6 | `running` | `exited` event without any `result`, no `rate_limited` seen | `exited` | includes a non-zero exit, a crash, a kill from outside the adapter (neither `cancel()` nor the watchdog, which are row 10), and a Codex bare top-level `error` |
 | 7 | `spawning`, `running` | `rate_limited` seen (any number of times) | stays in that state; sets the invocation's `limit_seen` flag; when the child ends (the `exited` event) the state becomes `rate_limited` | counted once per invocation; later ones only raise `reset_at`; a `rate_limited` seen while `spawning` is not lost |
 | 8 | `rate_limited` | backoff over (rule 10) or the user resumes (`resume`) | `idle` | the scheduler decides; a limit never starts a new session on the same provider [2] |
 | 9 | `idle` | `send(prompt)` | `spawning` | next invocation, resume by id; the invocation flags are empty |

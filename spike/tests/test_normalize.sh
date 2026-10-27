@@ -640,6 +640,8 @@ check "spec: row 14, the ordinary events stay in running" \
   grep -qE '^\| 14 \| `running` \| `message`, `tool_call`, `tool_result`, `warning`, `limit_notice`, `error` \(fatal or not\), `unknown` \| `running` \|' "$SPEC"
 check "spec: row 15, result stays running, sets result_seen and is_error, the last result counts" \
   grep -qE '^\| 15 \| `running` \| `result\{is_error\}` \| `running` \| sets `result_seen` and `is_error`.*the last one counts' "$SPEC"
+check "spec: row 6 no longer claims a watchdog kill (the watchdog is row 10, killed)" \
+  grep -qE '^\| 6 \|.*neither `cancel\(\)` nor the watchdog, which are row 10' "$SPEC"
 check "spec: row 16, cancel in exited or killed is an idempotent no-op" grep -qE '^\| 16 \| `exited`, `killed` \| `cancel\(\)` or watchdog \| unchanged \|' "$SPEC"
 check "spec: the exited event is named as the child-ends trigger" grep -qF 'that trigger is the **`exited` event**' "$SPEC_FLAT"
 check "spec: the exited event applies the end-of-invocation precedence" grep -qF 'The `exited` event applies it.' "$SPEC_FLAT"
