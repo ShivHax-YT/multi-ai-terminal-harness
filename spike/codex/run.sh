@@ -32,7 +32,7 @@ unset _here
 . "$HERE/../lib/common.sh"
 spike_require_live
 
-TASK='Create hello.txt containing exactly the line: hello from codex. Then reply DONE.'
+TASK='Create a file named hello.txt whose only line is the three words hello from codex with no punctuation. Then reply DONE.'
 WATCHDOG_SECS=120
 
 trap 'spike_verify_cleanup' EXIT
