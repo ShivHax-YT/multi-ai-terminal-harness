@@ -32,10 +32,20 @@ def ignored_keys: [
 def tool_items: ["command_execution", "file_change", "mcp_tool_call", "web_search"];
 
 def clean: gsub("[\u0000-\u0008\u000b-\u001f\u007f-\u009f]"; " ");
-def clip($n): if type == "string" then (clean | .[0:$n]) else null end;
+# cut to the limit first, then clean: gsub on a long untrusted string is quadratic, and cleaning keeps the length
+def clip($n): if type == "string" then (.[0:$n] | clean) else null end;
 def isobj: type == "object";
 def num: if type == "number" then . else null end;
 def int0: if type == "number" and . >= 0 then floor else 0 end;
+# a tool item failed: status failed or declined, or a non-zero exit code (a numeric string is parsed; anything else that is not
+# null counts as a failure, fail safe)
+def tool_failed($item):
+  $item.status == "failed" or $item.status == "declined"
+  or ($item.exit_code
+      | if . == null then false
+        elif type == "number" then . != 0
+        elif type == "string" then (try (tonumber != 0) catch true)
+        else true end);
 def dropnull: with_entries(select(.value != null));
 def inl($list): . as $x | any($list[]; . == $x);
 # Same wording as spike/codex/parse.jq (T-003); the test checks the two lines are identical. A hint only: it is applied to the
@@ -70,7 +80,7 @@ def step($seq; $st):
       else $t end
       | clip(64) | if . == "" then "empty_type" else . end ) as $rk
   | (if ($o.item | isobj) then $o.item else {} end) as $item
-  | ($item.id | clip(100)) as $iid
+  | ($item.id | clip(100) | if . == "" then null else . end) as $iid
   | ($iid // "line\($seq)") as $tid
   | ($it != null and (tool_items | any(. == $it))) as $is_tool
   | if $rk == "thread.started" then
@@ -79,14 +89,15 @@ def step($seq; $st):
              else unknown_ev($seq; $rk; $o) end ], st: $st}
     elif ($rk | inl(ignored_keys)) then {ev: [], st: $st}
     elif $t == "item.started" and $is_tool then
-      {ev: [ if $st.tools[$tid] then empty else ev($seq; "tool_call"; $rk; {id: $tid, name: $it}) end ],
-       st: ($st | .tools[$tid] = true)}
+      # without an id the started event is dropped: the completed line (which has its own line number) would get another
+      # synthetic id, so the pair could not be matched. The completed event then emits both tool_call and tool_result.
+      if $iid == null then {ev: [], st: $st}
+      else {ev: [ if $st.tools[$tid] then empty else ev($seq; "tool_call"; $rk; {id: $tid, name: $it}) end ],
+            st: ($st | .tools[$tid] = true)} end
     elif $t == "item.completed" and $is_tool then
-      {ev: [ (if $st.tools[$tid] then empty else ev($seq; "tool_call"; $rk; {id: $tid, name: $it}) end),
-             ev($seq; "tool_result"; $rk;
-                {id: $tid,
-                 is_error: ($item.status == "failed" or ((($item.exit_code | type) == "number") and $item.exit_code != 0))}) ],
-       st: ($st | .tools[$tid] = true)}
+      {ev: [ (if $iid != null and $st.tools[$tid] then empty else ev($seq; "tool_call"; $rk; {id: $tid, name: $it}) end),
+             ev($seq; "tool_result"; $rk; {id: $tid, is_error: tool_failed($item)}) ],
+       st: (if $iid != null then ($st | .tools[$tid] = true) else $st end)}
     elif $rk == "item.completed:agent_message" then
       {ev: [ ev($seq; "message"; $rk; {role: "assistant", text: ($item.text | clip(4000) // ""),
                                        truncated: ((($item.text | type) == "string") and (($item.text | length) > 4000))}) ],

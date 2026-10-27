@@ -28,9 +28,11 @@ def ignored_keys: [
 ];
 
 def clean: gsub("[\u0000-\u0008\u000b-\u001f\u007f-\u009f]"; " ");
-def clip($n): if type == "string" then (clean | .[0:$n]) else null end;
+# cut to the limit first, then clean: gsub on a long untrusted string is quadratic, and cleaning keeps the length
+def clip($n): if type == "string" then (.[0:$n] | clean) else null end;
 def isobj: type == "object";
 def num: if type == "number" then . else null end;
+def intn: if type == "number" then floor else null end;
 def int0: if type == "number" and . >= 0 then floor else 0 end;
 def nstr: if type == "number" then (floor | tostring) else "?" end;
 def dropnull: with_entries(select(.value != null));
@@ -88,7 +90,7 @@ def user_events($seq; $o):
 def limit_event_events($seq; $o):
   ($o.rate_limit_info) as $i
   | (if $i | isobj then $i else {} end) as $info
-  | ({reset_at: ($info.resetsAt | num)} | dropnull) as $reset
+  | ({reset_at: ($info.resetsAt | intn)} | dropnull) as $reset
   | $info.status as $s
   | if $s == "allowed" or $s == "allowed_warning" then
       ev($seq; "limit_notice"; "rate_limit_event"; {status: $s} + ({utilization: ($info.utilization | num)} | dropnull) + $reset)
@@ -102,7 +104,8 @@ def limit_event_events($seq; $o):
 def result_events($seq; $o; $rk):
   (if ($o.usage | isobj) then $o.usage else {} end) as $u
   | (if ($o.is_error | type) == "boolean" then $o.is_error else ($o.subtype != "success") end) as $err
-  | ( if $err and $o.api_error_status == 429 then ev($seq; "rate_limited"; $rk; {raw_kind: "claude_result_429"}) else empty end ),
+  | ($o.api_error_status | if type == "string" then (try tonumber catch null) else . end) as $status
+  | ( if $err and $status == 429 then ev($seq; "rate_limited"; $rk; {raw_kind: "claude_result_429"}) else empty end ),
     ev($seq; "result"; $rk;
        {is_error: $err}
        + ({subtype: ($o.subtype | clip(64))} | dropnull)
@@ -113,7 +116,7 @@ def result_events($seq; $o; $rk):
           tokens_known: ((($u.input_tokens | type) == "number") and (($u.output_tokens | type) == "number")),
           cost_usd: ($o.total_cost_usd | num),
           cost_is_estimate: true}
-       + ({stop_reason: ($o.stop_reason | clip(64)), duration_ms: (if ($o.duration_ms | type) == "number" and $o.duration_ms >= 0 then $o.duration_ms else null end)} | dropnull));
+       + ({stop_reason: ($o.stop_reason | clip(64)), duration_ms: (if ($o.duration_ms | type) == "number" and $o.duration_ms >= 0 then ($o.duration_ms | floor) else null end)} | dropnull));
 
 # ---- one JSON object -----------------------------------------------------------------------------------------------------
 def claude_events($seq):

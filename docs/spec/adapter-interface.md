@@ -127,21 +127,34 @@ running and the conversation can be resumed.
 |---|---|---|---|---|
 | 1 | (none) | child process started (`start`, or `send` from `idle`) | `spawning` | |
 | 2 | `spawning` | `session_started` | `running` | a resumed invocation announces the same id again |
-| 3 | `spawning` | child exits before `session_started` | `exited` | |
+| 3 | `spawning` | child exits before `session_started`, no `rate_limited` seen | `exited` | |
 | 4 | `running` | invocation ends: `result{is_error:false}` seen, exit code 0, no `rate_limited` seen | `idle` | resumable |
-| 5 | `running` | `result{is_error:true}` seen, then the child ends | `exited` | |
-| 6 | `running` | child exits without any `result` | `exited` | includes a non-zero exit |
-| 7 | `running` | `rate_limited` seen (any number of times) | stays `running` until the child ends, then `rate_limited` | counted once per invocation; later ones only raise `reset_at` |
+| 5 | `running` | `result{is_error:true}` seen, no `rate_limited` seen, then the child ends | `exited` | |
+| 6 | `running` | child exits without any `result`, no `rate_limited` seen | `exited` | includes a non-zero exit, a crash, a watchdog kill that was not a `cancel()`, and a Codex bare top-level `error` |
+| 7 | `spawning`, `running` | `rate_limited` seen (any number of times) | stays in that state; sets the invocation's `limit_seen` flag; when the child ends the state becomes `rate_limited` | counted once per invocation; later ones only raise `reset_at`; a `rate_limited` seen while `spawning` is not lost |
 | 8 | `rate_limited` | backoff over (rule 10) or the user resumes | `idle` | the scheduler decides; a limit never starts a new session on the same provider [2] |
 | 9 | `idle` | `send(prompt)` | `spawning` | next invocation, resume by id |
 | 10 | `spawning`, `running`, `idle`, `rate_limited` | `cancel()` or watchdog | `killed` | |
+| 11 | `running` | `result{is_error:false}` seen, then a non-zero exit, no `rate_limited` seen | `exited` | the invocation's `is_error` is derived from the exit code (true); the `result` event itself is not rewritten |
 
-Any other (state, trigger) pair is an illegal transition and an error in T-120's pure transition function. Row 7 wins over
-rows 4 and 5: an invocation in which a limit was seen ends in `rate_limited` even when it also produced a result.
+Any other (state, trigger) pair is an illegal transition and an error in T-120's pure transition function.
+
+**Invocation flags.** Row 7 needs memory that a single event cannot give: whether a `rate_limited` was seen earlier in this
+invocation. The transition function therefore takes `(state, event, invocation_flags)` and returns the new state and the new
+flags, not `(state, event)`. The flags are `limit_seen` (with the highest `reset_at` seen), `result_seen` and the `is_error`
+of that result; they start empty at row 1 or 9 and are dropped when the invocation ends.
+
+**Precedence when the child ends.** `limit_seen` wins over rows 3 to 6 and 11: an invocation in which a limit was seen ends
+in `rate_limited` even when it also produced a successful or failed `result`, produced no `result` at all (a Codex limit
+`error` with no `turn.failed`), or ended before `session_started`. Without `limit_seen`, the rows apply in this order: 3, 11,
+4, 5, 6 (a `result{is_error:false}` with a non-zero exit is row 11, never row 4).
 
 **Turns.** `result.turns` is the number of turns used by that invocation: for Claude the `num_turns` of its `result`; for
 Codex 1 per `exec` call (human decision 2026-10-26; the 120 s watchdog bounds one call). T-124 adds them up toward rule 1's
-40 turns per task. A result that is an error still counts its turns.
+40 turns per task. A result that is an error still counts its turns. **An invocation that ends without any `result` (a Codex
+bare top-level `error`, a crash, a watchdog kill, a killed Claude run) still counts at least 1 turn** toward the 40-turn
+ceiling: the scheduler counts 1 turn at dispatch of every invocation, then reconciles with `result.turns` when a `result`
+arrives and that number is larger. The count never goes down, so no failure path can make a run free.
 
 ## Event schema
 

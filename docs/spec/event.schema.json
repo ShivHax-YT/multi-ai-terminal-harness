@@ -148,7 +148,7 @@
       "unevaluatedProperties": false
     },
     "limit_notice": {
-      "description": "A routine, non-blocking usage notice. Never a limit hit: it never counts toward rule 10 backoff.",
+      "description": "A routine, non-blocking usage notice. Never a limit hit: it never counts toward rule 10 backoff. utilization is a fraction and stays a number; reset_at is whole epoch seconds (the normalizers floor it).",
       "allOf": [
         { "$ref": "#/$defs/envelope" },
         {
@@ -157,7 +157,7 @@
             "type": { "const": "limit_notice" },
             "status": { "enum": ["allowed", "allowed_warning"] },
             "utilization": { "type": "number" },
-            "reset_at": { "type": "number" }
+            "reset_at": { "type": "integer" }
           }
         }
       ],
@@ -172,8 +172,8 @@
           "properties": {
             "type": { "const": "rate_limited" },
             "raw_kind": { "type": "string", "maxLength": 64 },
-            "reset_at": { "type": "number" },
-            "retry_after_s": { "type": "number" }
+            "reset_at": { "type": "integer" },
+            "retry_after_s": { "type": "integer" }
           }
         }
       ],
@@ -210,7 +210,7 @@
             "cost_usd": { "type": ["number", "null"] },
             "cost_is_estimate": { "const": true },
             "stop_reason": { "type": "string", "maxLength": 64 },
-            "duration_ms": { "type": "number", "minimum": 0 }
+            "duration_ms": { "type": "integer", "minimum": 0 }
           }
         }
       ],
