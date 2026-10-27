@@ -36,6 +36,10 @@ d="$(new_repo)"; mkdir -p "$d/assets"; echo '<svg/>' > "$d/assets/openai-logo.sv
 d="$(new_repo)"; mkdir -p "$d/src-tauri"; printf '{ "productName": "GrokSquad", "identifier": "dev.x.app" }\n' > "$d/src-tauri/tauri.conf.json"; expect_scan dirty "R8 trademark app name" "$d"
 d="$(new_repo)"; mkdir -p "$d/src/scheduler"; echo 'use crate::pty::pty_write;' > "$d/src/scheduler/mod.rs"; expect_scan dirty "R3 PTY write from scheduler" "$d"
 d="$(new_repo)"; mkdir -p "$d/src/pty"; echo 'pub fn pty_write() {}' > "$d/src/pty/mod.rs"; expect_scan clean "R3 PTY module itself is fine" "$d"
+# jq normalizers and JSONL fixtures are scanned too (spike/normalize/*.jq, spike/fixtures/**/*.jsonl)
+d="$(new_repo)"; mkdir -p "$d/spike/normalize"; echo 'def p: "~/.codex/auth.json";' > "$d/spike/normalize/x.jq"; expect_scan dirty "R4 credential path in a .jq file" "$d"
+d="$(new_repo)"; mkdir -p "$d/spike/fixtures"; echo '{"env":"CODEX_HOME=/tmp/b"}' > "$d/spike/fixtures/x.jsonl"; expect_scan dirty "R2 config home in a .jsonl fixture" "$d"
+d="$(new_repo)"; mkdir -p "$d/spike/normalize"; echo 'def ok: "item.completed";' > "$d/spike/normalize/y.jq"; expect_scan clean "a plain .jq file is clean" "$d"
 
 echo "hooks"
 hook() {  # hook <script> <want exit> <name> <json>
