@@ -627,7 +627,7 @@ check "spec: a Claude invocation is never started with --max-turns 0" grep -qF '
 check "spec: the scheduler refuses the dispatch when the reservation does not fit under 40" \
   grep -qF 'refuses the dispatch (no child process is started) when the reservation does not fit under 40' "$SPEC_FLAT"
 check "spec: a result settles to max(1, the highest turns among results with turns_known true), not the last result" \
-  grep -qF 'the reservation is replaced by max(1, the highest `turns` among the invocation'"'"'s `result` events that have `turns_known` true)' "$SPEC_FLAT"
+  grep -qF 'The reservation is then replaced by max(1, the highest `turns` among the invocation'"'"'s `result` events that have `turns_known` true)' "$SPEC_FLAT"
 check "spec: the highest counts, not the last, and a later result never lowers an earlier count" \
   grep -qF 'The highest counts, not the last, so a later `result` can never lower what an earlier one already counted' "$SPEC_FLAT"
 check "spec: is_error still follows the last result; the two rules are independent" \
