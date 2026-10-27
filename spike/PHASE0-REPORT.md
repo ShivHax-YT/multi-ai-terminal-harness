@@ -25,7 +25,8 @@
 
 | Item | Claude Code | Codex |
 |---|---|---|
-| Version (`--version`) | | known 2026-10-26, confirm: codex-cli 0.162.0 |
+| Version (`--version`) | confirm: Claude Code native install; version as printed by preflight: ______ | known 2026-10-26, confirm: codex-cli 0.162.0 |
+| `--max-turns 5` honoured (Claude only; see the comment in `spike/claude/run.sh`: the flag is documented but hidden from `--help`) | confirm: the run stopped within 5 turns (the `turns` column of section 3 is 5 or less): yes / no | not applicable |
 | Install method | known 2026-10-26, confirm: native installer binary passes; the npm-installed `claude` is refused by preflight (launcher script) | |
 | Code signature result (preflight SIGNATURE column) | | |
 | Signer and team id (as printed) | | |

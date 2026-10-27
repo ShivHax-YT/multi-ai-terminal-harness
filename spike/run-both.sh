@@ -11,7 +11,7 @@
 # What it does, once, in this fixed order, never in parallel, never in a loop, no retry, no resume (rules 1 and 10):
 #   1. spike/preflight.sh once, output to <ROOT>/preflight.txt (versions, signature, sign-in by exit code; sends no prompt)
 #   2. spike/claude/run.sh once         (headless claude -p inside its own scratch worktree claude-1; rule 3)
-#   3. sleep 5                          (at least 5 s between dispatches, applied across providers as the human asked; rule 10)
+#   3. /bin/sleep 5                     (at least 5 s between dispatches, applied across providers as the human asked; rule 10)
 #   4. spike/codex/run.sh once          (headless codex exec --json inside its own scratch worktree codex-1; rule 3)
 #      Codex still runs when Claude failed (different provider, one prompt; human decision 2026-10-26). A signal stops before it.
 #   5. normalizes each raw.jsonl with spike/normalize/<cli>.jq, prints one row per CLI, writes <ROOT>/run-both.json
@@ -21,6 +21,9 @@
 # registered binary (rule 6). No credential file, config-home variable, profile or config override is touched (rules 2 and 4);
 # every file read from a capture is checked first (regular file, no symlink, one link, outside every CLI home).
 # Everything a CLI wrote is untrusted data: it is only parsed with jq and printed filtered to printable characters.
+# The scratch repo's config sits where the CLI could write it. Before ANY git command runs on that repo (the changed-files listing
+# and the library's cleanup), its config files are read without executing anything and compared with an ALLOWLIST of the keys the
+# scratch setup writes; any other key fails closed: the row FAILs ("scratch repo config changed"), no git runs, the dir is left and reported.
 set -u
 umask 077
 
@@ -83,6 +86,9 @@ trap 'SIGNAL_RC=130' INT
 trap 'SIGNAL_RC=143' TERM
 trap 'SIGNAL_RC=129' HUP
 
+# Every jq call on capture data uses the probe-checked native jq (a wrapper script or a copy in a user directory first on PATH is refused).
+JQ="$(spike_tool_path jq)" || { spike_err "a native jq in a system or package-manager prefix is required"; exit 1; }
+
 # ---- begin functions (the offline test extracts and runs these) -------------------------------------------------------------
 
 # printable <stdin>: keep printable characters and newlines only, so a CLI cannot inject terminal escape sequences.
@@ -137,25 +143,102 @@ hello_ok() {
   )
 }
 
-# changed_files <worktree>: names from git status --porcelain, printable only, at most 20 lines. The repo's config was written
-# in a place the CLI could write, so git runs with a closed environment and the config keys that start programs forced off.
-changed_files() {
-  local g
-  g="$(spike_tool_path git)" || return 1
-  env -i PATH=/usr/bin:/bin HOME=/nonexistent LC_ALL=C GIT_OPTIONAL_LOCKS=0 GIT_CONFIG_NOSYSTEM=1 \
-    GIT_CONFIG_COUNT=3 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false \
-    GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null GIT_CONFIG_KEY_2=core.untrackedCache GIT_CONFIG_VALUE_2=false \
-    "$g" -C "$1" status --porcelain 2>/dev/null | cut -c4- | printable | head -n 20
+# git_new_enough <git>: 0 if `git --version` is 2.32 or newer (GIT_CONFIG_COUNT needs 2.31, GIT_CONFIG_GLOBAL needs 2.32). Runs no repo.
+git_new_enough() {
+  local v maj min
+  v="$(env -i PATH=/usr/bin:/bin HOME=/nonexistent LC_ALL=C "$1" --version 2>/dev/null | head -n 1)"
+  v="${v#git version }"
+  maj="${v%%.*}"
+  min="${v#*.}"
+  min="${min%%.*}"
+  case "$maj" in ""|*[!0-9]*) return 1 ;; esac
+  case "$min" in ""|*[!0-9]*) return 1 ;; esac
+  [ "$maj" -gt 2 ] || { [ "$maj" -eq 2 ] && [ "$min" -ge 32 ]; }
 }
 
-# build_row <cli> <run.sh exit status> <hello yes|no> <changed files, one per line> <normalized.jsonl>: print one JSON row.
+# config_allowed <git> <config file>: 0 only if the file is a regular file (no symlink) whose every key is one the scratch repo
+# setup writes (spike_scratch_repo and spike_worktree_add: init and worktree add). An ALLOWLIST: any other key at all (a filter driver,
+# include.path, core.worktree, an unknown harmless key) refuses. The file is read by `config --file ... --list`, which follows no
+# include and executes nothing. An unreadable or unparsable file refuses.
+config_allowed() {
+  local keys n
+  [ -f "$2" ] && [ ! -L "$2" ] || return 1
+  keys="$(env -i PATH=/usr/bin:/bin HOME=/nonexistent LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CEILING_DIRECTORIES=/ \
+    "$1" -C / config --file "$2" --name-only --list 2>/dev/null)" || return 1
+  [ -n "$keys" ] || return 0
+  n="$(printf '%s\n' "$keys" | grep -vxE 'core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode)' | wc -l | tr -d ' ')"
+  [ "$n" = "0" ]
+}
+
+# config_absent_or_allowed <git> <config file>: 0 if the file does not exist at all, else config_allowed.
+config_absent_or_allowed() {
+  if [ ! -e "$2" ] && [ ! -L "$2" ]; then return 0; fi
+  config_allowed "$1" "$2"
+}
+
+# scratch_repo_ok <git> <worktree>: no git command runs on the scratch repo, only `config --file` on its config files. 0 = the layout is the
+# one the run scripts create (<run>/repo/.git and <run>/repo/.git/worktrees/<name>, no symlink) and every config file git would read
+# (the repo config, and config.worktree if present) passes the allowlist; 2 = the path is not a scratch worktree path; 3 = a config
+# file or the layout changed. Sets SG_COMMON and SG_GD (the pinned git dirs) for the caller; the worktree's own .git file is never read.
+scratch_repo_ok() {
+  local g="$1" wt="$2" rest
+  SG_COMMON=""
+  SG_GD=""
+  rest="${wt%/*}"
+  case "$rest" in
+    */repo-wt) ;;
+    *) return 2 ;;
+  esac
+  SG_COMMON="${rest%/repo-wt}/repo/.git"
+  SG_GD="$SG_COMMON/worktrees/${wt##*/}"
+  if [ ! -d "$SG_COMMON" ] || [ -L "$SG_COMMON" ] || [ -L "$SG_COMMON/worktrees" ] || [ ! -d "$SG_GD" ] || [ -L "$SG_GD" ] ||
+    [ ! -e "$SG_COMMON/config" ] || ! config_absent_or_allowed "$g" "$SG_COMMON/config" ||
+    ! config_absent_or_allowed "$g" "$SG_COMMON/config.worktree" || ! config_absent_or_allowed "$g" "$SG_GD/config.worktree"; then
+    return 3
+  fi
+  return 0
+}
+
+# changed_files <worktree>: names from git status --porcelain, printable only, at most 20 lines. The scratch repo's config sits where the
+# CLI could write it, so, before git runs on the repo at all:
+#   - git must be 2.32 or newer, else it prints "(not listed: git too old)" and runs nothing (not a failure by itself);
+#   - scratch_repo_ok must pass. A changed layout or any key outside the allowlist prints "(not listed: repo config changed)", runs
+#     NO git on the repo and returns 3 (the row FAILs with the fixed reason "scratch repo config changed").
+# Then status runs with a closed environment, the git dirs pinned (the worktree's .git file is not followed), no global or system
+# config, fsmonitor, hooks and untracked cache forced off, and submodules ignored (a submodule would start a second git inside a
+# directory the CLI controls).
+changed_files() {
+  local g wt="$1" rc
+  g="$(spike_tool_path git)" || { printf '(not listed: git unavailable)\n'; return 0; }
+  git_new_enough "$g" || { printf '(not listed: git too old)\n'; return 0; }
+  scratch_repo_ok "$g" "$wt"
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    printf '(not listed: unexpected worktree layout)\n'
+    return 0
+  fi
+  if [ "$rc" -ne 0 ]; then
+    printf '(not listed: repo config changed)\n'
+    return 3
+  fi
+  env -i PATH=/usr/bin:/bin HOME=/nonexistent LC_ALL=C GIT_OPTIONAL_LOCKS=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
+    GIT_DIR="$SG_GD" GIT_COMMON_DIR="$SG_COMMON" GIT_WORK_TREE="$wt" \
+    GIT_CONFIG_COUNT=3 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false \
+    GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null GIT_CONFIG_KEY_2=core.untrackedCache GIT_CONFIG_VALUE_2=false \
+    "$g" -C "$wt" status --porcelain --ignore-submodules=all 2>/dev/null | cut -c4- | printable | head -n 20
+  return 0
+}
+
+# build_row <cli> <run.sh exit status> <hello yes|no> <changed files, one per line> <normalized.jsonl> [flags]: print one JSON row.
 # PASS = run.sh exit 0, exactly one session_started, exactly one result with is_error false and numeric tokens, 0 rate_limited,
 # hello.txt exact. `unknown` > 0 never fails a run (needs_mapping is set). Reasons are fixed strings, never stream text.
+# flags (space separated words, all optional): cfg = the scratch repo config changed, norm = the normalizer failed, row = the row
+# could not be built. Each one forces FAIL with its own fixed reason.
 build_row() {
-  local cli="$1" rc="$2" hello="$3" changed="$4" norm="$5"
+  local cli="$1" rc="$2" hello="$3" changed="$4" norm="$5" flags="${6:-}"
   case "$rc" in ""|*[!0-9]*) rc=255 ;; esac
   [ -r "$norm" ] || norm=/dev/null
-  jq -c -s --arg cli "$cli" --argjson rc "$rc" --arg hello "$hello" --arg changed "$changed" '
+  "$JQ" -c -s --arg cli "$cli" --argjson rc "$rc" --arg hello "$hello" --arg changed "$changed" --arg flags "$flags" '
     def cnt($t): [.[] | select(.type == $t)] | length;
     def num: type == "number";
     . as $ev
@@ -171,6 +254,10 @@ build_row() {
        and ($t.input | num) and ($t.output | num)) as $c_res
     | ($rl == 0) as $c_rl
     | ($hello == "yes") as $c_hello
+    | ($flags | split(" ")) as $fl
+    | (($fl | index("cfg")) == null) as $c_cfg
+    | (($fl | index("norm")) == null) as $c_norm
+    | (($fl | index("row")) == null) as $c_row
     | { provider: $cli,
         run_exit: $rc,
         session: (if $sid == "" then "none" else (($sid | gsub("[^A-Za-z0-9-]"; "?") | .[0:4]) + "...") end),
@@ -184,17 +271,33 @@ build_row() {
         needs_mapping: (cnt("unknown") > 0),
         changed: ($changed | split("\n") | map(select(length > 0))),
         hello_ok: $c_hello,
-        verdict: (if $c_exit and $c_sess and $c_res and $c_rl and $c_hello then "PASS" else "FAIL" end),
-        reasons: ([ (if $c_exit then empty else "run.sh did not exit 0" end),
+        verdict: (if $c_exit and $c_sess and $c_res and $c_rl and $c_hello and $c_cfg and $c_norm and $c_row then "PASS" else "FAIL" end),
+        reasons: (if $c_row == false then ["row could not be built"] else [ (if $c_exit then empty else "run.sh did not exit 0" end),
                     (if $c_sess then empty else "not exactly one session_started" end),
                     (if $c_res then empty else "not exactly one successful result with numeric tokens" end),
                     (if $c_rl then empty else "rate_limited seen" end),
-                    (if $c_hello then empty else "hello.txt missing or not exact" end) ]) }' < "$norm"
+                    (if $c_hello then empty else "hello.txt missing or not exact" end),
+                    (if $c_cfg then empty else "scratch repo config changed" end),
+                    (if $c_norm then empty else "normalizer failed" end) ] end) }' < "$norm" 2>/dev/null
+}
+
+# fail_row <cli> <run.sh exit status>: the fixed FAIL row used when a row could not be built.
+fail_row() { build_row "$1" "${2:-255}" no "" /dev/null row; }
+
+# valid_row <cli> <run.sh exit status> <row json>: print the row if it is a JSON object for that CLI with a PASS or FAIL verdict and
+# the fields the table needs, else the fixed FAIL row. One bad row never hides the other.
+valid_row() {
+  if printf '%s' "$3" | "$JQ" -e --arg cli "$1" 'type == "object" and .provider == $cli and (.verdict == "PASS" or .verdict == "FAIL")
+      and (.changed | type) == "array" and (.reasons | type) == "array" and (.tokens | type) == "object"' >/dev/null 2>&1; then
+    printf '%s\n' "$3"
+  else
+    fail_row "$1" "$2"
+  fi
 }
 
 # table <run-both.json>: one printable table (one row per CLI), then the notes.
 table() {
-  jq -r '
+  "$JQ" -r '
     def pad($n): tostring | . + ([range(0; $n - length)] | map(" ") | add // "");
     def v: if . == null then "-" else . end;
     def cols: [
@@ -213,27 +316,70 @@ table() {
 }
 
 # ---- end functions ------------------------------------------------------------------------------------------------------------
-
 cap_of() { # cap_of <cli>: print the one capture dir under $ROOT/<cli>/, else return 1
   set -- "$ROOT/$1"/*/
   [ "$#" -eq 1 ] && [ -d "$1" ] && [ ! -L "$1" ] || return 1
   printf '%s\n' "${1%/}"
 }
-# scratch_of <cli> <worktree file>: print the scratch run dir of a finished run (for cleanup), or return 1.
-scratch_of() {
-  local cap wt
+
+# run_dir_of <cli> <worktree file>: print the scratch run dir of THIS run's <cli> worktree, or return 1. The worktree path comes from a
+# capture file the CLI could have written, so it is trusted only if all of this holds (a forged path is never read or deleted):
+#   - read_wt accepts the file (safe file, absolute, no control characters, physically inside the spike scratch root);
+#   - the path is exactly <scratch root>/run-<UTC stamp>-<6 characters>/repo-wt/<cli>-1, the shape the run scripts create;
+#   - the run dir is a real directory (no symlink) that is not older than this run's preflight.txt, so a leftover from an
+#     earlier run, or any other directory, is refused;
+#   - for claude, whose capture also holds rundir.path, that file must name the same run dir (codex writes no such file).
+run_dir_of() {
+  local cap wt run sroot rd
   cap="$(cap_of "$1")" || return 1
   wt="$(read_wt "$cap/$2")" || return 1
+  sroot="$(spike_root)" || return 1
   case "$wt" in
-    */repo-wt/*) printf '%s\n' "${wt%/repo-wt/*}" ;;
+    "$sroot"/run-????????T??????Z-??????/repo-wt/"$1"-1) ;;
     *) return 1 ;;
   esac
+  run="${wt%/repo-wt/*}"
+  [ -d "$run" ] && [ ! -L "$run" ] || return 1
+  [ ! "$ROOT/preflight.txt" -nt "$run" ] || return 1
+  if [ "$1" = "claude" ]; then
+    rd="$(read_wt "$cap/rundir.path")" || return 1
+    [ "$rd" = "$run" ] || return 1
+  fi
+  printf '%s\n' "$run"
 }
+
+# leftover_note <cli> <worktree file>: say where the scratch run dir was left, as claude/run.sh does. The recorded location is only
+# read from a safe file, and is printed filtered and cut; it is text from a file the CLI could write, so it is only shown, never used.
+leftover_note() {
+  local cap line
+  line="unknown"
+  if cap="$(cap_of "$1")" && safe_input "$cap/$2"; then
+    line="$(head -n 1 "$cap/$2" 2>/dev/null | cut -c1-300 | printable)"
+  fi
+  spike_err "$1: scratch run dir NOT removed (not verified as this run's, its repo config changed, or removal failed). Recorded location: $line. All scratch dirs live under $(spike_root 2>/dev/null | printable). Remove by hand: . spike/lib/common.sh; spike_cleanup <run dir>"
+}
+
+# cleanup_one <cli> <worktree file>: remove the verified scratch run dir. The library's cleanup runs git on the scratch repo, so it
+# runs only if the repo config still passes the allowlist (and git is new enough to check it); otherwise the dir is left and reported.
+cleanup_one() {
+  local d g
+  if d="$(run_dir_of "$1" "$2")" && g="$(spike_tool_path git)" && git_new_enough "$g" && scratch_repo_ok "$g" "$d/repo-wt/$1-1" &&
+    spike_cleanup "$d"; then
+    return 0
+  fi
+  leftover_note "$1" "$2"
+}
+
+# cleanup_scratch: once only, and only for a CLI that was started. Skipped with --keep.
+CLEANED=0
+STARTED_CLAUDE=0
+STARTED_CODEX=0
 cleanup_scratch() {
-  local d
   [ "$KEEP" -eq 0 ] || return 0
-  d="$(scratch_of claude worktree.path)" && spike_cleanup "$d"
-  d="$(scratch_of codex worktree.txt)" && spike_cleanup "$d"
+  [ "$CLEANED" -eq 0 ] || return 0
+  CLEANED=1
+  if [ "$STARTED_CLAUDE" -eq 1 ]; then cleanup_one claude worktree.path; fi
+  if [ "$STARTED_CODEX" -eq 1 ]; then cleanup_one codex worktree.txt; fi
   return 0
 }
 
@@ -248,27 +394,42 @@ stop_if_signalled() {
 
 # process_cli <cli> <worktree file> <expected hello text> <run.sh exit status>: normalize, check, print the row JSON on stdout.
 process_cli() {
-  local cli="$1" wtfile="$2" want="$3" rc="$4" cap raw norm wt hello changed
+  local cli="$1" wtfile="$2" want="$3" rc="$4" cap raw norm rd wt hello changed flags jqerr nrc crc normarg
   hello="no"
   changed=""
+  flags=""
   norm="$ROOT/$cli.normalized.jsonl"
   if cap="$(cap_of "$cli")" && raw="$cap/raw.jsonl" && safe_input "$raw"; then
-    ( set -C; jq -c -n -R -f "$HERE/normalize/$cli.jq" < "$raw" > "$norm" ) 2>/dev/null \
-      || spike_err "could not write $norm"
-    if wt="$(read_wt "$cap/$wtfile")"; then
+    # The status of the normalizer is kept: a non-zero status (jq failed after printing, or noclobber refused an existing file)
+    # fails the row. Its error text is shown through printable, at most 5 lines.
+    jqerr="$( ( set -C; "$JQ" -c -n -R -f "$HERE/normalize/$cli.jq" < "$raw" > "$norm" ) 2>&1 )"
+    nrc=$?
+    if [ "$nrc" -ne 0 ]; then
+      flags="$flags norm"
+      spike_err "$cli: the normalizer failed (status $nrc); its output is not used"
+      if [ -n "$jqerr" ]; then printf '%s\n' "$jqerr" | cut -c1-300 | printable | head -n 5 >&2; fi
+    fi
+    if rd="$(run_dir_of "$cli" "$wtfile")"; then
+      wt="$rd/repo-wt/$cli-1"
       if hello_ok "$wt" "$want"; then hello="yes"; fi
       changed="$(changed_files "$wt")"
+      crc=$?
+      if [ "$crc" -eq 3 ]; then
+        flags="$flags cfg"
+        spike_err "$cli: scratch repo config changed; no git command was run on that repo"
+      fi
     else
       spike_err "$cli: the worktree path file is missing or was refused"
     fi
   else
     spike_err "$cli: no single safe capture with raw.jsonl under $ROOT/$cli"
   fi
-  build_row "$cli" "$rc" "$hello" "$changed" "$norm"
+  normarg="$norm"
+  case "$flags" in *norm*) normarg=/dev/null ;; esac
+  build_row "$cli" "$rc" "$hello" "$changed" "$normarg" "$flags"
 }
 
 # ---- the root, preflight ----------------------------------------------------------------------------------------------------
-command -v jq >/dev/null 2>&1 || { spike_err "jq is required"; exit 1; }
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 ROOT="$HERE/captures/run-both/$STAMP"
 mkdir -p "$HERE/captures/run-both" || { spike_err "cannot create the run-both captures directory"; exit 1; }
@@ -282,39 +443,47 @@ fi
 "$HERE/preflight.sh" > "$ROOT/preflight.txt" 2>&1 < /dev/null
 PRE_RC=$?
 printable < "$ROOT/preflight.txt"
+stop_if_signalled
 if [ "$PRE_RC" -ne 0 ]; then
   spike_err "preflight failed (exit $PRE_RC); nothing was run"
   exit 1
 fi
-stop_if_signalled
 
 # ---- the two runs: fixed order, one call each, GAP_SECS apart ------------------------------------------------------------
-SPIKE_CAPTURES_ROOT="$ROOT" "$HERE/claude/run.sh" < /dev/null
-RC_CLAUDE=$?
+# Each run script's output (stdout and stderr) goes through printable; its own exit status is taken from PIPESTATUS.
+STARTED_CLAUDE=1
+SPIKE_CAPTURES_ROOT="$ROOT" "$HERE/claude/run.sh" < /dev/null 2>&1 | printable
+RC_CLAUDE="${PIPESTATUS[0]}"
 stop_if_signalled
-sleep "$GAP_SECS"
+/bin/sleep "$GAP_SECS"
 stop_if_signalled
-SPIKE_CAPTURES_ROOT="$ROOT" "$HERE/codex/run.sh" < /dev/null
-RC_CODEX=$?
+STARTED_CODEX=1
+SPIKE_CAPTURES_ROOT="$ROOT" "$HERE/codex/run.sh" < /dev/null 2>&1 | printable
+RC_CODEX="${PIPESTATUS[0]}"
 stop_if_signalled
 
 # ---- normalize, check, print ----------------------------------------------------------------------------------------------
 ROW_CLAUDE="$(process_cli claude worktree.path "$CLAUDE_HELLO" "$RC_CLAUDE")"
 ROW_CODEX="$(process_cli codex worktree.txt "$CODEX_HELLO" "$RC_CODEX")"
-ROWS="$(jq -c -n --argjson a "$ROW_CLAUDE" --argjson b "$ROW_CODEX" '[$a, $b]' 2>/dev/null)" || ROWS=""
+ROW_CLAUDE="$(valid_row claude "$RC_CLAUDE" "$ROW_CLAUDE")"
+ROW_CODEX="$(valid_row codex "$RC_CODEX" "$ROW_CODEX")"
+stop_if_signalled
+ROWS="$("$JQ" -c -n --argjson a "$ROW_CLAUDE" --argjson b "$ROW_CODEX" '[$a, $b]' 2>/dev/null)" || ROWS=""
 if [ -z "$ROWS" ]; then
   spike_err "could not build the result rows"
   cleanup_scratch
   exit 1
 fi
-jq -n --argjson rows "$ROWS" '{rows: $rows}' > "$ROOT/run-both.json"
+"$JQ" -n --argjson rows "$ROWS" '{rows: $rows}' > "$ROOT/run-both.json"
 printf '\n== run-both result ==\n'
 table "$ROOT/run-both.json"
 printf 'captures (gitignored; redact before committing anything): %s\n' "$ROOT"
 
 cleanup_scratch
+# A signal that arrived while normalizing or printing still ends the script with the signal's code, after the cleanup above.
+stop_if_signalled
 
-if [ "$(printf '%s\n' "$ROWS" | jq -r 'map(select(.verdict == "PASS")) | length')" = "2" ]; then
+if [ "$(printf '%s\n' "$ROWS" | "$JQ" -r 'map(select(.verdict == "PASS")) | length')" = "2" ]; then
   printf 'run-both: PASS (both CLIs)\n'
   exit 0
 fi
