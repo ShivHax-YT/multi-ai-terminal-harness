@@ -210,8 +210,12 @@ for f in "$FIXN"/*.jsonl; do
   esac
 done
 
-# raw keys of a fixture, derived independently of the normalizers (well-formed lines only)
-claude_rawkeys='
+# raw keys of a fixture, derived independently of the normalizers (well-formed lines only). Keys with a character outside
+# printable ASCII, or longer than 64, are dropped here (the hostile tests cover them). The filter is a jq regex on purpose:
+# a shell glob range such as [ -~] follows the locale's collation under bash 3.2 (macOS), where it excluded every letter
+# and silently checked zero keys.
+printable_key_def='def printable_key: select(test("^[ -~]{1,64}$"));'
+claude_rawkeys="$printable_key_def"'
   def blocks: (.message.content? // null) | if type == "string" then [{type: "text"}] elif type == "array" then . else [] end;
   [ inputs | (try fromjson catch null) | select(type == "object" and (.type | type) == "string")
     | . as $o
@@ -219,13 +223,13 @@ claude_rawkeys='
        elif ($o.type == "system" or $o.type == "result") and ($o.subtype | type) == "string" then "\($o.type)/\($o.subtype)" else $o.type end),
       (if $o.type == "assistant" and ($o.error | type) == "string" then "assistant" else empty end),
       (if $o.type == "assistant" or $o.type == "user" then ($o | blocks[] | select(type == "object" and (.type | type) == "string") | "\($o.type):\(.type)") else empty end)
-  ] | unique | .[]'
-codex_rawkeys='
+  ] | unique | .[] | printable_key'
+codex_rawkeys="$printable_key_def"'
   [ inputs | (try fromjson catch null) | select(type == "object" and (.type | type) == "string")
     | if .type == "item.updated" then "item.updated"
       elif (.type == "item.started" or .type == "item.completed") then (if (.item | type) == "object" and (.item.type | type) == "string" then "\(.type):\(.item.type)" else empty end)
       else .type end
-  ] | unique | .[]'
+  ] | unique | .[] | printable_key'
 key_listed() { # cli key [jq-file] : 0 if the key is mapped (a trailing /* is a wildcard) or ignored in that file
   local cli=$1 key=$2 file=${3:-$NORM/$1.jq}
   jq -n -e --arg dump keys -f "$file" < /dev/null \
@@ -238,8 +242,6 @@ rawkey_problems() {
   if [ "$cli" = claude ]; then keysprog=$claude_rawkeys; else keysprog=$codex_rawkeys; fi
   while IFS= read -r key; do
     [ -n "$key" ] || continue
-    case "$key" in *[!\ -~]*) continue ;; esac # hostile keys with control characters are covered by the hostile tests
-    [ "${#key}" -le 64 ] || continue
     n=$((n + 1))
     if key_listed "$cli" "$key" "$jqfile"; then
       :
@@ -251,6 +253,18 @@ rawkey_problems() {
   done < <(jq -n -r -R "$keysprog" < "$file")
   echo "checked $n"
 }
+
+# The independent key derivation itself, pinned on the two sample fixtures and on edge cases, so a platform difference that
+# yields no keys (bash 3.2's collation-ordered glob ranges did) fails here by name instead of passing silently.
+eq "derived raw keys of fixtures/claude/sample.jsonl" "$(jq -n -r -R "$claude_rawkeys" < "$SPIKE/fixtures/claude/sample.jsonl" | paste -sd' ' -)" \
+  "assistant:text assistant:tool_use rate_limit_event result/success system/api_retry system/init system/status user:tool_result"
+eq "derived raw keys of fixtures/codex/sample.jsonl" "$(jq -n -r -R "$codex_rawkeys" < "$SPIKE/fixtures/codex/sample.jsonl" | paste -sd' ' -)" \
+  "future.event.kind item.completed:agent_message item.completed:command_execution item.completed:error item.completed:file_change item.completed:future_item_kind item.completed:mcp_tool_call item.completed:reasoning item.completed:todo_list item.completed:web_search item.started:command_execution item.started:mcp_tool_call item.started:todo_list item.updated thread.started turn.completed turn.started"
+k64=$(printf 'y%.0s' $(seq 64))
+printf '%s\n' '{"type":"ok_type"}' '{"type":"bad\u0007type"}' "{\"type\":\"${k64}x\"}" "{\"type\":\"$k64\"}" '{"type":"caf\u00e9"}' \
+  '{"type":"tab\there"}' > "$TMP/keyedge.jsonl"
+eq "key derivation keeps printable ASCII up to 64 characters and drops control, non-ASCII and longer keys" \
+  "$(jq -n -r -R "$codex_rawkeys" < "$TMP/keyedge.jsonl" | paste -sd' ' -)" "ok_type $k64"
 
 observed_seen=0
 for e in "${entries[@]}"; do
