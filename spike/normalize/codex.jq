@@ -99,9 +99,10 @@ def step($seq; $st):
              ev($seq; "tool_result"; $rk; {id: $tid, is_error: tool_failed($item)}) ],
        st: (if $iid != null then ($st | .tools[$tid] = true) else $st end)}
     elif $rk == "item.completed:agent_message" then
-      {ev: [ ev($seq; "message"; $rk; {role: "assistant", text: ($item.text | clip(4000) // ""),
-                                       truncated: ((($item.text | type) == "string") and (($item.text | length) > 4000))}) ],
-       st: $st}
+      # text must be a string (an empty string is a valid text); anything else makes the item unknown
+      if ($item.text | type) != "string" then {ev: [ unknown_ev($seq; $rk; $o) ], st: $st}
+      else {ev: [ ev($seq; "message"; $rk; {role: "assistant", text: ($item.text | clip(4000)), truncated: (($item.text | length) > 4000)}) ],
+            st: $st} end
     elif $rk == "item.started:error" or $rk == "item.completed:error" then
       {ev: [ if $iid != null and $st.errs[$iid] then empty
              else ev($seq; "warning"; $rk; {kind: "item_error", message: ($item.message | clip(300) // "")}) end ],

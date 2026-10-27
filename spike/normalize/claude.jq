@@ -58,12 +58,16 @@ def block_events($seq; $who):
   | if ($b | isobj | not) or (($b.type | type) != "string") then unknown_ev($seq; $who + ":invalid_block"; null)
     else ($who + ":" + ($b.type | clip(40))) as $k
     | if $k == "assistant:text" then
-        ev($seq; "message"; $k; {role: "assistant", text: ($b.text | clip(4000) // ""),
-                                 truncated: ((($b.text | type) == "string") and (($b.text | length) > 4000))})
+        # a required field that is missing or not a string makes the block unknown (an empty string is a valid text)
+        if ($b.text | type) != "string" then unknown_ev($seq; $k; $b)
+        else ev($seq; "message"; $k; {role: "assistant", text: ($b.text | clip(4000)), truncated: (($b.text | length) > 4000)}) end
       elif $k == "assistant:tool_use" then
-        ev($seq; "tool_call"; $k; {id: ($b.id | clip(100) // ""), name: ($b.name | clip(64) // "")})
+        if (($b.id | type) != "string") or ($b.id == "") or (($b.name | type) != "string") or ($b.name == "")
+        then unknown_ev($seq; $k; $b)
+        else ev($seq; "tool_call"; $k; {id: ($b.id | clip(100)), name: ($b.name | clip(64))}) end
       elif $k == "user:tool_result" then
-        ev($seq; "tool_result"; $k; {id: ($b.tool_use_id | clip(100) // ""), is_error: ($b.is_error == true)})
+        if (($b.tool_use_id | type) != "string") or ($b.tool_use_id == "") then unknown_ev($seq; $k; $b)
+        else ev($seq; "tool_result"; $k; {id: ($b.tool_use_id | clip(100)), is_error: ($b.is_error == true)}) end
       elif ($k | inl(ignored_keys)) then empty
       else unknown_ev($seq; $k; $b)
       end

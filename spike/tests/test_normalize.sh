@@ -421,12 +421,13 @@ printf '%s\n' '{"type":"result","subtype":"success","num_turns":1}' > "$TMP/nous
 normalize claude "$TMP/nousage.jsonl" > "$TMP/o.jsonl"
 jqe "claude result without usage: zero tokens, tokens_known false, still numeric" "$(jq -s -c '.[0]' "$TMP/o.jsonl")" \
   '.tokens == {input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0} and .tokens_known == false and .is_error == false and .cost_usd == null'
-printf '%s\n' '{"type":"system","subtype":"init"}' '{"type":"assistant","message":{"content":[{"type":"server_tool_use"},{"type":"tool_use","id":"t1","name":"X"},"str",null,7]}}' \
-  '{"type":"user","message":{"content":[{"type":"image"},{"type":"text","text":"x"},{"type":"tool_result","tool_use_id":"t1","is_error":true}]}}' > "$TMP/odd.jsonl"
+printf '%s\n' '{"type":"system","subtype":"init"}' \
+  '{"type":"assistant","message":{"content":[{"type":"server_tool_use"},{"type":"tool_use","id":"t1","name":"X"},"str",null,7,{"type":"tool_use","name":"Y"},{"type":"text"}]}}' \
+  '{"type":"user","message":{"content":[{"type":"image"},{"type":"text","text":"x"},{"type":"tool_result","tool_use_id":"t1","is_error":true},{"type":"tool_result"}]}}' > "$TMP/odd.jsonl"
 normalize claude "$TMP/odd.jsonl" > "$TMP/o.jsonl"
-eq "claude odd shapes: init without id, unknown block types, invalid blocks" \
+eq "claude odd shapes: init without id, unknown block types, invalid blocks, tool_use without id, text without text, tool_result without id" \
   "$(jq -s -c '[.[] | [.type, .raw_type // .name // ""]]' "$TMP/o.jsonl")" \
-  '[["unknown","system/init"],["unknown","assistant:server_tool_use"],["tool_call","X"],["unknown","assistant:invalid_block"],["unknown","assistant:invalid_block"],["unknown","assistant:invalid_block"],["unknown","user:image"],["tool_result",""]]'
+  '[["unknown","system/init"],["unknown","assistant:server_tool_use"],["tool_call","X"],["unknown","assistant:invalid_block"],["unknown","assistant:invalid_block"],["unknown","assistant:invalid_block"],["unknown","assistant:tool_use"],["unknown","assistant:text"],["unknown","user:image"],["tool_result",""],["unknown","user:tool_result"]]'
 
 # codex rows
 cx_failure="$TMP/out/codex-failure.jsonl"
@@ -497,6 +498,13 @@ done
 normalize claude "$TMP/weird.jsonl" > "$TMP/o.jsonl"
 eq "claude weird input: 8 malformed_line unknowns" "$(count "$TMP/o.jsonl" '.type == "unknown" and .raw_type == "malformed_line"')" "8"
 eq "claude weird input: garbage makes no error event, only the unknown-status and the string-429 rate_limited" "$(count "$TMP/o.jsonl" '.type == "error"')/$(count "$TMP/o.jsonl" '.type == "rate_limited"')" "0/2"
+eq "claude weird input: 44 unknown (was 40 before round 4: +1 text without text, +1 text with an object, +1 tool_use without id, +1 tool_result without id)" \
+  "$(count "$TMP/o.jsonl" '.type == "unknown"')" "44"
+check "claude weird input: no tool_call or tool_result with an empty id, no message from a non-string text" \
+  jq -s -e 'all(.[]; if .type == "tool_call" or .type == "tool_result" then (.id != "") else true end)' "$TMP/o.jsonl"
+normalize codex "$TMP/weird.jsonl" > "$TMP/o.jsonl"
+eq "codex weird input: 37 unknown (was 36 before round 4: +1 agent_message with a numeric text)" "$(count "$TMP/o.jsonl" '.type == "unknown"')" "37"
+eq "codex weird input: a non-string agent_message text gives no message" "$(count "$TMP/o.jsonl" '.type == "message"')" "0"
 # a final line without a newline is still read
 printf '%s' '{"type":"system","subtype":"init","session_id":"abc"}' > "$TMP/nonl.jsonl"
 eq "a last line without a newline is read" "$(normalize claude "$TMP/nonl.jsonl" | wc -l | tr -d ' ')" "1"
@@ -590,11 +598,30 @@ check "mutation claude ignored assistant:thinking: the coverage check FAILS on c
   test "$(rawkey_problems claude "$FIXN/claude-routine.jsonl" "$TMP/out/claude-routine.jsonl" "$TMP/mutant-ign.jq" | grep -c '^raw key')" -ge 1
 
 # ---- round 2: turn rule and state machine text in the spec ------------------------------------------------------------------
-check "spec: an invocation without a result still counts at least 1 turn" grep -q 'still counts at least 1 turn' "$SPEC_FLAT"
-check "spec: the scheduler counts 1 turn at dispatch" grep -q 'counts 1 turn at dispatch' "$SPEC_FLAT"
-check "spec: reconcile with result.turns when it is larger" grep -qE 'reconciles with `result.turns` when a `result` arrives and that number is larger' "$SPEC_FLAT"
-check "spec: the turn rule names the Codex bare top-level error, a crash and the watchdog" \
-  grep -qF 'bare top-level `error`, a crash, a watchdog kill' "$SPEC_FLAT"
+# round 4, fix 1: turns are reserved at dispatch (rule 1 never passes 40); the round 2 wording (count 1 at dispatch, reconcile
+# afterwards) must be gone
+check "spec: the old wording 'counts 1 turn at dispatch' is gone" test "$(grep -c 'counts 1 turn at dispatch' "$SPEC_FLAT")" = "0"
+check "spec: the old wording 'still counts at least 1 turn' is gone" test "$(grep -c 'still counts at least 1 turn' "$SPEC_FLAT")" = "0"
+check "spec: the old wording 'reconciles with result.turns' is gone" test "$(grep -c 'reconciles with' "$SPEC_FLAT")" = "0"
+check "spec: reserve at dispatch, Claude its --max-turns value, Codex 1" \
+  grep -qF 'Reserve at dispatch.** Before every invocation the scheduler reserves that invocation'"'"'s maximum: for Claude its `--max-turns` value, for Codex 1' "$SPEC_FLAT"
+check "spec: Claude --max-turns is min(5, 40 minus turns already used or reserved)" \
+  grep -qF '`--max-turns` is set to min(5, 40 minus turns already used or reserved)' "$SPEC_FLAT"
+check "spec: a Claude invocation is never started with --max-turns 0" grep -qF 'never started with `--max-turns` 0' "$SPEC_FLAT"
+check "spec: the scheduler refuses the dispatch when the reservation does not fit under 40" \
+  grep -qF 'refuses the dispatch (no child process is started) when the reservation does not fit under 40' "$SPEC_FLAT"
+check "spec: a result replaces the reservation with max(1, result.turns)" \
+  grep -qF 'the reservation is replaced by max(1, `result.turns`)' "$SPEC_FLAT"
+check "spec: with no result the full reservation stays counted" grep -qF 'the full reservation stays counted' "$SPEC_FLAT"
+check "spec: no failure path can make a run cheaper than its reservation" grep -qF 'No failure path can make a run cheaper than its reservation' "$SPEC_FLAT"
+check "spec: no-result cases named: crash, watchdog, cancel(), Codex bare top-level error" \
+  grep -qF '(a crash, the watchdog, `cancel()`, a Codex bare top-level `error`)' "$SPEC_FLAT"
+check "spec worked example: at 38 used Claude gets --max-turns 2" grep -qF 'At 38 turns used, Claude gets `--max-turns` 2' "$SPEC_FLAT"
+check "spec worked example: at 40 nothing is dispatched" grep -qF 'At 40 turns used or reserved, nothing is dispatched' "$SPEC_FLAT"
+check "spec worked example: reserved at 5 and killed before its result counts 5" \
+  grep -qF 'A Claude call reserved at 5 and killed before its `result` counts 5' "$SPEC_FLAT"
+check "spec: Claude's native cap makes the reservation enforceable" grep -qF "Claude's native cap is what makes the turn reservation enforceable" "$SPEC_FLAT"
+check "spec: Codex has no native cap and 1 per exec is the approved rule" grep -qF 'Codex has no native cap; 1 turn per `exec` call is the approved rule' "$SPEC_FLAT"
 check "spec: the transition function takes (state, event, invocation_flags)" grep -qF '(state, event, invocation_flags)' "$SPEC_FLAT"
 check "spec: row 7 needs a per-invocation limit_seen flag" grep -qF '`limit_seen`' "$SPEC_FLAT"
 check "spec: limit_seen wins over a Codex limit error with no turn.failed" grep -qF 'a Codex limit `error` with no `turn.failed`' "$SPEC_FLAT"
@@ -604,6 +631,27 @@ check "spec: a successful result followed by a non-zero exit is exited, is_error
 check "spec: a successful result followed by death from a non-cancel signal is row 11 (exited)" \
   grep -qE '^\| 11 \| `running` \| `result\{is_error:false\}` seen, then a non-zero exit or death by a signal that was not a `cancel\(\)`.*`exited`' "$SPEC"
 check "spec: row 7 covers spawning and running" grep -qE '^\| 7 \| `spawning`, `running` \|' "$SPEC"
+# round 4, fix 3: the ordinary events have explicit rows, the exited event is named, the illegal pairs are listed
+check "spec: row 12, warning/limit_notice/unknown/error{fatal:false} stay in spawning" \
+  grep -qE '^\| 12 \| `spawning` \| `warning`, `limit_notice`, `unknown`, `error\{fatal:false\}` \| `spawning` \|' "$SPEC"
+check "spec: row 13, error{fatal:true} stays in spawning until the child ends (decision stated)" \
+  grep -qE '^\| 13 \| `spawning` \| `error\{fatal:true\}` \| `spawning` \|.*decision: a fatal error is information, not an exit' "$SPEC"
+check "spec: row 14, the ordinary events stay in running" \
+  grep -qE '^\| 14 \| `running` \| `message`, `tool_call`, `tool_result`, `warning`, `limit_notice`, `error` \(fatal or not\), `unknown` \| `running` \|' "$SPEC"
+check "spec: row 15, result stays running, sets result_seen and is_error, the last result counts" \
+  grep -qE '^\| 15 \| `running` \| `result\{is_error\}` \| `running` \| sets `result_seen` and `is_error`.*the last one counts' "$SPEC"
+check "spec: row 16, cancel in exited or killed is an idempotent no-op" grep -qE '^\| 16 \| `exited`, `killed` \| `cancel\(\)` or watchdog \| unchanged \|' "$SPEC"
+check "spec: the exited event is named as the child-ends trigger" grep -qF 'that trigger is the **`exited` event**' "$SPEC_FLAT"
+check "spec: the exited event applies the end-of-invocation precedence" grep -qF 'The `exited` event applies it.' "$SPEC_FLAT"
+check "spec: an Illegal transitions list exists" grep -qF '**Illegal transitions.**' "$SPEC"
+check "spec: illegal: session_started while in running" grep -qF '`session_started` while in `running`' "$SPEC_FLAT"
+check "spec: illegal: events in idle, rate_limited, exited and killed, and after a terminal state" \
+  grep -qF 'while in `idle` or `rate_limited` (no child is running), and in `exited` or `killed` (events after a terminal state)' "$SPEC_FLAT"
+check "spec: illegal: send outside idle, resume outside rate_limited" grep -qF '`send(prompt)` in any state but `idle`; `resume` in any state but `rate_limited`' "$SPEC_FLAT"
+check "spec: the flags are limit_seen, result_seen and the is_error of the last result" \
+  grep -qF '`result_seen` and `is_error` (that of the last `result`)' "$SPEC_FLAT"
+check "spec: row 10 stops feeding events of a cancelled child and keeps the turn reservation" \
+  grep -qE '^\| 10 \|.*feeds no further event of that child to the function.*the turn reservation stays' "$SPEC"
 
 # ---- round 2: clip cuts first and cleans after, so 32k control characters stay fast ---------------------------------------
 esc32k=$(jq -n -r '[range(32000) | "\u001b"] | join("")')
@@ -701,6 +749,282 @@ printf '%s\n' '{"text":"installed @types/node and @scope/pkg"}' > "$TMP/at-harml
 printf '%s\n' '{"text":"contact someone@example.com now"}' > "$TMP/at-email.txt"
 eq "email check: @types/node is harmless" "$(email_hits "$TMP/at-harmless.txt")" "0"
 eq "email check: an email-shaped string is caught" "$(email_hits "$TMP/at-email.txt")" "1"
+
+# ---- round 4, fix 2: a missing or mistyped required field becomes unknown, never an empty id or empty text -----------------
+# each case is "raw key|one raw line"; the normalizer must give exactly one unknown with that raw key as raw and raw_type
+bad_field_cases=(
+  'claude|assistant:tool_use|{"type":"assistant","message":{"content":[{"type":"tool_use","name":"X"}]}}'
+  'claude|assistant:tool_use|{"type":"assistant","message":{"content":[{"type":"tool_use","id":5,"name":"X"}]}}'
+  'claude|assistant:tool_use|{"type":"assistant","message":{"content":[{"type":"tool_use","id":"","name":"X"}]}}'
+  'claude|assistant:tool_use|{"type":"assistant","message":{"content":[{"type":"tool_use","id":null,"name":"X"}]}}'
+  'claude|assistant:tool_use|{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1"}]}}'
+  'claude|assistant:tool_use|{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":7}]}}'
+  'claude|assistant:tool_use|{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":""}]}}'
+  'claude|assistant:tool_use|{"type":"assistant","message":{"content":[{"type":"tool_use"}]}}'
+  'claude|assistant:text|{"type":"assistant","message":{"content":[{"type":"text"}]}}'
+  'claude|assistant:text|{"type":"assistant","message":{"content":[{"type":"text","text":5}]}}'
+  'claude|assistant:text|{"type":"assistant","message":{"content":[{"type":"text","text":null}]}}'
+  'claude|assistant:text|{"type":"assistant","message":{"content":[{"type":"text","text":{"n":1}}]}}'
+  'claude|assistant:text|{"type":"assistant","message":{"content":[{"type":"text","text":["a"]}]}}'
+  'claude|user:tool_result|{"type":"user","message":{"content":[{"type":"tool_result"}]}}'
+  'claude|user:tool_result|{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":5}]}}'
+  'claude|user:tool_result|{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":""}]}}'
+  'claude|user:tool_result|{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":null,"is_error":true}]}}'
+  'claude|user:tool_result|{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":["t1"]}]}}'
+  'codex|item.completed:agent_message|{"type":"item.completed","item":{"id":"m1","type":"agent_message"}}'
+  'codex|item.completed:agent_message|{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":5}}'
+  'codex|item.completed:agent_message|{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":null}}'
+  'codex|item.completed:agent_message|{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":{"nested":"object"}}}'
+  'codex|item.completed:agent_message|{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":["a"]}}'
+)
+bad_n=0
+for c in "${bad_field_cases[@]}"; do
+  IFS='|' read -r bcli bkey bline <<< "$c"
+  bad_n=$((bad_n + 1))
+  printf '%s\n' "$bline" > "$TMP/badfield.jsonl"
+  normalize "$bcli" "$TMP/badfield.jsonl" > "$TMP/o.jsonl"
+  eq "malformed field case $bad_n ($bcli $bkey): exactly one event, an unknown with raw and raw_type $bkey" \
+    "$(jq -s -c --arg k "$bkey" '[.[] | [.type, .raw, .raw_type]] == [["unknown", $k, $k]]' "$TMP/o.jsonl")" "true"
+  check "malformed field case $bad_n ($bcli $bkey): keys are key names (an array of strings)" \
+    jq -s -e '.[0].keys | type == "array" and all(.[]; type == "string")' "$TMP/o.jsonl"
+  eq "malformed field case $bad_n ($bcli $bkey): the unknown validates against the schema" "$(validate "$TMP/o.jsonl")" "0"
+done
+eq "the malformed-field case list has 23 entries" "$bad_n" "23"
+# valid shapes still map, and an empty string text is a valid string
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"X"},{"type":"text","text":"hi"},{"type":"text","text":""}]}}' \
+  '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]}}' \
+  '{"type":"assistant","message":{"content":"plain"}}' > "$TMP/valid.jsonl"
+normalize claude "$TMP/valid.jsonl" > "$TMP/o.jsonl"
+eq "claude valid shapes still map: tool_call, message, empty-string message, tool_result, string content" \
+  "$(jq -s -c '[.[] | [.type, (.id // .text), (if .type == "tool_result" then .is_error else (.name // .truncated) end)]]' "$TMP/o.jsonl")" \
+  '[["tool_call","t1","X"],["message","hi",false],["message","",false],["tool_result","t1",false],["message","plain",false]]'
+eq "claude valid shapes: 0 unknown and the events validate" "$(count "$TMP/o.jsonl" '.type == "unknown"')/$(validate "$TMP/o.jsonl")" "0/0"
+printf '%s\n' '{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":"hi"}}' \
+  '{"type":"item.completed","item":{"id":"m2","type":"agent_message","text":""}}' > "$TMP/valid.jsonl"
+normalize codex "$TMP/valid.jsonl" > "$TMP/o.jsonl"
+eq "codex valid agent_message and empty-string agent_message both map to message" \
+  "$(jq -s -c '[.[] | [.type, .text, .truncated]]' "$TMP/o.jsonl")" '[["message","hi",false],["message","",false]]'
+eq "codex valid messages: the events validate" "$(validate "$TMP/o.jsonl")" "0"
+# a tool_use name of a string type but only control characters is still a (cleaned, non-empty) name
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"\u0001"}]}}' > "$TMP/ctl.jsonl"
+eq "a control-character-only name is a string, so the tool_call stays (cleaned to a space)" "$(normalize claude "$TMP/ctl.jsonl" | jq -c '[.type, .name]')" '["tool_call"," "]'
+# the deliberate round 2 rule stays: Codex tool items without an id get line<N>
+eq "codex tool items without an id still get line<N> ids (round 2 rule unchanged)" \
+  "$(normalize codex "$TMP/noid.jsonl" | jq -s -c '[.[] | select(.type == "tool_call") | .id]')" '["line2","line4"]'
+# golden: the one committed fixture line with a malformed required field
+eq "golden codex-malformed: line 16 (agent_message with an object text) is an unknown, not a message" \
+  "$(sed -n '/"seq":16,/p' "$EXPECTED/codex-malformed.jsonl" | jq -c '[.type, .raw_type]')" '["unknown","item.completed:agent_message"]'
+eq "golden codex-malformed: the only message events are the valid line 17" "$(jq -s -c '[.[] | select(.type == "message") | .seq]' "$EXPECTED/codex-malformed.jsonl")" "[17]"
+
+# ---- round 4, fix 3: the state machine accepts the ordinary events of a real run, proven by replaying every fixture ------------
+# ===== REFERENCE TRANSITION FUNCTION =====================================================================================
+# Implements the table in docs/spec/adapter-interface.md ("Session state machine", rows 1 to 16) and the explicit illegal list,
+# and nothing more. The trailing "# ROWn" tags name the spec row; the mutation proof edits the line tagged ROW14.
+# input: none (called as transition($state; $event; $flags)); $state is null before row 1.
+# Triggers: the 11 event types, plus the commands start, send, cancel, resume.
+cat > "$TMP/reference.jq" <<'EOF'
+def flags0: {limit_seen: false, reset_at: null, result_seen: false, is_error: null};
+def inl($l): . as $x | any($l[]; . == $x);
+def clean_exit($e): ($e.code == 0) and (($e.signal // null) == null);
+def transition($state; $e; $f):
+  def ok($s; $nf): {ok: true, state: $s, flags: $nf};
+  def bad: {ok: false, state: $state, flags: $f};
+  def with_limit: $f | .limit_seen = true | .reset_at = ([.reset_at, $e.reset_at] | map(select(. != null)) | max);
+  ($e.type) as $t
+  | if $t == "start" then (if $state == null then ok("spawning"; flags0) else bad end)                          # ROW1
+    elif $t == "send" then (if $state == "idle" then ok("spawning"; flags0) else bad end)                       # ROW9
+    elif $t == "resume" then (if $state == "rate_limited" then ok("idle"; $f) else bad end)                     # ROW8
+    elif $t == "cancel" then
+      (if ($state | inl(["spawning", "running", "idle", "rate_limited"])) then ok("killed"; $f)                 # ROW10
+       elif ($state | inl(["exited", "killed"])) then ok($state; $f)                                            # ROW16
+       else bad end)
+    elif $state == "spawning" then
+      if $t == "session_started" then ok("running"; $f)                                                         # ROW2
+      elif $t == "rate_limited" then ok("spawning"; with_limit)                                                 # ROW7
+      elif ($t | inl(["warning", "limit_notice", "unknown"])) then ok("spawning"; $f)                           # ROW12
+      elif $t == "error" and $e.fatal == false then ok("spawning"; $f)                                          # ROW12
+      elif $t == "error" and $e.fatal == true then ok("spawning"; $f)                                           # ROW13
+      elif $t == "exited" then (if $f.limit_seen then ok("rate_limited"; $f) else ok("exited"; $f) end)         # ROW7 ROW3
+      else bad end
+    elif $state == "running" then
+      if $t == "rate_limited" then ok("running"; with_limit)                                                    # ROW7
+      elif $t == "result" then ok("running"; $f | .result_seen = true | .is_error = $e.is_error)                # ROW15
+      elif ($t | inl(["message", "tool_call", "tool_result", "warning", "limit_notice", "error", "unknown"])) then ok("running"; $f)   # ROW14
+      elif $t == "exited" then
+        (if $f.limit_seen then ok("rate_limited"; $f)                                                           # ROW7
+         elif $f.result_seen and $f.is_error == false and (clean_exit($e) | not) then ok("exited"; $f)          # ROW11
+         elif $f.result_seen and $f.is_error == false then ok("idle"; $f)                                       # ROW4
+         elif $f.result_seen then ok("exited"; $f)                                                              # ROW5
+         else ok("exited"; $f) end)                                                                             # ROW6
+      else bad end
+    else bad end;
+EOF
+# ===== END REFERENCE TRANSITION FUNCTION =================================================================================
+{
+  cat "$TMP/reference.jq"
+  echo '($f // flags0) as $fl | transition($s; $e; $fl) | if .ok then .state else "illegal" end'
+} > "$TMP/one.jq"
+{
+  cat "$TMP/reference.jq"
+  echo 'transition($s; $e; $f) | .flags'
+} > "$TMP/oneflags.jq"
+{
+  cat "$TMP/reference.jq"
+  cat <<'EOF'
+def replay: reduce .[] as $e ({state: "spawning", flags: flags0, illegal: []};
+  transition(.state; $e; .flags) as $r
+  | if $r.ok then .state = $r.state | .flags = $r.flags
+    else .illegal += [{seq: $e.seq, type: $e.type, state: .state}] end);
+replay
+EOF
+} > "$TMP/replay.jq"
+tr_one() { # state-json event-json [flags-json] : prints the new state, or "illegal"
+  jq -n -c -r --argjson s "$1" --argjson e "$2" --argjson f "${3:-null}" -f "$TMP/one.jq"
+}
+tr_flags() { # state-json event-json flags-json : prints the flags after the transition
+  jq -n -c --argjson s "$1" --argjson e "$2" --argjson f "$3" -f "$TMP/oneflags.jq"
+}
+replay_json() { # json-array-of-events : prints "<end state>/<number of illegal transitions>" (the replay starts in spawning, after row 1)
+  printf '%s' "$1" | jq -c -f "$TMP/replay.jq" | jq -r '"\(.state)/\(.illegal | length)"'
+}
+replay_flags() { printf '%s' "$1" | jq -c -f "$TMP/replay.jq" | jq -c '.flags'; }
+
+# the matrix: every (state, trigger) pair against an independent statement of the table (a bash case, written from the spec rows)
+matrix_event() {
+  case "$1" in
+    error_nonfatal) echo '{"type":"error","fatal":false}' ;;
+    error_fatal) echo '{"type":"error","fatal":true}' ;;
+    result_ok) echo '{"type":"result","is_error":false}' ;;
+    result_err) echo '{"type":"result","is_error":true}' ;;
+    exited_clean) echo '{"type":"exited","code":0}' ;;
+    *) echo "{\"type\":\"$1\"}" ;;
+  esac
+}
+matrix_expect() { # state trigger : the table's target state; "illegal" for every pair the table does not allow
+  case "$1:$2" in
+    none:start) echo spawning ;;
+    spawning:cancel | running:cancel | idle:cancel | rate_limited:cancel | killed:cancel) echo killed ;;
+    exited:cancel) echo exited ;;
+    idle:send) echo spawning ;;
+    rate_limited:resume) echo idle ;;
+    spawning:session_started) echo running ;;
+    spawning:warning | spawning:limit_notice | spawning:unknown | spawning:error_nonfatal | spawning:error_fatal | spawning:rate_limited) echo spawning ;;
+    spawning:exited_clean) echo exited ;;
+    running:message | running:tool_call | running:tool_result | running:warning | running:limit_notice | running:unknown) echo running ;;
+    running:error_nonfatal | running:error_fatal | running:rate_limited | running:result_ok | running:result_err) echo running ;;
+    running:exited_clean) echo exited ;;
+    *) echo illegal ;;
+  esac
+}
+matrix_triggers="start send resume cancel session_started message tool_call tool_result warning limit_notice rate_limited error_nonfatal error_fatal result_ok result_err unknown exited_clean"
+matrix_total=0
+for st in none spawning running idle rate_limited exited killed; do
+  mism=""
+  for tg in $matrix_triggers; do
+    matrix_total=$((matrix_total + 1))
+    if [ "$st" = none ]; then sj=null; else sj="\"$st\""; fi
+    got=$(tr_one "$sj" "$(matrix_event "$tg")")
+    want=$(matrix_expect "$st" "$tg")
+    [ "$got" = "$want" ] || mism="$mism [$tg: want $want got $got]"
+  done
+  eq "state machine matrix, state $st: every trigger matches the table" "$mism" ""
+done
+eq "state machine matrix covered 7 states x 17 triggers" "$matrix_total" "119"
+# the named illegal cases of the brief
+eq "illegal: a message in idle" "$(tr_one '"idle"' '{"type":"message"}')" "illegal"
+eq "illegal: session_started in running" "$(tr_one '"running"' '{"type":"session_started"}')" "illegal"
+eq "illegal: an event after a terminal state (killed): all 11 event types" \
+  "$(for t in session_started message tool_call tool_result warning limit_notice rate_limited error result exited unknown; do tr_one '"killed"' "{\"type\":\"$t\",\"fatal\":false,\"is_error\":false}"; done | sort -u | paste -sd' ' -)" "illegal"
+eq "illegal: an event after a terminal state (exited): all 11 event types" \
+  "$(for t in session_started message tool_call tool_result warning limit_notice rate_limited error result exited unknown; do tr_one '"exited"' "{\"type\":\"$t\",\"fatal\":false,\"is_error\":false}"; done | sort -u | paste -sd' ' -)" "illegal"
+eq "illegal: message, tool_call, tool_result and result before session_started (spawning)" \
+  "$(for t in message tool_call tool_result result; do tr_one '"spawning"' "{\"type\":\"$t\",\"is_error\":false}"; done | sort -u | paste -sd' ' -)" "illegal"
+# an illegal transition is reported by the replay and changes neither the state nor the flags
+eq "replay reports session_started in running as illegal and stays running" "$(replay_json '[{"type":"session_started","seq":1},{"type":"session_started","seq":2}]')" "running/1"
+eq "replay reports a message after an idle end as illegal" \
+  "$(replay_json '[{"type":"session_started"},{"type":"result","is_error":false},{"type":"exited","code":0},{"type":"message"}]')" "idle/1"
+eq "replay reports any event after cancel (killed) as illegal, the exited event of the killed child included" \
+  "$(replay_json '[{"type":"cancel"},{"type":"message"},{"type":"exited","code":137}]')" "killed/2"
+eq "replay: a second exited event is illegal" "$(replay_json '[{"type":"session_started"},{"type":"exited","code":1},{"type":"exited","code":1}]')" "exited/1"
+eq "replay: message and result in spawning are illegal" "$(replay_json '[{"type":"message"},{"type":"result","is_error":false}]')" "spawning/2"
+# the ordinary events of a normal run: no illegal transition
+eq "ordinary spawning events (warning, limit_notice, unknown, both errors) stay in spawning" \
+  "$(replay_json '[{"type":"warning"},{"type":"limit_notice"},{"type":"unknown"},{"type":"error","fatal":false},{"type":"error","fatal":true}]')" "spawning/0"
+eq "decision: error{fatal:true} in spawning stays spawning until the child ends; then it is row 3 (exited)" \
+  "$(replay_json '[{"type":"error","fatal":true},{"type":"exited","code":1}]')" "exited/0"
+eq "ordinary running events stay in running" \
+  "$(replay_json '[{"type":"session_started"},{"type":"message"},{"type":"tool_call"},{"type":"tool_result"},{"type":"warning"},{"type":"limit_notice"},{"type":"error","fatal":false},{"type":"error","fatal":true},{"type":"unknown"}]')" "running/0"
+# the exited event and the precedence (rows 3 to 7, 11)
+ss='{"type":"session_started"}'
+eq "row 3: exited before session_started -> exited" "$(replay_json '[{"type":"exited","code":1}]')" "exited/0"
+eq "row 4: success result then exit 0 -> idle" "$(replay_json "[$ss,{\"type\":\"result\",\"is_error\":false},{\"type\":\"exited\",\"code\":0}]")" "idle/0"
+eq "row 5: error result then exit 0 -> exited" "$(replay_json "[$ss,{\"type\":\"result\",\"is_error\":true},{\"type\":\"exited\",\"code\":0}]")" "exited/0"
+eq "row 5: error result then exit 1 -> exited" "$(replay_json "[$ss,{\"type\":\"result\",\"is_error\":true},{\"type\":\"exited\",\"code\":1}]")" "exited/0"
+eq "row 6: no result, exit 0 -> exited" "$(replay_json "[$ss,{\"type\":\"exited\",\"code\":0}]")" "exited/0"
+eq "row 6: no result, exit 1 -> exited" "$(replay_json "[$ss,{\"type\":\"exited\",\"code\":1}]")" "exited/0"
+eq "row 7: rate_limited then exit with no result -> rate_limited" "$(replay_json "[$ss,{\"type\":\"rate_limited\"},{\"type\":\"exited\",\"code\":1}]")" "rate_limited/0"
+eq "row 7: rate_limited then success result then exit 0 -> rate_limited (limit_seen wins)" \
+  "$(replay_json "[$ss,{\"type\":\"rate_limited\"},{\"type\":\"result\",\"is_error\":false},{\"type\":\"exited\",\"code\":0}]")" "rate_limited/0"
+eq "row 7: rate_limited seen while spawning is not lost" "$(replay_json '[{"type":"rate_limited"},{"type":"exited","code":1}]')" "rate_limited/0"
+eq "row 11: success result then exit 1 -> exited" "$(replay_json "[$ss,{\"type\":\"result\",\"is_error\":false},{\"type\":\"exited\",\"code\":1}]")" "exited/0"
+eq "row 11: success result then death by a signal -> exited" "$(replay_json "[$ss,{\"type\":\"result\",\"is_error\":false},{\"type\":\"exited\",\"signal\":\"KILL\"}]")" "exited/0"
+eq "row 11: success result then an exited event with neither code nor signal -> exited (not a clean exit)" \
+  "$(replay_json "[$ss,{\"type\":\"result\",\"is_error\":false},{\"type\":\"exited\"}]")" "exited/0"
+eq "several results: the last one counts (error, then success -> idle)" \
+  "$(replay_json "[$ss,{\"type\":\"result\",\"is_error\":true},{\"type\":\"result\",\"is_error\":false},{\"type\":\"exited\",\"code\":0}]")" "idle/0"
+eq "several results: the last one counts (success, then error -> exited)" \
+  "$(replay_json "[$ss,{\"type\":\"result\",\"is_error\":false},{\"type\":\"result\",\"is_error\":true},{\"type\":\"exited\",\"code\":0}]")" "exited/0"
+eq "flags: result sets result_seen and is_error; no other event changes them" \
+  "$(replay_flags "[$ss,{\"type\":\"message\"},{\"type\":\"result\",\"is_error\":true},{\"type\":\"warning\"}]")" '{"limit_seen":false,"reset_at":null,"result_seen":true,"is_error":true}'
+eq "flags: limit_seen keeps the highest reset_at" \
+  "$(replay_flags "[$ss,{\"type\":\"rate_limited\",\"reset_at\":5},{\"type\":\"rate_limited\",\"reset_at\":9},{\"type\":\"rate_limited\",\"reset_at\":7},{\"type\":\"rate_limited\"}]")" '{"limit_seen":true,"reset_at":9,"result_seen":false,"is_error":null}'
+eq "row 9 (send from idle) starts a new invocation with empty flags" \
+  "$(tr_flags '"idle"' '{"type":"send"}' '{"limit_seen":true,"reset_at":9,"result_seen":true,"is_error":false}')" '{"limit_seen":false,"reset_at":null,"result_seen":false,"is_error":null}'
+eq "rows 1, 8 and 9 in a row: start, then resume from rate_limited and send from idle" \
+  "$(tr_one null '{"type":"start"}')/$(tr_one '"rate_limited"' '{"type":"resume"}')/$(tr_one '"idle"' '{"type":"send"}')" "spawning/idle/spawning"
+
+# replay every fixture's normalized output with an exited event appended, from the state after row 1 (spawning).
+# The exit code per fixture: 1 for a fixture that is a failed or limited run (its last result is an error or it hit a limit, so a
+# real CLI exits non-zero), 0 for a successful run. For claude-limits and codex-failure the code does not matter: limit_seen
+# wins over every other row. For codex-hostile and codex-malformed the last result is an error (row 5), also whatever the code.
+replay_code() {
+  case "$1" in
+    claude-limits | codex-failure | codex-hostile | codex-malformed) echo 1 ;;
+    *) echo 0 ;;
+  esac
+}
+# The end state each fixture must reach.
+#  claude-sample, claude-routine, claude-hostile, codex-sample, codex-item-warning: one successful result, exit 0, no limit
+#    -> row 4, idle. (claude-hostile has an error{fatal:false} in running; that is row 14 and changes nothing.)
+#  claude-limits, codex-failure: rate_limited events were seen -> row 7, rate_limited at exit.
+#  codex-hostile: its only result is an error (the failed turn) and no rate_limited -> row 5, exited.
+#  codex-malformed: results false, false, true, true: the LAST one counts (is_error true) and no rate_limited -> row 5, exited.
+#    Its first two lines are unknown events in spawning (row 12) before the real thread.started on line 3.
+#  an observed*.jsonl capture: one successful result, exit 0 -> idle.
+expected_end() {
+  case "$1" in
+    claude-sample | claude-routine | claude-hostile | codex-sample | codex-item-warning) echo idle ;;
+    claude-limits | codex-failure) echo rate_limited ;;
+    codex-hostile | codex-malformed) echo exited ;;
+    claude-observed* | codex-observed*) echo idle ;;
+    *) echo "NO-EXPECTATION-FOR-$1" ;;
+  esac
+}
+replayed=0
+for e in "${entries[@]}"; do
+  IFS='|' read -r cli file name <<< "$e"
+  code=$(replay_code "$name")
+  case "$name" in claude-observed* | codex-observed*) code=0 ;; esac
+  normalize "$cli" "$file" --argjson exit_code "$code" > "$TMP/replay-events.jsonl"
+  res=$(jq -s -c -f "$TMP/replay.jq" "$TMP/replay-events.jsonl")
+  nev=$(wc -l < "$TMP/replay-events.jsonl" | tr -d ' ')
+  replayed=$((replayed + 1))
+  eq "$name: replay (exit $code) has no illegal transition" "$(printf '%s' "$res" | jq -c '.illegal')" "[]"
+  eq "$name: replay (exit $code) ends in $(expected_end "$name")" "$(printf '%s' "$res" | jq -r '.state')" "$(expected_end "$name")"
+  check "$name: the replay saw all $nev events, the last one the appended exited event" \
+    jq -s -e --argjson n "$nev" 'length == $n and .[-1].type == "exited" and .[-1].code == '"$code" "$TMP/replay-events.jsonl"
+done
+check "the replay covered at least the 9 committed fixtures" test "$replayed" -ge 9
 
 # ---- no live provider use ------------------------------------------------------------------------------------------------
 check "this test never sets SPIKE_LIVE" test "$(grep -cE '^[[:space:]]*(export[[:space:]]+)?SPIKE_LIVE=' "$HERE/test_normalize.sh")" = "0"
