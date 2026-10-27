@@ -106,7 +106,25 @@ check "git runs with no global config (GIT_CONFIG_GLOBAL=/dev/null) and no syste
 check "git status runs with submodules ignored and the git dirs pinned" test "$(grep -c -e '--ignore-submodules=all' -e 'GIT_DIR="\$SG_GD" GIT_COMMON_DIR="\$SG_COMMON"' "$RUN")" -ge 2
 check "the wait is /bin/sleep (no PATH lookup of sleep)" test "$(code_lines "$RUN" | grep -c '^/bin/sleep "\$GAP_SECS"$')" = "1" -a "$(code_lines "$RUN" | grep -vE '^[[:space:]]*printf' | grep -cE '(^|[^/A-Za-z_])sleep ')" = "0"
 check "every jq call on capture data goes through the probe-checked \$JQ" test "$(code_lines "$RUN" | grep -E '(^|[^A-Za-z_"$/-])jq ' | grep -vcE "printf|spike_err")" = "0"
-check "the run scripts' output is filtered with printable and their status taken from PIPESTATUS" test "$(code_lines "$RUN" | grep -cE '/(claude|codex)/run.sh" < /dev/null 2>&1 \| printable$')" = "2" -a "$(code_lines "$RUN" | grep -c 'PIPESTATUS\[0\]')" = "2"
+FILTER_TAIL="2>&1 | ( trap '' INT; printable )"
+check "the run scripts' output is filtered with printable and their status taken from PIPESTATUS" test "$(code_lines "$RUN" | grep -E '/(claude|codex)/run.sh" < /dev/null ' | grep -cF -- "$FILTER_TAIL")" = "2" -a "$(code_lines "$RUN" | grep -c 'PIPESTATUS\[0\]')" = "2"
+check "the output filter after each run.sh ignores SIGINT (a Ctrl-C must not kill the pipe under the run script)" test "$(code_lines "$RUN" | grep -cF -- "| ( trap '' INT; printable )")" = "2" -a "$(code_lines "$RUN" | grep -cE '(claude|codex)/run.sh.*\| printable$')" = "0"
+# no [a-z]-style range in a case pattern (bash 3.2 orders ranges by the locale's collation). A bracket holding a dash between two
+# characters is a range; POSIX classes are fine. The pattern text is what comes before the first ) of a case line.
+has_range() { printf '%s\n' "$1" | grep -qE '\[[^]]*[^][ :-]-[^]]'; }
+check "range detector: [!0-9] is a range" has_range '*[!0-9]*'
+check "range detector: [a-z] is a range" has_range '[a-z]'
+check "range detector: [A-Za-z0-9._-] holds ranges" has_range '*[!A-Za-z0-9._-]*'
+check "range detector: a POSIX class is not a range" test "$(has_range '*[[:cntrl:]]*'; echo $?)" = "1"
+check "range detector: an explicit digit list is not a range" test "$(has_range '*[!0123456789]*'; echo $?)" = "1"
+check "range detector: a trailing dash is not a range" test "$(has_range '[._-]'; echo $?)" = "1"
+CASE_PATS="$(code_lines "$RUN" | grep -E ';;|(^|[^[:alnum:]_])case .* in( |$)' | sed 's/).*//')"
+check "the case patterns were found (at least 15 lines)" test "$(printf '%s\n' "$CASE_PATS" | wc -l | tr -d ' ')" -ge 15
+check "no [a-z]-style range in any case pattern of run-both.sh" test "$(printf '%s\n' "$CASE_PATS" | grep -cE '\[[^]]*[^][ :-]-[^]]')" = "0"
+check "the digit tests use an explicit digit list" test "$(code_lines "$RUN" | grep -cF -- '[!0123456789]')" = "4"
+check "process_cli checks the worktree path before it reads hello.txt or lists changed files" test "$(awk '/^process_cli\(\)/ {f=1} f && /wt_path_ok "\$wt"/ && !a {a=NR} f && /hello_ok "\$wt"/ && !b {b=NR} f && /changed_files "\$wt"/ && !c {c=NR} END {exit !(a && b && c && a < b && b < c)}' "$RUN"; echo $?)" = "0"
+check "cleanup_one checks the worktree path before the library cleanup" test "$(awk '/^cleanup_one\(\)/ {f=1} f && /wt_path_ok/ && !a {a=NR} f && /spike_cleanup/ && !b {b=NR} END {exit !(a && b && a < b)}' "$RUN"; echo $?)" = "0"
+check "run_dir_of checks the run dir name for a slash" test "$(awk '/^run_dir_of\(\)/ {f=1} f && /\*\/\*\) return 1/ {n++} END {print n + 0}' "$RUN")" = "1"
 check "the normalizer's exit status is kept (no || after the noclobber subshell)" test "$(code_lines "$RUN" | grep -c 'nrc=\$?')" = "1"
 
 # ---- the hello constants equal the text inside each merged run.sh TASK (the brief's drift guard) -----------------------------
@@ -189,7 +207,7 @@ JQ="$(spike_tool_path jq)"
 check "the probe path finds a native jq" test -n "$JQ"
 # shellcheck disable=SC1090
 . "$FUNCS"
-for fn in printable safe_input read_wt hello_ok git_new_enough config_allowed config_absent_or_allowed scratch_repo_ok changed_files build_row fail_row valid_row table; do
+for fn in printable safe_input read_wt hello_ok git_new_enough config_allowed config_absent_or_allowed wt_path_ok scratch_repo_ok changed_files build_row fail_row valid_row table; do
   check "function $fn is defined" test "$(type -t "$fn")" = "function"
 done
 
@@ -257,6 +275,8 @@ R="$(build_row claude 0 yes "" "$EXP/claude-sample.jsonl" " norm")"
 expect "flag norm: FAIL with the fixed reason normalizer failed" "$R" '.verdict == "FAIL" and .reasons == ["normalizer failed"]'
 R="$(build_row claude 0 yes "" "$EXP/claude-sample.jsonl" "cfg norm")"
 expect "flags cfg and norm: both fixed reasons" "$R" '.verdict == "FAIL" and .reasons == ["scratch repo config changed","normalizer failed"]'
+R="$(build_row claude 0 yes "" "$EXP/claude-sample.jsonl" wt)"
+expect "flag wt: FAIL with the fixed reason worktree path refused" "$R" '.verdict == "FAIL" and .reasons == ["worktree path refused"]'
 R="$(fail_row codex 7)"
 expect "fail_row: FAIL, row could not be built, the real run exit kept, zero counts" "$R" '.verdict == "FAIL" and .provider == "codex" and .run_exit == 7 and .reasons == ["row could not be built"] and .session == "none"'
 R="$(row claude 0 yes "" "$EXP/claude-sample.jsonl")"
@@ -391,6 +411,17 @@ ln "$TMP/outside.txt" "$W/hello.txt"
 check "hello_ok refuses a hard-linked hello.txt" test "$(hello_ok "$W" "$CANARY"; echo $?)" = "1"
 rm -f "$W/hello.txt"
 
+# -- wt_path_ok: the worktree path must be its own physical path and outside every CLI home (rule 4)
+check "wt_path_ok accepts a physical directory under the scratch root" wt_path_ok "$WT1"
+mkdir -p "$TMP/wt-other"
+ln -s "$TMP/wt-other" "$WTROOT/run-test/repo-wt/wlink"
+check "wt_path_ok refuses a path that is a symlink to another directory" test "$(wt_path_ok "$WTROOT/run-test/repo-wt/wlink"; echo $?)" = "1"
+ln -s "$WTROOT/run-test/repo-wt" "$WTROOT/run-test/rwlink"
+check "wt_path_ok refuses a path with a symlink in a middle component" test "$(wt_path_ok "$WTROOT/run-test/rwlink/w1"; echo $?)" = "1"
+mkdir -p "$CLIHOME/sub"
+check "wt_path_ok refuses a directory inside a CLI home" test "$(wt_path_ok "$CLIHOME/sub"; echo $?)" = "1"
+check "wt_path_ok refuses an empty path" test "$(wt_path_ok ""; echo $?)" = "1"
+
 # -- changed_files and the config allowlist, on real scratch repos made by the library (rule 4). The scratch repo's config sits where
 # the CLI could write it: git must not run on it at all unless every key is one the setup writes (an allowlist, not a blocklist).
 GIT_BIN="$(spike_tool_path git)"
@@ -408,14 +439,15 @@ CANARY_CFG="$TMP/canary.cfg"
 printf '%s\n' "$CANARY" > "$CANARY_CFG"
 
 # the allowlist, key by key
-for kv in core.repositoryformatversion=0 core.filemode=true core.bare=false core.logallrefupdates=true core.ignorecase=true core.precomposeunicode=true; do
+for kv in core.repositoryformatversion=0 core.filemode=true core.bare=false core.logallrefupdates=true core.ignorecase=true core.precomposeunicode=true \
+  extensions.objectformat=sha256 extensions.refstorage=reftable; do
   : > "$TMP/cfg-one"
   tg config --file "$TMP/cfg-one" "${kv%%=*}" "${kv#*=}"
   check "config_allowed accepts ${kv%%=*}" config_allowed "$GIT_BIN" "$TMP/cfg-one"
 done
 for kv in filter.x.clean=a filter.x.process=a filter.x.smudge=a include.path=/x includeIf.gitdir:/x/.path=/y core.worktree=/x core.fsmonitor=a \
   core.hooksPath=/x core.sshCommand=a core.pager=a core.attributesFile=/x core.excludesFile=/x extensions.worktreeConfig=true \
-  alias.x=a diff.x.textconv=a foo.bar=1 core.foo=1 branch.main.remote=origin user.name=x; do
+  alias.x=a diff.x.textconv=a foo.bar=1 core.foo=1 branch.main.remote=origin user.name=x extensions.foo=1 extensions.objectformat2=1 extensions.compatobjectformat=sha1; do
   : > "$TMP/cfg-one"
   tg config --file "$TMP/cfg-one" "${kv%%=*}" "${kv#*=}"
   check "config_allowed refuses ${kv%%=*}" test "$(config_allowed "$GIT_BIN" "$TMP/cfg-one" >/dev/null 2>&1; echo $?)" != "0"
@@ -431,6 +463,30 @@ ln -s "$TMP/cfg-one" "$TMP/cfg-link"
 check "config_allowed refuses a symlink" test "$(config_allowed "$GIT_BIN" "$TMP/cfg-link" >/dev/null 2>&1; echo $?)" != "0"
 check "config_absent_or_allowed accepts a missing file" config_absent_or_allowed "$GIT_BIN" "$TMP/cfg-missing"
 check "config_absent_or_allowed refuses a dangling symlink" test "$(ln -s "$TMP/nowhere" "$TMP/cfg-dangling"; config_absent_or_allowed "$GIT_BIN" "$TMP/cfg-dangling" >/dev/null 2>&1; echo $?)" != "0"
+
+# the two extensions a user's global init.* settings can make `git init` write: a real sha256 init writes extensions.objectformat
+env GIT_DEFAULT_HASH=sha256 "$GIT_BIN" init -q -b main "$TMP/sha-repo" > /dev/null 2>&1
+if "$GIT_BIN" config --file "$TMP/sha-repo/.git/config" --name-only --list 2>/dev/null | grep -qx 'extensions.objectformat'; then
+  check "config_allowed accepts the config a real sha256 git init writes" config_allowed "$GIT_BIN" "$TMP/sha-repo/.git/config"
+else
+  ok # this git cannot write a sha256 repo; the per-key checks above cover the key
+fi
+# rule 4: the config file is checked with safe_input BEFORE git reads it. The content below is allowlisted, so only the file checks refuse it.
+mk_wt
+ln "$WREPO/.git/config" "$TMP/cfg-hardlink"
+check "config_allowed refuses a hard-linked config (allowlisted content)" test "$(config_allowed "$GIT_BIN" "$WREPO/.git/config" >/dev/null 2>&1; echo $?)" != "0"
+check "changed_files refuses a hard-linked repo config: status 3, no git run" test "$(changed_files "$WWT" 2>&1; echo "rc=$?")" = "(not listed: repo config changed)
+rc=3"
+rm -f "$TMP/cfg-hardlink"
+check "config_allowed accepts the same config once the extra link is gone" config_allowed "$GIT_BIN" "$WREPO/.git/config"
+cp "$WREPO/.git/config" "$CLIHOME/gitcfg"
+check "config_allowed refuses a config file inside a CLI home (allowlisted content)" test "$(config_allowed "$GIT_BIN" "$CLIHOME/gitcfg" >/dev/null 2>&1; echo $?)" != "0"
+mk_wt
+printf '[core]\n\tbare = false\n' > "$WREPO/.git/worktrees/claude-1/config.worktree"
+ln "$WREPO/.git/worktrees/claude-1/config.worktree" "$TMP/cfgwt-hardlink"
+CH="$(changed_files "$WWT" 2>&1)"
+eq "a hard-linked config.worktree is refused: status 3" "3" "$?"
+rm -f "$TMP/cfgwt-hardlink"
 
 # an untouched scratch config lists the changed files (positive)
 mk_wt
@@ -494,6 +550,7 @@ hostile "extensions.worktreeConfig" extensions.worktreeConfig true
 filter_fixture() { # filter_fixture <key>
   mk_wt
   printf 'aaaa\n' > "$WWT/f.txt"
+  touch -t 202001010000 "$WWT/f.txt" # an old mtime: the later rewrite is always stat-dirty, never within the same timestamp tick
   printf 'f.txt filter=x\n' > "$WWT/.gitattributes"
   tg -C "$WWT" add f.txt .gitattributes
   tg -C "$WWT" commit -q -m f
@@ -541,10 +598,69 @@ ln -s "$WREPO/.git-moved" "$WREPO/.git"
 HOUT="$(changed_files "$WWT" 2>&1)"
 eq "a .git directory replaced by a symlink is refused: status 3" "3" "$?"
 
+# commondir pinned: the worktree entry's commondir file must be a safe regular file holding exactly ../..
+mk_wt
+CD="$WREPO/.git/worktrees/claude-1/commondir"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "scratch_repo_ok accepts the commondir git wrote (../.. and a newline)" "0" "$?"
+printf '../..' > "$CD"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "scratch_repo_ok accepts ../.. without a trailing newline" "0" "$?"
+EVILCD="$TMP/evil-cd-repo"
+rm -rf "$EVILCD"
+tg init -q -b main "$EVILCD"
+printf '%s\n' "$EVILCD/.git" > "$CD"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "scratch_repo_ok refuses a commondir that points at another repo" "3" "$?"
+CH="$(changed_files "$WWT" 2>&1)"
+eq "changed_files with a redirected commondir: status 3" "3" "$?"
+eq "changed_files with a redirected commondir: the fixed text and nothing else" "(not listed: repo config changed)" "$CH"
+for cdv in '../../' '../..\n\n' '../.. ' '..' '../../..' '/etc' ''; do
+  printf "$cdv" > "$CD"
+  scratch_repo_ok "$GIT_BIN" "$WWT"
+  eq "scratch_repo_ok refuses a commondir holding [$cdv]" "3" "$?"
+done
+rm -f "$CD"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "scratch_repo_ok refuses a missing commondir" "3" "$?"
+printf '../..\n' > "$TMP/cd-target"
+ln -s "$TMP/cd-target" "$CD"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "scratch_repo_ok refuses a symlinked commondir (right content)" "3" "$?"
+rm -f "$CD"
+printf '../..\n' > "$CD"
+ln "$CD" "$TMP/cd-hard"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "scratch_repo_ok refuses a hard-linked commondir (right content)" "3" "$?"
+rm -f "$TMP/cd-hard"
+
+# the repo itself pinned: <run>/repo is not a symlink and the physical path of its .git is exactly <run>/repo/.git
+mk_wt
+V1REPO="$WREPO"
+V1WT="$WWT"
+mk_wt
+mv "$V1REPO" "$(dirname "$V1REPO")/repo.real"
+ln -s "$WREPO" "$V1REPO"
+scratch_repo_ok "$GIT_BIN" "$V1WT"
+eq "scratch_repo_ok refuses a repo that is a symlink to another repo (it has a worktrees/claude-1 entry and an allowlisted config)" "3" "$?"
+{ "$GIT_BIN" -C "$WREPO" worktree list; find "$WREPO" | sort; } > "$TMP/other.before" 2>&1
+CH="$(changed_files "$V1WT" 2>&1)"
+eq "changed_files on a redirected repo: status 3" "3" "$?"
+eq "changed_files on a redirected repo: the fixed text" "(not listed: repo config changed)" "$CH"
+{ "$GIT_BIN" -C "$WREPO" worktree list; find "$WREPO" | sort; } > "$TMP/other.after" 2>&1
+check "nothing in the other repo changed (worktree list and file listing)" cmp -s "$TMP/other.before" "$TMP/other.after"
+mk_wt
+RUN2="$(dirname "$WREPO")"
+mv "$RUN2" "$RUN2.real"
+ln -s "$RUN2.real" "$RUN2"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "scratch_repo_ok refuses a worktree path whose run dir is a symlink (physical path of .git differs)" "3" "$?"
+
 # the worktree's own .git file is never followed. The "CLI" rewrites it to a COPY of the git dirs whose config defines a filter driver
 # (the real config stays clean, so the allowlist passes); with the git dirs pinned from the path the copy is never read.
 mk_wt
 printf 'aaaa\n' > "$WWT/f.txt"
+touch -t 202001010000 "$WWT/f.txt" # old mtime: the rewrite below is always stat-dirty
 printf 'f.txt filter=x\n' > "$WWT/.gitattributes"
 tg -C "$WWT" add f.txt .gitattributes
 tg -C "$WWT" commit -q -m f
@@ -570,6 +686,7 @@ mk_wt
 mkdir -p "$WWT/sub"
 tg init -q -b main "$WWT/sub"
 printf 'aaaa\n' > "$WWT/sub/f.txt"
+touch -t 202001010000 "$WWT/sub/f.txt" # old mtime: the rewrite below is always stat-dirty
 printf 'f.txt filter=x\n' > "$WWT/sub/.gitattributes"
 tg -C "$WWT/sub" add f.txt .gitattributes
 tg -C "$WWT/sub" commit -q -m s
@@ -634,6 +751,24 @@ mk_sandbox() { # mk_sandbox -> sets SB; the sandbox copy of run-both.sh is byte-
   printf '#!/bin/bash\necho "sleep $*" >> "$FAKE_LOG"\n[ -n "${FAKE_SLEEP_SIGNAL:-}" ] && kill -"$FAKE_SLEEP_SIGNAL" "$PPID"\nexit 0\n' > "$SB/fast/sleep"
   printf '#!/bin/bash\ncase "$*" in *%%Y%%m%%dT*) echo 20260101T000000Z ;; *) exec /bin/date "$@" ;; esac\n' > "$SB/fast/date"
   printf '#!/bin/bash\nif [ -n "${FAKE_SLOWFLAG:-}" ] && [ -e "$FAKE_SLOWFLAG" ]; then rm -f "$FAKE_SLOWFLAG"; /bin/sleep 2; fi\nexec /usr/bin/tr "$@"\n' > "$SB/fast/tr"
+  # a wc that, on its 2nd `wc -c` call (the second read_wt of the claude capture, after the path shape was accepted), swaps the claude
+  # worktree for a symlink to $FAKE_WCSWAP_OTHER: the race the worktree path check closes
+  cat > "$SB/fast/wc" <<'EOF'
+#!/bin/bash
+if [ -n "${FAKE_WCSWAP_OTHER:-}" ] && [ "${1:-}" = "-c" ]; then
+  n="$(cat "$FAKE_LOG.wcn" 2>/dev/null)"
+  n=$((${n:-0} + 1))
+  echo "$n" > "$FAKE_LOG.wcn"
+  if [ "$n" = "2" ]; then
+    for w in "$TMPDIR"/harness-spike/run-*/repo-wt/claude-1; do
+      mv "$w" "$w.real"
+      ln -s "$FAKE_WCSWAP_OTHER" "$w"
+      echo "swapped $w" >> "$FAKE_LOG"
+    done
+  fi
+fi
+exec /usr/bin/wc "$@"
+EOF
   cat > "$SB/spike/preflight.sh" <<'EOF'
 #!/bin/bash
 printf 'preflight %s\n' "$(date +%s)" >> "$FAKE_LOG"
@@ -651,6 +786,8 @@ printf 'claude root %s\n' "${SPIKE_CAPTURES_ROOT:-none}" >> "$FAKE_LOG"
 printf 'claude says hello\n'
 printf 'claude escape \033[31mred\033[0m end\n'
 printf 'claude stderr text\n' >&2
+# a run that died before it made any scratch repo or capture directory
+[ "${FAKE_CLAUDE_NOCAP:-}" = "1" ] && exit "${FAKE_CLAUDE_RC:-2}"
 REPO="$(spike_scratch_repo)"
 WT="$(spike_worktree_add "$REPO" claude-1)"
 CAP="$(spike_capture_dir claude)"
@@ -694,6 +831,19 @@ case "${FAKE_HOSTILE:-}" in
   foobar) _spike_git config --file "$CFG" foo.bar 1 ;;
 esac
 [ -n "${FAKE_CLAUDE_SIGNAL:-}" ] && kill -"$FAKE_CLAUDE_SIGNAL" "$PPID"
+if [ "${FAKE_CLAUDE_CTRLC:-}" = "1" ]; then
+  # a terminal Ctrl-C reaches every process of the foreground group: simulate it on run-both.sh and on the other members of its pipeline
+  # (the output filter and its child), then keep writing. This script's own EXIT trap (like the real run.sh cleanup) must still run.
+  trap 'printf "claude exit-trap\n"; printf "claude exit-trap\n" >> "$FAKE_LOG"' EXIT
+  kill -INT "$PPID"
+  for p in $(pgrep -P "$PPID"); do
+    [ "$p" = "$$" ] && continue
+    for c in $(pgrep -P "$p"); do kill -INT "$c" 2>/dev/null; done
+    kill -INT "$p" 2>/dev/null
+  done
+  /bin/sleep 1
+  printf 'claude after the interrupt\n'
+fi
 printf 'claude end %s\n' "$(date +%s)" >> "$FAKE_LOG"
 exit "${FAKE_CLAUDE_RC:-0}"
 EOF
@@ -728,6 +878,33 @@ if [ "${FAKE_CODEX_FORGE:-}" = "claude" ]; then
   CW="$(cat "$SPIKE_CAPTURES_ROOT"/claude/*/worktree.path)"
   printf '%s\n' "$CW" > "$CAP/worktree.txt"
 fi
+if [ "${FAKE_CODEX_FORGE:-}" = "slash" ]; then
+  # a complete, fresh scratch repo and worktree whose run dir has TWO path segments (run-a/bcdefgT123456Z-abcdef) that a case
+  # pattern with ? wildcards would accept, because a ? also matches a slash
+  V="$(spike_root)/run-a/bcdefgT123456Z-abcdef"
+  mkdir -p "$V/repo" "$V/repo-wt"
+  _spike_git -C "$V/repo" init -q -b main
+  printf 'x\n' > "$V/repo/README.md"
+  _spike_git -C "$V/repo" add README.md
+  _spike_git -C "$V/repo" commit -q -m i
+  _spike_git -C "$V/repo" worktree add -q -b spike/codex-1 "$V/repo-wt/codex-1" > /dev/null
+  printf 'hello from codex\n' > "$V/repo-wt/codex-1/hello.txt"
+  printf 'keep\n' > "$V/repo-wt/codex-1/sentinel"
+  printf 'victim %s\n' "$V/repo-wt/codex-1" >> "$FAKE_LOG"
+  printf '%s\n' "$V/repo-wt/codex-1" > "$CAP/worktree.txt"
+fi
+if [ "${FAKE_CODEX_REPOLINK:-}" = "1" ]; then
+  # the "CLI" redirects <run>/repo to ANOTHER scratch repo that has an allowlisted config and a worktrees/codex-1 entry whose worktree
+  # path lies in THIS run dir, so a git command run through the redirect (the library cleanup does that) would remove it
+  OREPO="$(spike_scratch_repo)"
+  mv "$WT" "$WT.moved"
+  _spike_git -C "$OREPO" worktree add -q -b spike/codex-1 "$WT" > /dev/null
+  printf 'hello from codex\n' > "$WT/hello.txt"
+  mv "$REPO" "$REPO.real"
+  ln -s "$OREPO" "$REPO"
+  printf 'other %s\n' "$OREPO" >> "$FAKE_LOG"
+  { git -C "$OREPO" worktree list; find "$OREPO" | sort; } > "$FAKE_LOG.other.before" 2>&1
+fi
 if [ "${FAKE_CODEX_LATE:-}" = "1" ]; then
   : > "$FAKE_SLOWFLAG"
   ( /bin/sleep 1; kill -TERM "$PPID" ) > /dev/null 2>&1 < /dev/null &
@@ -736,7 +913,7 @@ fi
 printf 'codex end %s\n' "$(date +%s)" >> "$FAKE_LOG"
 exit "${FAKE_CODEX_RC:-0}"
 EOF
-  chmod +x "$SB/spike/run-both.sh" "$SB/spike/preflight.sh" "$SB/spike/claude/run.sh" "$SB/spike/codex/run.sh" "$SB/fast/sleep" "$SB/fast/date" "$SB/fast/tr"
+  chmod +x "$SB/spike/run-both.sh" "$SB/spike/preflight.sh" "$SB/spike/claude/run.sh" "$SB/spike/codex/run.sh" "$SB/fast/sleep" "$SB/fast/date" "$SB/fast/tr" "$SB/fast/wc"
   : > "$SB/log"
 }
 # mk_fast: a sandbox whose copy of run-both.sh has exactly ONE line rewritten, the /bin/sleep line, so the wait is a shim that only logs
@@ -1036,6 +1213,65 @@ eq "M: worktree.path is a symlink: exit 1" "1" "$rc"
 has "M: the refusal is reported" "$(cat "$SB/err")" 'claude: the worktree path file is missing or was refused'
 has "M: the leftover is reported with an unknown location" "$(cat "$SB/err")" 'claude: scratch run dir NOT removed'
 has "M: the location is unknown (the symlinked file was not read)" "$(cat "$SB/err")" 'Recorded location: unknown'
+
+# N. round 3 hardening, whole flow
+# N1. the claude worktree is swapped for a symlink to another directory (after the path shape was accepted): nothing is read there
+mk_fast
+mkdir -p "$SB/tmp/other"
+printf 'hello from claude\n' > "$SB/tmp/other/hello.txt"
+CNAME="canary-name-$$-must-never-be-printed"
+printf 'x\n' > "$SB/tmp/other/$CNAME"
+rc="$(run_sb "$SB/$FASTP" "FAKE_WCSWAP_OTHER=$SB/tmp/other" --)"
+JN="$(cat "$(root_of)/run-both.json" 2>/dev/null)"
+eq "N1: a swapped worktree symlink: exit 1" "1" "$rc"
+eq "N1: the swap really happened (the wc shim ran it once)" "1" "$(logcount swapped)"
+expect "N1: the claude row is FAIL with the fixed reason worktree path refused" "$JN" '.rows[0].verdict == "FAIL" and (.rows[0].reasons | index("worktree path refused")) != null'
+expect "N1: hello.txt was not read through the symlink, nothing was listed" "$JN" '.rows[0].hello_ok == false and .rows[0].changed == []'
+expect "N1: the codex row is unaffected" "$JN" '.rows[1].verdict == "PASS"'
+eq "N1: the canary file name is never printed or stored" "0" "$(cat "$SB/out" "$SB/err" "$(root_of)/run-both.json" | grep -c "$CNAME")"
+has "N1: the refusal is reported" "$(cat "$SB/err")" 'claude: worktree path refused'
+eq "N1: the claude scratch dir is left, the codex one removed" "1" "$(scratch_left)"
+check "N1: the other directory was not touched" test "$(ls -A "$SB/tmp/other" | wc -l | tr -d ' ')" = "2"
+
+# N2. Ctrl-C during the claude run reaches the output filter too: the filter keeps the pipe open, the run script's EXIT trap runs
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "FAKE_CLAUDE_CTRLC=1" --)"
+eq "N2: Ctrl-C during the claude run: exit 130" "130" "$rc"
+eq "N2: the run script's EXIT trap ran (the filter did not die and close the pipe under it)" "1" "$(logcount 'claude exit-trap')"
+has "N2: the EXIT trap output reached the screen (the filter was still alive to show it)" "$(cat "$SB/out")" "claude exit-trap"
+has "N2: the output written after the interrupt was still shown" "$(cat "$SB/out")" 'claude after the interrupt'
+eq "N2: codex never started and no wait happened" "00" "$(logcount 'codex start')$(grep -c '^sleep' "$SB/log")"
+eq "N2: scratch cleanup ran" "0" "$(scratch_left)"
+check "N2: no run-both.json" test ! -e "$(root_of)/run-both.json"
+
+# N3. a CLI with no capture dir: no false "NOT removed" message
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "FAKE_CLAUDE_NOCAP=1" --)"
+eq "N3: claude left no capture dir: exit 1" "1" "$rc"
+has "N3: the missing capture is reported once" "$(cat "$SB/err")" 'claude: no single safe capture'
+lacks "N3: no 'NOT removed' message for claude (nothing is recorded or known)" "$(cat "$SB/err")" 'claude: scratch run dir NOT removed'
+expect "N3: claude FAIL, codex PASS" "$(cat "$(root_of)/run-both.json")" '.rows[0].verdict == "FAIL" and .rows[1].verdict == "PASS"'
+
+# N4. a run dir name with a slash that the ? wildcards would accept is refused, and the victim is not deleted
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "FAKE_CODEX_FORGE=slash" --)"
+eq "N4: codex worktree.txt naming a two-segment run dir: exit 1" "1" "$rc"
+VICT="$(grep '^victim ' "$SB/log" | cut -d' ' -f2)"
+check "N4: the victim (a complete scratch repo whose path the glob accepts) was not deleted" test -f "$VICT/sentinel"
+expect "N4: the codex row is FAIL (hello not read from the forged path), claude PASS" "$(cat "$(root_of)/run-both.json")" '.rows[0].verdict == "PASS" and .rows[1].verdict == "FAIL" and .rows[1].hello_ok == false'
+has "N4: the codex leftover is reported" "$(cat "$SB/err")" 'codex: scratch run dir NOT removed'
+
+# N5. <run>/repo is redirected to another scratch repo: no git runs through it, the other repo is untouched
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "FAKE_CODEX_REPOLINK=1" --)"
+eq "N5: a redirected repo: exit 1" "1" "$rc"
+OREPO="$(grep '^other ' "$SB/log" | cut -d' ' -f2)"
+check "N5: the other repo exists" test -d "$OREPO/.git"
+{ git -C "$OREPO" worktree list; find "$OREPO" | sort; } > "$SB/other.after" 2>&1
+check "N5: nothing in the other repo changed (git worktree list and file listing, before and after)" cmp -s "$SB/log.other.before" "$SB/other.after"
+check "N5: the other repo still has its worktrees/codex-1 entry" test -d "$OREPO/.git/worktrees/codex-1"
+expect "N5: the codex row is FAIL with exactly the fixed reason" "$(cat "$(root_of)/run-both.json")" '.rows[1].verdict == "FAIL" and .rows[1].reasons == ["scratch repo config changed"]'
+has "N5: the leftover is reported (no cleanup through the redirect)" "$(cat "$SB/err")" 'codex: scratch run dir NOT removed'
 
 # ---- the live gate in the real library is still intact (the sandbox override is only in the sandbox copy) -----------------------
 check "the real lib/common.sh was not changed by the sandbox override" test "$(grep -c 'spike_require_live() { :; }' "$SPIKE/lib/common.sh")" = "0"

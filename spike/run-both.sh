@@ -108,7 +108,7 @@ read_wt() {
   local f="$1" line phys sroot size
   safe_input "$f" || return 1
   size="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"
-  case "$size" in ""|*[!0-9]*) return 1 ;; esac
+  case "$size" in ""|*[!0123456789]*) return 1 ;; esac
   [ "$size" -gt 0 ] && [ "$size" -le 4096 ] || return 1
   line="$(head -n 1 "$f" 2>/dev/null)"
   case "$line" in
@@ -151,22 +151,24 @@ git_new_enough() {
   maj="${v%%.*}"
   min="${v#*.}"
   min="${min%%.*}"
-  case "$maj" in ""|*[!0-9]*) return 1 ;; esac
-  case "$min" in ""|*[!0-9]*) return 1 ;; esac
+  case "$maj" in ""|*[!0123456789]*) return 1 ;; esac
+  case "$min" in ""|*[!0123456789]*) return 1 ;; esac
   [ "$maj" -gt 2 ] || { [ "$maj" -eq 2 ] && [ "$min" -ge 32 ]; }
 }
 
-# config_allowed <git> <config file>: 0 only if the file is a regular file (no symlink) whose every key is one the scratch repo
-# setup writes (spike_scratch_repo and spike_worktree_add: init and worktree add). An ALLOWLIST: any other key at all (a filter driver,
-# include.path, core.worktree, an unknown harmless key) refuses. The file is read by `config --file ... --list`, which follows no
+# config_allowed <git> <config file>: 0 only if the file passes safe_input BEFORE git reads it (a regular file, no symlink, one link,
+# outside every CLI home; rule 4) and every key is one the scratch repo setup writes (spike_scratch_repo and spike_worktree_add: init
+# and worktree add, plus extensions.objectformat and extensions.refstorage, which a user's global init.* settings can make `git init`
+# write and which start no program). An ALLOWLIST: any other key at all (a filter driver, include.path, core.worktree,
+# extensions.worktreeconfig, an unknown harmless key) refuses. The file is read by `config --file ... --list`, which follows no
 # include and executes nothing. An unreadable or unparsable file refuses.
 config_allowed() {
   local keys n
-  [ -f "$2" ] && [ ! -L "$2" ] || return 1
+  safe_input "$2" || return 1
   keys="$(env -i PATH=/usr/bin:/bin HOME=/nonexistent LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CEILING_DIRECTORIES=/ \
     "$1" -C / config --file "$2" --name-only --list 2>/dev/null)" || return 1
   [ -n "$keys" ] || return 0
-  n="$(printf '%s\n' "$keys" | grep -vxE 'core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode)' | wc -l | tr -d ' ')"
+  n="$(printf '%s\n' "$keys" | grep -vxE 'core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode)|extensions\.(objectformat|refstorage)' | wc -l | tr -d ' ')"
   [ "$n" = "0" ]
 }
 
@@ -176,12 +178,25 @@ config_absent_or_allowed() {
   config_allowed "$1" "$2"
 }
 
+# wt_path_ok <worktree>: 0 only if the path is its own physical path (no component is a symlink) and lies outside every CLI home
+# (rule 4). Nothing is read from or run in a worktree path that fails this.
+wt_path_ok() {
+  local phys
+  [ -n "${1:-}" ] || return 1
+  phys="$(spike_resolve_path "$1")" || return 1
+  [ "$phys" = "$1" ] || return 1
+  if spike_under_cli_home "$1"; then return 1; fi
+  return 0
+}
+
 # scratch_repo_ok <git> <worktree>: no git command runs on the scratch repo, only `config --file` on its config files. 0 = the layout is the
-# one the run scripts create (<run>/repo/.git and <run>/repo/.git/worktrees/<name>, no symlink) and every config file git would read
-# (the repo config, and config.worktree if present) passes the allowlist; 2 = the path is not a scratch worktree path; 3 = a config
-# file or the layout changed. Sets SG_COMMON and SG_GD (the pinned git dirs) for the caller; the worktree's own .git file is never read.
+# one the run scripts create (<run>/repo/.git and <run>/repo/.git/worktrees/<name>) and is pinned: <run>/repo is not a symlink, the
+# physical path of the common git dir is exactly <run>/repo/.git (so no component above it redirects elsewhere), the worktree's
+# commondir file is a safe regular file holding exactly ../.., and every config file git would read (the repo config, and
+# config.worktree if present) passes the allowlist; 2 = the path is not a scratch worktree path; 3 = a config file or the layout
+# changed. Sets SG_COMMON and SG_GD (the pinned git dirs) for the caller; the worktree's own .git file is never read.
 scratch_repo_ok() {
-  local g="$1" wt="$2" rest
+  local g="$1" wt="$2" rest repo phys got
   SG_COMMON=""
   SG_GD=""
   rest="${wt%/*}"
@@ -189,13 +204,22 @@ scratch_repo_ok() {
     */repo-wt) ;;
     *) return 2 ;;
   esac
-  SG_COMMON="${rest%/repo-wt}/repo/.git"
+  repo="${rest%/repo-wt}/repo"
+  SG_COMMON="$repo/.git"
   SG_GD="$SG_COMMON/worktrees/${wt##*/}"
+  if [ ! -d "$repo" ] || [ -L "$repo" ]; then return 3; fi
+  phys="$(spike_resolve_path "$SG_COMMON")" || return 3
+  [ "$phys" = "$SG_COMMON" ] || return 3
   if [ ! -d "$SG_COMMON" ] || [ -L "$SG_COMMON" ] || [ -L "$SG_COMMON/worktrees" ] || [ ! -d "$SG_GD" ] || [ -L "$SG_GD" ] ||
     [ ! -e "$SG_COMMON/config" ] || ! config_absent_or_allowed "$g" "$SG_COMMON/config" ||
     ! config_absent_or_allowed "$g" "$SG_COMMON/config.worktree" || ! config_absent_or_allowed "$g" "$SG_GD/config.worktree"; then
     return 3
   fi
+  # git writes ../.. (and a newline) into the worktree entry's commondir file; anything else points the entry at another repo.
+  safe_input "$SG_GD/commondir" || return 3
+  got="$(cat -- "$SG_GD/commondir" 2>/dev/null; printf x)"
+  got="${got%x}"
+  [ "$got" = "../.." ] || [ "$got" = "../.."$'\n' ] || return 3
   return 0
 }
 
@@ -232,11 +256,11 @@ changed_files() {
 # build_row <cli> <run.sh exit status> <hello yes|no> <changed files, one per line> <normalized.jsonl> [flags]: print one JSON row.
 # PASS = run.sh exit 0, exactly one session_started, exactly one result with is_error false and numeric tokens, 0 rate_limited,
 # hello.txt exact. `unknown` > 0 never fails a run (needs_mapping is set). Reasons are fixed strings, never stream text.
-# flags (space separated words, all optional): cfg = the scratch repo config changed, norm = the normalizer failed, row = the row
-# could not be built. Each one forces FAIL with its own fixed reason.
+# flags (space separated words, all optional): cfg = the scratch repo config changed, wt = the worktree path was refused, norm = the
+# normalizer failed, row = the row could not be built. Each one forces FAIL with its own fixed reason.
 build_row() {
   local cli="$1" rc="$2" hello="$3" changed="$4" norm="$5" flags="${6:-}"
-  case "$rc" in ""|*[!0-9]*) rc=255 ;; esac
+  case "$rc" in ""|*[!0123456789]*) rc=255 ;; esac
   [ -r "$norm" ] || norm=/dev/null
   "$JQ" -c -s --arg cli "$cli" --argjson rc "$rc" --arg hello "$hello" --arg changed "$changed" --arg flags "$flags" '
     def cnt($t): [.[] | select(.type == $t)] | length;
@@ -256,6 +280,7 @@ build_row() {
     | ($hello == "yes") as $c_hello
     | ($flags | split(" ")) as $fl
     | (($fl | index("cfg")) == null) as $c_cfg
+    | (($fl | index("wt")) == null) as $c_wt
     | (($fl | index("norm")) == null) as $c_norm
     | (($fl | index("row")) == null) as $c_row
     | { provider: $cli,
@@ -271,13 +296,14 @@ build_row() {
         needs_mapping: (cnt("unknown") > 0),
         changed: ($changed | split("\n") | map(select(length > 0))),
         hello_ok: $c_hello,
-        verdict: (if $c_exit and $c_sess and $c_res and $c_rl and $c_hello and $c_cfg and $c_norm and $c_row then "PASS" else "FAIL" end),
+        verdict: (if $c_exit and $c_sess and $c_res and $c_rl and $c_hello and $c_cfg and $c_wt and $c_norm and $c_row then "PASS" else "FAIL" end),
         reasons: (if $c_row == false then ["row could not be built"] else [ (if $c_exit then empty else "run.sh did not exit 0" end),
                     (if $c_sess then empty else "not exactly one session_started" end),
                     (if $c_res then empty else "not exactly one successful result with numeric tokens" end),
                     (if $c_rl then empty else "rate_limited seen" end),
                     (if $c_hello then empty else "hello.txt missing or not exact" end),
                     (if $c_cfg then empty else "scratch repo config changed" end),
+                    (if $c_wt then empty else "worktree path refused" end),
                     (if $c_norm then empty else "normalizer failed" end) ] end) }' < "$norm" 2>/dev/null
 }
 
@@ -325,12 +351,13 @@ cap_of() { # cap_of <cli>: print the one capture dir under $ROOT/<cli>/, else re
 # run_dir_of <cli> <worktree file>: print the scratch run dir of THIS run's <cli> worktree, or return 1. The worktree path comes from a
 # capture file the CLI could have written, so it is trusted only if all of this holds (a forged path is never read or deleted):
 #   - read_wt accepts the file (safe file, absolute, no control characters, physically inside the spike scratch root);
-#   - the path is exactly <scratch root>/run-<UTC stamp>-<6 characters>/repo-wt/<cli>-1, the shape the run scripts create;
+#   - the path is exactly <scratch root>/run-<UTC stamp>-<6 characters>/repo-wt/<cli>-1, the shape the run scripts create, and the
+#     run dir name is one path segment (a ? in the pattern would also match a slash);
 #   - the run dir is a real directory (no symlink) that is not older than this run's preflight.txt, so a leftover from an
 #     earlier run, or any other directory, is refused;
 #   - for claude, whose capture also holds rundir.path, that file must name the same run dir (codex writes no such file).
 run_dir_of() {
-  local cap wt run sroot rd
+  local cap wt run sroot rd name
   cap="$(cap_of "$1")" || return 1
   wt="$(read_wt "$cap/$2")" || return 1
   sroot="$(spike_root)" || return 1
@@ -339,6 +366,11 @@ run_dir_of() {
     *) return 1 ;;
   esac
   run="${wt%/repo-wt/*}"
+  # a ? in a case pattern also matches a slash, so the run dir name is checked on its own: exactly one path segment
+  name=${run#"$sroot"/}
+  case "$name" in
+    "" | */*) return 1 ;;
+  esac
   [ -d "$run" ] && [ ! -L "$run" ] || return 1
   [ ! "$ROOT/preflight.txt" -nt "$run" ] || return 1
   if [ "$1" = "claude" ]; then
@@ -353,18 +385,21 @@ run_dir_of() {
 leftover_note() {
   local cap line
   line="unknown"
-  if cap="$(cap_of "$1")" && safe_input "$cap/$2"; then
+  # No capture dir for this CLI: there is no recorded location and nothing to point at, so no "NOT removed" message at all.
+  cap="$(cap_of "$1")" || return 0
+  if safe_input "$cap/$2"; then
     line="$(head -n 1 "$cap/$2" 2>/dev/null | cut -c1-300 | printable)"
   fi
   spike_err "$1: scratch run dir NOT removed (not verified as this run's, its repo config changed, or removal failed). Recorded location: $line. All scratch dirs live under $(spike_root 2>/dev/null | printable). Remove by hand: . spike/lib/common.sh; spike_cleanup <run dir>"
 }
 
 # cleanup_one <cli> <worktree file>: remove the verified scratch run dir. The library's cleanup runs git on the scratch repo, so it
-# runs only if the repo config still passes the allowlist (and git is new enough to check it); otherwise the dir is left and reported.
+# runs only if the worktree path is clean and the repo layout and config still pass scratch_repo_ok (pinned repo path, commondir,
+# allowlist; git new enough to check it); otherwise the dir is left and reported.
 cleanup_one() {
   local d g
-  if d="$(run_dir_of "$1" "$2")" && g="$(spike_tool_path git)" && git_new_enough "$g" && scratch_repo_ok "$g" "$d/repo-wt/$1-1" &&
-    spike_cleanup "$d"; then
+  if d="$(run_dir_of "$1" "$2")" && wt_path_ok "$d/repo-wt/$1-1" && g="$(spike_tool_path git)" && git_new_enough "$g" &&
+    scratch_repo_ok "$g" "$d/repo-wt/$1-1" && spike_cleanup "$d"; then
     return 0
   fi
   leftover_note "$1" "$2"
@@ -411,12 +446,17 @@ process_cli() {
     fi
     if rd="$(run_dir_of "$cli" "$wtfile")"; then
       wt="$rd/repo-wt/$cli-1"
-      if hello_ok "$wt" "$want"; then hello="yes"; fi
-      changed="$(changed_files "$wt")"
-      crc=$?
-      if [ "$crc" -eq 3 ]; then
-        flags="$flags cfg"
-        spike_err "$cli: scratch repo config changed; no git command was run on that repo"
+      if wt_path_ok "$wt"; then
+        if hello_ok "$wt" "$want"; then hello="yes"; fi
+        changed="$(changed_files "$wt")"
+        crc=$?
+        if [ "$crc" -eq 3 ]; then
+          flags="$flags cfg"
+          spike_err "$cli: scratch repo config changed; no git command was run on that repo"
+        fi
+      else
+        flags="$flags wt"
+        spike_err "$cli: worktree path refused; nothing was read or run there"
       fi
     else
       spike_err "$cli: the worktree path file is missing or was refused"
@@ -450,15 +490,17 @@ if [ "$PRE_RC" -ne 0 ]; then
 fi
 
 # ---- the two runs: fixed order, one call each, GAP_SECS apart ------------------------------------------------------------
-# Each run script's output (stdout and stderr) goes through printable; its own exit status is taken from PIPESTATUS.
+# Each run script's output (stdout and stderr) goes through printable; its own exit status is taken from PIPESTATUS. The filter
+# ignores SIGINT: a terminal Ctrl-C reaches the whole foreground group, and a filter that died would close the pipe under the run
+# script, which would then die of SIGPIPE before its EXIT trap (its own cleanup) ran. The signal is still recorded by the trap above.
 STARTED_CLAUDE=1
-SPIKE_CAPTURES_ROOT="$ROOT" "$HERE/claude/run.sh" < /dev/null 2>&1 | printable
+SPIKE_CAPTURES_ROOT="$ROOT" "$HERE/claude/run.sh" < /dev/null 2>&1 | ( trap '' INT; printable )
 RC_CLAUDE="${PIPESTATUS[0]}"
 stop_if_signalled
 /bin/sleep "$GAP_SECS"
 stop_if_signalled
 STARTED_CODEX=1
-SPIKE_CAPTURES_ROOT="$ROOT" "$HERE/codex/run.sh" < /dev/null 2>&1 | printable
+SPIKE_CAPTURES_ROOT="$ROOT" "$HERE/codex/run.sh" < /dev/null 2>&1 | ( trap '' INT; printable )
 RC_CODEX="${PIPESTATUS[0]}"
 stop_if_signalled
 
