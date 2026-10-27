@@ -1,0 +1,1 @@
+{"type":"error","provider":"codex","seq":1,"ts":null,"raw":"error","kind":"stream_error","fatal":true,"message":"synthetic: connection closed before the stream started"}

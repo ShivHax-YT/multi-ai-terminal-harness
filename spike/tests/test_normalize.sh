@@ -183,12 +183,23 @@ printf '%s\n' '{"type":"message","provider":"claude","seq":1,"ts":null,"raw":"x"
   '{"type":"message","provider":"claude","seq":1,"ts":null,"raw":"x","role":"assistant","text":5,"truncated":false}' \
   '{"type":"message","provider":"claude","seq":0,"ts":null,"raw":"x","role":"assistant","text":"hi","truncated":false}' \
   '{"type":"message","provider":"claude","seq":1,"ts":null,"raw":"x","role":"assistant","text":"hi","truncated":false,"extra":1}' \
-  '{"type":"result","provider":"codex","seq":1,"ts":null,"raw":"x","is_error":false,"turns":1,"tokens":{"input":1,"output":1,"cache_read":1,"cache_write":1},"tokens_known":true,"cost_usd":null,"cost_is_estimate":true}' \
-  '{"type":"result","provider":"codex","seq":1,"ts":null,"raw":"x","is_error":false,"turns":1,"tokens":{"input":1,"output":1,"cache_read":1,"cache_write":1,"reasoning":0},"tokens_known":true,"cost_usd":null,"cost_is_estimate":false}' \
+  '{"type":"result","provider":"codex","seq":1,"ts":null,"raw":"x","is_error":false,"turns":1,"turns_known":true,"tokens":{"input":1,"output":1,"cache_read":1,"cache_write":1},"tokens_known":true,"cost_usd":null,"cost_is_estimate":true}' \
+  '{"type":"result","provider":"codex","seq":1,"ts":null,"raw":"x","is_error":false,"turns":1,"turns_known":true,"tokens":{"input":1,"output":1,"cache_read":1,"cache_write":1,"reasoning":0},"tokens_known":true,"cost_usd":null,"cost_is_estimate":false}' \
   '{"type":"bogus","provider":"codex","seq":1,"ts":null,"raw":"x"}' \
+  '{"type":"result","provider":"codex","seq":1,"ts":null,"raw":"x","is_error":false,"turns":1,"turns_known":true,"tokens":{"input":1,"output":1,"cache_read":1,"cache_write":1,"reasoning":0},"tokens_known":true,"cost_usd":null,"cost_is_estimate":true}' \
+  '{"type":"result","provider":"codex","seq":1,"ts":null,"raw":"x","is_error":false,"turns":1,"tokens":{"input":1,"output":1,"cache_read":1,"cache_write":1,"reasoning":0},"tokens_known":true,"cost_usd":null,"cost_is_estimate":true}' \
+  '{"type":"result","provider":"codex","seq":1,"ts":null,"raw":"x","is_error":false,"turns":1,"turns_known":"yes","tokens":{"input":1,"output":1,"cache_read":1,"cache_write":1,"reasoning":0},"tokens_known":true,"cost_usd":null,"cost_is_estimate":true}' \
+  '{"type":"tool_call","provider":"claude","seq":1,"ts":null,"raw":"x","id":"","name":"X"}' \
+  '{"type":"tool_call","provider":"claude","seq":1,"ts":null,"raw":"x","id":"t1","name":""}' \
+  '{"type":"tool_result","provider":"claude","seq":1,"ts":null,"raw":"x","id":"","is_error":false}' \
+  '{"type":"error","provider":"claude","seq":1,"ts":null,"raw":"x","kind":"","fatal":false,"message":""}' \
+  '{"type":"error","provider":"claude","seq":1,"ts":null,"raw":"x","kind":"unknown_error","fatal":false,"message":""}' \
   > "$TMP/badevents.jsonl"
 bad=$(jq -s --slurpfile sch "$SCHEMA" -f "$TMP/validate.jq" "$TMP/badevents.jsonl" | jq 'length')
-eq "validator self-test: 1 good event, 6 bad events caught" "$bad" "6"
+# bad (12): text 5, seq 0, extra field, result without reasoning, cost_is_estimate false, unknown type, result without turns_known,
+# turns_known not a boolean, tool_call with an empty id, tool_call with an empty name, tool_result with an empty id, error with an
+# empty kind. Good (3): the first message, one complete result, an error with an empty message but a kind.
+eq "validator self-test: 3 good events, 12 bad events caught (a missing turns_known, empty ids and an empty kind included)" "$bad" "12"
 validate() { # events-file : prints the number of schema problems
   jq -s --slurpfile sch "$SCHEMA" -f "$TMP/validate.jq" "$1" | jq 'length'
 }
@@ -299,7 +310,8 @@ for e in "${entries[@]}"; do
   check "$name: provider is $cli" jq -s -e --arg p "$cli" 'all(.[]; .provider == $p)' "$out"
 
   # session_started first and once (the deliberately broken-line fixture is exempt)
-  if [ "$name" != "codex-malformed" ]; then
+  # (codex-prestart-error is a run that died before thread.started, so it has no session_started by design)
+  if [ "$name" != "codex-malformed" ] && [ "$name" != "codex-prestart-error" ]; then
     eq "$name: session_started appears once" "$(count "$out" '.type == "session_started"')" "1"
     check "$name: session_started is the first event" jq -s -e '.[0].type == "session_started"' "$out"
   fi
@@ -308,7 +320,11 @@ for e in "${entries[@]}"; do
     jq -s -e '. as $all | all(range(0; length); . as $i | $all[$i] | if .type == "tool_result" then (.id as $id | [$all[0:$i][] | select(.type == "tool_call" and .id == $id)] | length > 0) else true end)' "$out"
   # every result has numeric turns and five numeric token fields
   check "$name: every result has numeric tokens" \
-    jq -s -e 'all(.[] | select(.type == "result"); (.turns | type == "number") and (.tokens | [.input, .output, .cache_read, .cache_write, .reasoning] | all(type == "number")) and (.tokens_known | type == "boolean") and .cost_is_estimate == true)' "$out"
+    jq -s -e 'all(.[] | select(.type == "result"); (.turns | type == "number") and (.turns_known | type == "boolean") and (.tokens | [.input, .output, .cache_read, .cache_write, .reasoning] | all(type == "number")) and (.tokens_known | type == "boolean") and .cost_is_estimate == true)' "$out"
+  # rule 1: every result of every committed fixture (and of any observed capture) carries a real turn count, so none of them
+  # would make the scheduler keep a full reservation by accident
+  check "$name: every result has turns_known true and, for Codex, turns 1" \
+    jq -s -e --arg p "$cli" 'all(.[] | select(.type == "result"); .turns_known == true and (.turns >= 1) and ($p != "codex" or .turns == 1))' "$out"
   # tokens_known is false only for turn.failed (Codex), whatever fixture; the broken-line fixture has odd usage shapes
   if [ "$name" != "codex-malformed" ]; then
     check "$name: tokens_known is false only for turn.failed" \
@@ -610,8 +626,33 @@ check "spec: Claude --max-turns is min(5, 40 minus turns already used or reserve
 check "spec: a Claude invocation is never started with --max-turns 0" grep -qF 'never started with `--max-turns` 0' "$SPEC_FLAT"
 check "spec: the scheduler refuses the dispatch when the reservation does not fit under 40" \
   grep -qF 'refuses the dispatch (no child process is started) when the reservation does not fit under 40' "$SPEC_FLAT"
-check "spec: a result replaces the reservation with max(1, result.turns)" \
-  grep -qF 'the reservation is replaced by max(1, `result.turns`)' "$SPEC_FLAT"
+check "spec: a result settles to max(1, the highest turns among results with turns_known true), not the last result" \
+  grep -qF 'the reservation is replaced by max(1, the highest `turns` among the invocation'"'"'s `result` events that have `turns_known` true)' "$SPEC_FLAT"
+check "spec: the highest counts, not the last, and a later result never lowers an earlier count" \
+  grep -qF 'The highest counts, not the last, so a later `result` can never lower what an earlier one already counted' "$SPEC_FLAT"
+check "spec: is_error still follows the last result; the two rules are independent" \
+  grep -qF 'The `is_error` flag still follows the last `result` (row 15); the two rules are independent' "$SPEC_FLAT"
+check "spec: a result with turns_known false is treated exactly as if no result had arrived (full reservation kept)" \
+  grep -qF 'a `result` with `turns_known` false is treated exactly as if no result had arrived' "$SPEC_FLAT"
+check "spec: turns_known false when num_turns is missing, a string or negative" \
+  grep -qF '(missing, a string or a negative number gives `turns_known` false and `turns` 0)' "$SPEC_FLAT"
+check "spec: Codex turns_known is always true" grep -qF 'for Codex always' "$SPEC_FLAT"
+check "spec: refuse when 40 minus used-or-reserved is 0 or less, for Claude and Codex alike" \
+  grep -qF 'for Claude and for Codex alike when 40 minus turns already used or reserved is 0 or less' "$SPEC_FLAT"
+check "spec: the old refusal 'is 0, Codex when it is less than 1' is gone" test "$(grep -c 'Claude when 40 minus turns already used or reserved is 0,' "$SPEC_FLAT")" = "0"
+check "spec: --max-turns is always at least 1" grep -qF 'the value is always at least 1' "$SPEC_FLAT"
+check "spec worked example: 38 used, Claude given 2, reports 3 -> 41 counted, next dispatch refused" \
+  grep -qF 'At 38 used, Claude is given 2 and reports `num_turns` 3: 41 is counted as reported, 40 minus 41 is -1, which is 0 or less, and the next dispatch is refused' "$SPEC_FLAT"
+check "spec worked example: a result without num_turns counts the full reservation 5" \
+  grep -qF 'whose `result` has no `num_turns` (`turns_known` false) counts 5' "$SPEC_FLAT"
+check "spec: check and reserve are one serialized step per task (atomic)" \
+  grep -qF 'are one serialized step (one lock per task, nothing can run between the check and the record)' "$SPEC_FLAT"
+check "spec: two concurrent dispatches can never both reserve against the same count" \
+  grep -qF 'Two concurrent dispatches can never both reserve against the same count' "$SPEC_FLAT"
+check "spec: the 40-turn count belongs to the task and a failover never resets it (decision C, pending the human)" \
+  grep -qF 'carry across a failover to another provider: a failover never resets the count' "$SPEC_FLAT"
+check "spec: the result event has turns_known in the event rules and the Claude and Codex mappings" \
+  test "$(grep -c 'turns_known' "$SPEC")" -ge 6
 check "spec: with no result the full reservation stays counted" grep -qF 'the full reservation stays counted' "$SPEC_FLAT"
 check "spec: no failure path can make a run cheaper than its reservation" grep -qF 'No failure path can make a run cheaper than its reservation' "$SPEC_FLAT"
 check "spec: no-result cases named: crash, watchdog, cancel(), Codex bare top-level error" \
@@ -642,6 +683,16 @@ check "spec: row 15, result stays running, sets result_seen and is_error, the la
   grep -qE '^\| 15 \| `running` \| `result\{is_error\}` \| `running` \| sets `result_seen` and `is_error`.*the last one counts' "$SPEC"
 check "spec: row 6 no longer claims a watchdog kill (the watchdog is row 10, killed)" \
   grep -qE '^\| 6 \|.*neither `cancel\(\)` nor the watchdog, which are row 10' "$SPEC"
+check "spec: row 10 still reaps the child and drains stdout and stderr to EOF (no zombie, no blocked pipe)" \
+  grep -qE '^\| 10 \|.*still reaps the child and drains its stdout and stderr to EOF \(no zombie process, no blocked pipe\)' "$SPEC"
+check "spec: row 10 drops the invocation flags" grep -qE '^\| 10 \|.*the invocation flags are dropped' "$SPEC"
+check "spec: cancel() with no state is illegal; legal in every state that exists" \
+  grep -qF '`cancel()` is legal in every state that exists (rows 10 and 16). Before row 1 there is no state and nothing to cancel, so `cancel()` with no state is illegal.' "$SPEC_FLAT"
+check "spec: an invocation ends at the exited event or at cancel() and the function then returns empty flags" \
+  grep -qF 'the function then returns empty flags' "$SPEC_FLAT"
+check "spec: error and warning keep an empty message by design; kind is never empty (unknown_error)" \
+  grep -qF 'By design, `error` and `warning` events keep an empty `message`' "$SPEC_FLAT"
+check "spec: an empty Claude assistant error string gives kind unknown_error" grep -qF 'an empty error string gives kind `unknown_error`' "$SPEC_FLAT"
 check "spec: row 16, cancel in exited or killed is an idempotent no-op" grep -qE '^\| 16 \| `exited`, `killed` \| `cancel\(\)` or watchdog \| unchanged \|' "$SPEC"
 check "spec: the exited event is named as the child-ends trigger" grep -qF 'that trigger is the **`exited` event**' "$SPEC_FLAT"
 check "spec: the exited event applies the end-of-invocation precedence" grep -qF 'The `exited` event applies it.' "$SPEC_FLAT"
@@ -837,7 +888,7 @@ def transition($state; $e; $f):
     elif $t == "send" then (if $state == "idle" then ok("spawning"; flags0) else bad end)                       # ROW9
     elif $t == "resume" then (if $state == "rate_limited" then ok("idle"; $f) else bad end)                     # ROW8
     elif $t == "cancel" then
-      (if ($state | inl(["spawning", "running", "idle", "rate_limited"])) then ok("killed"; $f)                 # ROW10
+      (if ($state | inl(["spawning", "running", "idle", "rate_limited"])) then ok("killed"; flags0)                 # ROW10
        elif ($state | inl(["exited", "killed"])) then ok($state; $f)                                            # ROW16
        else bad end)
     elif $state == "spawning" then
@@ -846,18 +897,18 @@ def transition($state; $e; $f):
       elif ($t | inl(["warning", "limit_notice", "unknown"])) then ok("spawning"; $f)                           # ROW12
       elif $t == "error" and $e.fatal == false then ok("spawning"; $f)                                          # ROW12
       elif $t == "error" and $e.fatal == true then ok("spawning"; $f)                                           # ROW13
-      elif $t == "exited" then (if $f.limit_seen then ok("rate_limited"; $f) else ok("exited"; $f) end)         # ROW7 ROW3
+      elif $t == "exited" then (if $f.limit_seen then ok("rate_limited"; flags0) else ok("exited"; flags0) end)         # ROW7 ROW3
       else bad end
     elif $state == "running" then
       if $t == "rate_limited" then ok("running"; with_limit)                                                    # ROW7
       elif $t == "result" then ok("running"; $f | .result_seen = true | .is_error = $e.is_error)                # ROW15
       elif ($t | inl(["message", "tool_call", "tool_result", "warning", "limit_notice", "error", "unknown"])) then ok("running"; $f)   # ROW14
       elif $t == "exited" then
-        (if $f.limit_seen then ok("rate_limited"; $f)                                                           # ROW7
-         elif $f.result_seen and $f.is_error == false and (clean_exit($e) | not) then ok("exited"; $f)          # ROW11
-         elif $f.result_seen and $f.is_error == false then ok("idle"; $f)                                       # ROW4
-         elif $f.result_seen then ok("exited"; $f)                                                              # ROW5
-         else ok("exited"; $f) end)                                                                             # ROW6
+        (if $f.limit_seen then ok("rate_limited"; flags0)                                                           # ROW7
+         elif $f.result_seen and $f.is_error == false and (clean_exit($e) | not) then ok("exited"; flags0)          # ROW11
+         elif $f.result_seen and $f.is_error == false then ok("idle"; flags0)                                       # ROW4
+         elif $f.result_seen then ok("exited"; flags0)                                                              # ROW5
+         else ok("exited"; flags0) end)                                                                             # ROW6
       else bad end
     else bad end;
 EOF
@@ -991,7 +1042,7 @@ eq "rows 1, 8 and 9 in a row: start, then resume from rate_limited and send from
 # wins over every other row. For codex-hostile and codex-malformed the last result is an error (row 5), also whatever the code.
 replay_code() {
   case "$1" in
-    claude-limits | codex-failure | codex-hostile | codex-malformed) echo 1 ;;
+    claude-limits | codex-failure | codex-hostile | codex-malformed | codex-prestart-error) echo 1 ;;
     *) echo 0 ;;
   esac
 }
@@ -1002,12 +1053,14 @@ replay_code() {
 #  codex-hostile: its only result is an error (the failed turn) and no rate_limited -> row 5, exited.
 #  codex-malformed: results false, false, true, true: the LAST one counts (is_error true) and no rate_limited -> row 5, exited.
 #    Its first two lines are unknown events in spawning (row 12) before the real thread.started on line 3.
+#  codex-prestart-error: a fatal top-level error before thread.started (the plain message does not match the limit hint, so no
+#    rate_limited), then the child exits 1. The error is row 13 (stays in spawning), the exited event is row 3 -> exited.
 #  an observed*.jsonl capture: one successful result, exit 0 -> idle.
 expected_end() {
   case "$1" in
     claude-sample | claude-routine | claude-hostile | codex-sample | codex-item-warning) echo idle ;;
     claude-limits | codex-failure) echo rate_limited ;;
-    codex-hostile | codex-malformed) echo exited ;;
+    codex-hostile | codex-malformed | codex-prestart-error) echo exited ;;
     claude-observed* | codex-observed*) echo idle ;;
     *) echo "NO-EXPECTATION-FOR-$1" ;;
   esac
@@ -1026,7 +1079,71 @@ for e in "${entries[@]}"; do
   check "$name: the replay saw all $nev events, the last one the appended exited event" \
     jq -s -e --argjson n "$nev" 'length == $n and .[-1].type == "exited" and .[-1].code == '"$code" "$TMP/replay-events.jsonl"
 done
-check "the replay covered at least the 9 committed fixtures" test "$replayed" -ge 9
+check "the replay covered at least the 10 committed fixtures" test "$replayed" -ge 10
+# row 13 is exercised by a committed fixture, not only by unit tests: removing it must fail a replay
+eq "codex-prestart-error: its first event is a fatal error in spawning, no session_started, no rate_limited (row 13, then row 3)" \
+  "$(jq -s -c '[.[] | .type + ":" + ((.fatal // "") | tostring)]' "$TMP/out/codex-prestart-error.jsonl")" '["error:true"]'
+
+# ---- round 5, blocker 1: an unknown turn count must not release the reservation (turns_known) ------------------------------
+# num_turns missing, a string, negative, null, a boolean, an array or an object: turns_known false and turns 0
+tk_n=0
+for nt in '' ',"num_turns":"5"' ',"num_turns":-1' ',"num_turns":null' ',"num_turns":true' ',"num_turns":[3]' ',"num_turns":{"n":3}' ',"num_turns":"3.0"'; do
+  tk_n=$((tk_n + 1))
+  printf '{"type":"result","subtype":"success","is_error":false%s,"usage":{"input_tokens":1,"output_tokens":1}}\n' "$nt" > "$TMP/tk.jsonl"
+  normalize claude "$TMP/tk.jsonl" > "$TMP/o.jsonl"
+  eq "turns_known case $tk_n (num_turns ${nt:-missing}): turns_known false and turns 0" \
+    "$(jq -s -c '[.[0].turns_known, .[0].turns]' "$TMP/o.jsonl")" "[false,0]"
+  eq "turns_known case $tk_n (num_turns ${nt:-missing}): the result validates" "$(validate "$TMP/o.jsonl")" "0"
+done
+eq "turns_known: 8 unknown-count cases" "$tk_n" "8"
+for nt in 0 1 3 5 41 2.5; do
+  printf '{"type":"result","subtype":"success","is_error":false,"num_turns":%s}\n' "$nt" > "$TMP/tk.jsonl"
+  normalize claude "$TMP/tk.jsonl" > "$TMP/o.jsonl"
+  eq "turns_known: a numeric num_turns $nt gives turns_known true" "$(jq -s -r '.[0].turns_known' "$TMP/o.jsonl")" "true"
+  eq "turns_known: num_turns $nt gives turns $(jq -n --argjson n "$nt" '$n | ceil') (rounded up, never down)" "$(jq -s -r '.[0].turns' "$TMP/o.jsonl")" "$(jq -n --argjson n "$nt" '$n | ceil')"
+done
+# an error result with an unknown count (a failed run) is still turns_known false
+printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true}' > "$TMP/tk.jsonl"
+normalize claude "$TMP/tk.jsonl" > "$TMP/o.jsonl"
+eq "turns_known: an error result without num_turns is turns_known false" "$(jq -s -c '[.[0].is_error, .[0].turns_known]' "$TMP/o.jsonl")" "[true,false]"
+# Codex: turns_known is always true, for turn.completed and turn.failed, even with odd usage
+printf '%s\n' '{"type":"turn.completed"}' '{"type":"turn.completed","usage":[1]}' '{"type":"turn.failed"}' '{"type":"turn.failed","error":5}' > "$TMP/tk.jsonl"
+normalize codex "$TMP/tk.jsonl" > "$TMP/o.jsonl"
+eq "turns_known: every Codex result has turns_known true and turns 1" "$(jq -s -c '[.[] | select(.type == "result") | [.turns_known, .turns]] | unique' "$TMP/o.jsonl")" "[[true,1]]"
+check "schema: turns_known is a required boolean on result" \
+  jq -e '."$defs".result.allOf[1] | (.required | index("turns_known") != null) and (.properties.turns_known.type == "boolean")' "$SCHEMA"
+check "schema: tool_call id and name and tool_result id have minLength 1; error and warning kind too" \
+  jq -e '."$defs" as $d | ($d.tool_call.allOf[1].properties.id.minLength == 1) and ($d.tool_call.allOf[1].properties.name.minLength == 1) and ($d.tool_result.allOf[1].properties.id.minLength == 1) and ($d.error.allOf[1].properties.kind.minLength == 1) and ($d.warning.allOf[1].properties.kind.minLength == 1)' "$SCHEMA"
+eq "validator: an event with turns_known missing fails the schema" \
+  "$(printf '%s\n' '{"type":"result","provider":"claude","seq":1,"ts":null,"raw":"x","is_error":false,"turns":2,"tokens":{"input":1,"output":1,"cache_read":0,"cache_write":0,"reasoning":0},"tokens_known":true,"cost_usd":null,"cost_is_estimate":true}' > "$TMP/notk.jsonl"; validate "$TMP/notk.jsonl")" "1"
+eq "validator: a tool_call with an empty id fails the schema" \
+  "$(printf '%s\n' '{"type":"tool_call","provider":"claude","seq":1,"ts":null,"raw":"x","id":"","name":"X"}' > "$TMP/emptyid.jsonl"; validate "$TMP/emptyid.jsonl")" "1"
+
+# ---- round 5, reviewer item 4: an empty error string keeps a non-empty kind -------------------------------------------------
+printf '%s\n' '{"type":"assistant","error":"","message":{"content":[]}}' '{"type":"assistant","error":"\u0001"}' '{"type":"assistant","error":"billing_error"}' > "$TMP/emptyerr.jsonl"
+normalize claude "$TMP/emptyerr.jsonl" > "$TMP/o.jsonl"
+eq "an empty assistant error string: error kind unknown_error, fatal false, empty message; a control-only string stays a cleaned kind" \
+  "$(jq -s -c '[.[] | select(.type == "error") | [.kind, .fatal, .message]]' "$TMP/o.jsonl")" '[["unknown_error",false,""],[" ",false," "],["billing_error",false,"billing_error"]]'
+eq "those error events validate (kind minLength 1, empty message allowed)" "$(validate "$TMP/o.jsonl")" "0"
+printf '%s\n' '{"type":"error"}' '{"type":"error","message":""}' '{"type":"turn.failed"}' > "$TMP/emptymsg.jsonl"
+normalize codex "$TMP/emptymsg.jsonl" > "$TMP/o.jsonl"
+eq "a Codex fatal error without message text stays an error with an empty message (never unknown)" \
+  "$(jq -s -c '[.[] | select(.type == "error") | [.kind, .fatal, .message]]' "$TMP/o.jsonl")" '[["stream_error",true,""],["stream_error",true,""],["turn_failed",true,""]]'
+eq "and validates" "$(validate "$TMP/o.jsonl")" "0"
+
+# ---- round 5, reviewer item 2: the reference matches the spec on cancel() and on dropping the flags ----------------------------
+eq "cancel() with no state is illegal (the spec says legal in every state that exists)" "$(tr_one null '{"type":"cancel"}')" "illegal"
+eq "cancel() in every existing state is legal" \
+  "$(for st in spawning running idle rate_limited exited killed; do tr_one "\"$st\"" '{"type":"cancel"}'; done | paste -sd' ' -)" "killed killed killed killed exited killed"
+full_flags='{"limit_seen":true,"reset_at":9,"result_seen":true,"is_error":false}'
+empty_flags='{"limit_seen":false,"reset_at":null,"result_seen":false,"is_error":null}'
+eq "flags are dropped at the exited event: rate_limited end (row 7)" "$(tr_flags '"running"' '{"type":"exited","code":0}' "$full_flags")" "$empty_flags"
+eq "flags are dropped at the exited event: idle end (row 4)" "$(tr_flags '"running"' '{"type":"exited","code":0}' '{"limit_seen":false,"reset_at":null,"result_seen":true,"is_error":false}')" "$empty_flags"
+eq "flags are dropped at the exited event: exited end (rows 5, 6, 11)" "$(tr_flags '"running"' '{"type":"exited","code":1}' '{"limit_seen":false,"reset_at":null,"result_seen":true,"is_error":true}')" "$empty_flags"
+eq "flags are dropped at the exited event in spawning (rows 3 and 7)" "$(tr_flags '"spawning"' '{"type":"exited","code":1}' "$full_flags")" "$empty_flags"
+eq "flags are dropped at cancel() of a live invocation (row 10)" "$(tr_flags '"running"' '{"type":"cancel"}' "$full_flags")" "$empty_flags"
+eq "a whole limited invocation leaves empty flags behind" \
+  "$(replay_flags "[$ss,{\"type\":\"rate_limited\",\"reset_at\":9},{\"type\":\"result\",\"is_error\":true},{\"type\":\"exited\",\"code\":1}]")" "$empty_flags"
 
 # ---- no live provider use ------------------------------------------------------------------------------------------------
 check "this test never sets SPIKE_LIVE" test "$(grep -cE '^[[:space:]]*(export[[:space:]]+)?SPIKE_LIVE=' "$HERE/test_normalize.sh")" = "0"

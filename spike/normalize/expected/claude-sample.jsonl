@@ -5,4 +5,4 @@
 {"type":"tool_call","provider":"claude","seq":5,"ts":null,"raw":"assistant:tool_use","id":"toolu_sample_1","name":"Write"}
 {"type":"tool_result","provider":"claude","seq":6,"ts":null,"raw":"user:tool_result","id":"toolu_sample_1","is_error":false}
 {"type":"message","provider":"claude","seq":7,"ts":null,"raw":"assistant:text","role":"assistant","text":"DONE","truncated":false}
-{"type":"result","provider":"claude","seq":8,"ts":null,"raw":"result/success","is_error":false,"subtype":"success","turns":2,"tokens":{"input":300,"output":49,"cache_read":120,"cache_write":0,"reasoning":0},"tokens_known":true,"cost_usd":0.0123,"cost_is_estimate":true,"stop_reason":"end_turn","duration_ms":4200}
+{"type":"result","provider":"claude","seq":8,"ts":null,"raw":"result/success","is_error":false,"subtype":"success","turns":2,"turns_known":true,"tokens":{"input":300,"output":49,"cache_read":120,"cache_write":0,"reasoning":0},"tokens_known":true,"cost_usd":0.0123,"cost_is_estimate":true,"stop_reason":"end_turn","duration_ms":4200}

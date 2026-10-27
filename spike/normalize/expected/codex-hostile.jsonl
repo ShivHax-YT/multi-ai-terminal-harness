@@ -6,4 +6,4 @@
 {"type":"tool_result","provider":"codex","seq":5,"ts":null,"raw":"item.completed:command_execution","id":"item_4","is_error":true}
 {"type":"unknown","provider":"codex","seq":6,"ts":null,"raw":"item.completed:future _kind ","raw_type":"item.completed:future _kind ","keys":["item","type"]}
 {"type":"error","provider":"codex","seq":7,"ts":null,"raw":"turn.failed","kind":"turn_failed","fatal":true,"message":"bo om  plain failure"}
-{"type":"result","provider":"codex","seq":7,"ts":null,"raw":"turn.failed","is_error":true,"turns":1,"tokens":{"input":0,"output":0,"cache_read":0,"cache_write":0,"reasoning":0},"tokens_known":false,"cost_usd":null,"cost_is_estimate":true}
+{"type":"result","provider":"codex","seq":7,"ts":null,"raw":"turn.failed","is_error":true,"turns":1,"turns_known":true,"tokens":{"input":0,"output":0,"cache_read":0,"cache_write":0,"reasoning":0},"tokens_known":false,"cost_usd":null,"cost_is_estimate":true}

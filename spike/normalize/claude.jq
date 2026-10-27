@@ -76,7 +76,8 @@ def block_events($seq; $who):
 def assistant_events($seq; $o):
   ( if ($o.error | type) == "string" then
       if $o.error == "rate_limit" then ev($seq; "rate_limited"; "assistant"; {raw_kind: "claude_assistant_rate_limit"})
-      else ev($seq; "error"; "assistant"; {kind: ($o.error | clip(64)), fatal: false, message: ($o.error | clip(300))})
+      # an empty error string still is an error: kind is never empty ("unknown_error"), message keeps the (possibly empty) text
+      else ev($seq; "error"; "assistant"; {kind: ($o.error | clip(64) | if . == "" then "unknown_error" else . end), fatal: false, message: ($o.error | clip(300))})
       end
     else empty end ),
   ( blocks($o.message) as $bs
@@ -113,7 +114,10 @@ def result_events($seq; $o; $rk):
     ev($seq; "result"; $rk;
        {is_error: $err}
        + ({subtype: ($o.subtype | clip(64))} | dropnull)
-       + {turns: ($o.num_turns | int0),
+       # turns_known is true only for a numeric num_turns >= 0; otherwise turns is 0 and means "unknown", and the scheduler keeps
+       # the full turn reservation (rule 1) instead of settling to max(1, 0)
+       + {turns: (if (($o.num_turns | type) == "number") and ($o.num_turns >= 0) then ($o.num_turns | ceil) else 0 end),
+          turns_known: ((($o.num_turns | type) == "number") and ($o.num_turns >= 0)),
           tokens: {input: ($u.input_tokens | int0), output: ($u.output_tokens | int0),
                    cache_read: ($u.cache_read_input_tokens | int0), cache_write: ($u.cache_creation_input_tokens | int0),
                    reasoning: 0},

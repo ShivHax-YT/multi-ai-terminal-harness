@@ -5,4 +5,4 @@
 {"type":"warning","provider":"claude","seq":5,"ts":null,"raw":"system/permission_denied","kind":"permission_denied","message":"tool Bash"}
 {"type":"rate_limited","provider":"claude","seq":6,"ts":null,"raw":"assistant","raw_kind":"claude_assistant_rate_limit"}
 {"type":"message","provider":"claude","seq":6,"ts":null,"raw":"assistant:text","role":"assistant","text":"You've hit your session limit","truncated":false}
-{"type":"result","provider":"claude","seq":7,"ts":null,"raw":"result/error_max_turns","is_error":true,"subtype":"error_max_turns","turns":5,"tokens":{"input":50,"output":10,"cache_read":0,"cache_write":0,"reasoning":0},"tokens_known":true,"cost_usd":0.002,"cost_is_estimate":true,"duration_ms":900}
+{"type":"result","provider":"claude","seq":7,"ts":null,"raw":"result/error_max_turns","is_error":true,"subtype":"error_max_turns","turns":5,"turns_known":true,"tokens":{"input":50,"output":10,"cache_read":0,"cache_write":0,"reasoning":0},"tokens_known":true,"cost_usd":0.002,"cost_is_estimate":true,"duration_ms":900}

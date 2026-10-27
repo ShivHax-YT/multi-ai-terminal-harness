@@ -112,8 +112,8 @@
           "required": ["id", "name"],
           "properties": {
             "type": { "const": "tool_call" },
-            "id": { "type": "string", "maxLength": 100 },
-            "name": { "type": "string", "maxLength": 64 }
+            "id": { "type": "string", "minLength": 1, "maxLength": 100 },
+            "name": { "type": "string", "minLength": 1, "maxLength": 64 }
           }
         }
       ],
@@ -126,7 +126,7 @@
           "required": ["id", "is_error"],
           "properties": {
             "type": { "const": "tool_result" },
-            "id": { "type": "string", "maxLength": 100 },
+            "id": { "type": "string", "minLength": 1, "maxLength": 100 },
             "is_error": { "type": "boolean" }
           }
         }
@@ -140,7 +140,7 @@
           "required": ["kind", "message"],
           "properties": {
             "type": { "const": "warning" },
-            "kind": { "type": "string", "maxLength": 64 },
+            "kind": { "type": "string", "minLength": 1, "maxLength": 64 },
             "message": { "type": "string", "maxLength": 300 }
           }
         }
@@ -186,7 +186,7 @@
           "required": ["kind", "fatal", "message"],
           "properties": {
             "type": { "const": "error" },
-            "kind": { "type": "string", "maxLength": 64 },
+            "kind": { "type": "string", "minLength": 1, "maxLength": 64 },
             "fatal": { "type": "boolean" },
             "message": { "type": "string", "maxLength": 300 }
           }
@@ -195,16 +195,17 @@
       "unevaluatedProperties": false
     },
     "result": {
-      "description": "End of one invocation. turns is the number of turns this invocation used (Claude num_turns; Codex 1 per exec call). tokens_known is false when the CLI reported no usage (a failed Codex turn); the five token fields are then 0. cost_is_estimate is always true for subscription logins.",
+      "description": "End of one invocation. turns is the number of turns this invocation used (Claude num_turns; Codex 1 per exec call). turns_known is false when Claude's num_turns is missing, not a number or negative; turns is then 0 and carries no information, and the scheduler keeps the full turn reservation as if no result had arrived (rule 1). Codex is always true. tokens_known is false when the CLI reported no usage (a failed Codex turn); the five token fields are then 0. cost_is_estimate is always true for subscription logins.",
       "allOf": [
         { "$ref": "#/$defs/envelope" },
         {
-          "required": ["is_error", "turns", "tokens", "tokens_known", "cost_usd", "cost_is_estimate"],
+          "required": ["is_error", "turns", "turns_known", "tokens", "tokens_known", "cost_usd", "cost_is_estimate"],
           "properties": {
             "type": { "const": "result" },
             "is_error": { "type": "boolean" },
             "subtype": { "type": "string", "maxLength": 64 },
             "turns": { "type": "integer", "minimum": 0 },
+            "turns_known": { "type": "boolean" },
             "tokens": { "$ref": "#/$defs/tokens" },
             "tokens_known": { "type": "boolean" },
             "cost_usd": { "type": ["number", "null"] },
