@@ -198,8 +198,11 @@ always turns used plus turns reserved:
   1, because the next bullet refuses the dispatch before it could be lower.
 - **Refuse when nothing fits.** The scheduler refuses the dispatch (no child process is started) when the reservation does
   not fit under 40: for Claude and for Codex alike when 40 minus turns already used or reserved is 0 or less.
-- **A result settles the count.** When `result` events arrive, the reservation is replaced by max(1, the highest `turns`
-  among the invocation's `result` events that have `turns_known` true). The highest counts, not the last, so a later `result`
+- **A result settles the count, once, when the invocation ends.** Settlement happens at the end of the invocation (its
+  `exited` event or the reap after `cancel()`), never while the child still runs, so freed turns can never be reserved by
+  another dispatch before a later, higher `result` arrives. The reservation is then replaced by max(1, the highest `turns`
+  among the invocation's `result` events that have `turns_known` true). If any `result` of the invocation has `turns_known`
+  false, the count is max(the reservation, that highest known `turns`): a mix of known and unknown results never frees turns. The highest counts, not the last, so a later `result`
   can never lower what an earlier one already counted: once settled, the count of an invocation never goes down. A result that
   is an error still counts its turns. A settled number above the reservation (the CLI overshot its own cap) is counted as
   reported and shrinks what the next dispatch can get. The `is_error` flag still follows the last `result` (row 15); the two

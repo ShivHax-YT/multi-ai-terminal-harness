@@ -693,6 +693,10 @@ check "spec: an invocation ends at the exited event or at cancel() and the funct
 check "spec: error and warning keep an empty message by design; kind is never empty (unknown_error)" \
   grep -qF 'By design, `error` and `warning` events keep an empty `message`' "$SPEC_FLAT"
 check "spec: an empty Claude assistant error string gives kind unknown_error" grep -qF 'an empty error string gives kind `unknown_error`' "$SPEC_FLAT"
+check "spec: settlement happens once, when the invocation ends, never while the child runs" \
+  grep -qF 'Settlement happens at the end of the invocation' "$SPEC_FLAT"
+check "spec: a mix of known and unknown results keeps max(reservation, highest known)" \
+  grep -qF 'the count is max(the reservation, that highest known `turns`): a mix of known and unknown results never frees turns' "$SPEC_FLAT"
 check "spec: row 16, cancel in exited or killed is an idempotent no-op" grep -qE '^\| 16 \| `exited`, `killed` \| `cancel\(\)` or watchdog \| unchanged \|' "$SPEC"
 check "spec: the exited event is named as the child-ends trigger" grep -qF 'that trigger is the **`exited` event**' "$SPEC_FLAT"
 check "spec: the exited event applies the end-of-invocation precedence" grep -qF 'The `exited` event applies it.' "$SPEC_FLAT"
