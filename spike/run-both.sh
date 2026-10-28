@@ -13,7 +13,9 @@
 #   2. spike/claude/run.sh once         (headless claude -p inside its own scratch worktree claude-1; rule 3)
 #   3. /bin/sleep 5                     (at least 5 s between dispatches, applied across providers as the human asked; rule 10)
 #   4. spike/codex/run.sh once          (headless codex exec --json inside its own scratch worktree codex-1; rule 3)
-#      Codex still runs when Claude failed (different provider, one prompt; human decision 2026-10-26). A signal stops before it.
+#      Codex still runs when Claude failed (different provider, one prompt; human decision 2026-10-26). A signal received before the
+#      check that precedes the Codex start keeps Codex from starting; one that lands in the instants between that check and the
+#      launch is noticed only after Codex ran (bash runs a trap only after the foreground command ends).
 #   5. normalizes each raw.jsonl with spike/normalize/<cli>.jq, prints one row per CLI, writes <ROOT>/run-both.json
 #   6. removes the scratch run dirs unless --keep. Exit 0 only if both CLIs PASS, else 1.
 # <ROOT> = spike/captures/run-both/<UTC stamp> (gitignored, fresh). The run scripts pick it up from the capture-root variable;
@@ -64,7 +66,7 @@ if [ "$DRY" -eq 1 ]; then
   printf '  8. print one table (provider, exit, session, turns, tokens, cost, warning, rate_limited, unknown, changed files, hello, verdict)\n'
   printf '     and write <ROOT>/run-both.json\n'
   printf '  9. remove the scratch run dirs (skipped with --keep); exit 0 only if both PASS\n'
-  printf 'Codex runs even if Claude fails. A signal stops before the codex run. The live run itself is the human'"'"'s.\n'
+  printf 'Codex runs even if Claude fails. A signal received before the pre-Codex check stops the run before the codex run. The live run itself is the human'"'"'s.\n'
   exit 0
 fi
 
@@ -80,7 +82,8 @@ unset _here
 
 spike_require_live
 
-# A signal is recorded, never acted on in the middle of a child: once set, nothing new starts (see stop_if_signalled).
+# A signal is recorded, never acted on in the middle of a child: once set, no later step starts, except in the instants between the
+# last check and a launch (see stop_if_signalled).
 SIGNAL_RC=0
 trap 'SIGNAL_RC=130' INT
 trap 'SIGNAL_RC=143' TERM
@@ -196,18 +199,26 @@ meta_file_ok() {
   safe_input "$1"
 }
 
-# scratch_repo_ok <git> <worktree>: no git command runs on the scratch repo, only `config --file` on its config files. 0 = the layout is the
-# one the run scripts create (<run>/repo/.git and <run>/repo/.git/worktrees/<name>) and is pinned: <run>/repo is not a symlink, the
-# physical path of the common git dir is exactly <run>/repo/.git (so no component above it redirects elsewhere), the worktree's
-# commondir file is a safe regular file holding exactly ../.., every config file git would read (the repo config, and
-# config.worktree if present) passes the allowlist, and every other metadata FILE that `git status` opens passes safe_input when it
-# exists (common dir: HEAD, packed-refs, info/exclude, info/attributes, info/sparse-checkout, shallow, objects/info/alternates and
-# the loose ref refs/heads/spike/<name>; worktree gitdir: HEAD (required), index, gitdir) while refs, refs/heads, refs/heads/spike,
-# logs, info, objects and objects/info must not be symlinks (rule 4: git must not open a CLI-home file through the repo); a missing
-# optional file is fine; 2 = the path is not a scratch worktree path; 3 = a config file, a metadata file or the layout
-# changed. Sets SG_COMMON and SG_GD (the pinned git dirs) for the caller; the worktree's own .git file is never read.
+# scratch_repo_ok <git> <worktree>: no git command runs on the scratch repo, only `config --file` on its config files. Result:
+#   0 = the layout is the one the run scripts create (<run>/repo/.git and <run>/repo/.git/worktrees/<name>) and all of this holds:
+#     - <run>/repo is not a symlink and the physical path of the common git dir is exactly <run>/repo/.git;
+#     - the WHOLE tree below the common git dir (which contains the worktree's git dir) holds only directories and regular files with
+#       one link: `find` (it follows no symlink) must print nothing and succeed, so a symlink, FIFO, socket, device or hard-linked
+#       file anywhere (loose objects, packs, commit-graph, info/grafts, refs/replace, sharedindex.*, logs, ...) refuses before any
+#       file is read;
+#     - the worktree's commondir file is a safe regular file holding exactly ../.., and its HEAD is a safe regular file holding exactly
+#       `ref: refs/heads/spike/<name>` (so HEAD can name no other ref);
+#     - every config file git would read (the repo config, config.worktree if present) passes the allowlist;
+#     - these files pass safe_input when they exist (missing is fine): common dir HEAD, packed-refs, info/exclude, info/attributes,
+#       shallow, objects/info/alternates and the loose ref refs/heads/spike/<name>; worktree git dir index, gitdir, info/sparse-checkout;
+#     - refs, refs/heads, refs/heads/spike, logs, info, objects, objects/info of the common dir, and info of the worktree git dir, are
+#       not symlinks (the tree check already refuses them; kept as a second, cheaper test);
+#   2 = the path is not a scratch worktree path;
+#   3 = a config file, a metadata file or the layout changed.
+# Sets SG_COMMON and SG_GD (the pinned git dirs) for the caller; the worktree's own .git file is never read. Not covered: the window
+# between this check and the git command that follows (a shell cannot make them atomic; recorded as an accepted residual risk).
 scratch_repo_ok() {
-  local g="$1" wt="$2" rest repo phys got
+  local g="$1" wt="$2" rest repo phys got want tree trc
   SG_COMMON=""
   SG_GD=""
   rest="${wt%/*}"
@@ -221,6 +232,11 @@ scratch_repo_ok() {
   if [ ! -d "$repo" ] || [ -L "$repo" ]; then return 3; fi
   phys="$(spike_resolve_path "$SG_COMMON")" || return 3
   [ "$phys" = "$SG_COMMON" ] || return 3
+  # The whole-tree check comes first, before any file below the git dirs is read. A find that fails is a refusal too.
+  tree="$(env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/find "$SG_COMMON" \( \( ! -type d ! -type f \) -o \( -type f -links +1 \) \) -print 2>/dev/null; printf 'rc=%s' "$?")"
+  trc="${tree##*rc=}"
+  tree="${tree%rc=*}"
+  [ "$trc" = "0" ] && [ -z "$tree" ] || return 3
   if [ ! -d "$SG_COMMON" ] || [ -L "$SG_COMMON" ] || [ -L "$SG_COMMON/worktrees" ] || [ ! -d "$SG_GD" ] || [ -L "$SG_GD" ] ||
     [ ! -e "$SG_COMMON/config" ] || ! config_absent_or_allowed "$g" "$SG_COMMON/config" ||
     ! config_absent_or_allowed "$g" "$SG_COMMON/config.worktree" || ! config_absent_or_allowed "$g" "$SG_GD/config.worktree"; then
@@ -231,14 +247,20 @@ scratch_repo_ok() {
   got="$(cat -- "$SG_GD/commondir" 2>/dev/null; printf x)"
   got="${got%x}"
   [ "$got" = "../.." ] || [ "$got" = "../.."$'\n' ] || return 3
+  # The worktree's HEAD names the branch git created for it and nothing else (a HEAD naming another ref could be followed to a symlink).
+  safe_input "$SG_GD/HEAD" || return 3
+  got="$(cat -- "$SG_GD/HEAD" 2>/dev/null; printf x)"
+  got="${got%x}"
+  want="ref: refs/heads/spike/${wt##*/}"
+  [ "$got" = "$want" ] || [ "$got" = "$want"$'\n' ] || return 3
   # The rest of what `git status` opens. No loop: one explicit chain each (the file has no loop at all, rule 1).
   if [ -L "$SG_COMMON/refs" ] || [ -L "$SG_COMMON/refs/heads" ] || [ -L "$SG_COMMON/refs/heads/spike" ] || [ -L "$SG_COMMON/logs" ] ||
-    [ -L "$SG_COMMON/info" ] || [ -L "$SG_COMMON/objects" ] || [ -L "$SG_COMMON/objects/info" ]; then
+    [ -L "$SG_COMMON/info" ] || [ -L "$SG_COMMON/objects" ] || [ -L "$SG_COMMON/objects/info" ] || [ -L "$SG_GD/info" ]; then
     return 3
   fi
-  safe_input "$SG_GD/HEAD" || return 3
-  meta_file_ok "$SG_GD/index" && meta_file_ok "$SG_GD/gitdir" && meta_file_ok "$SG_COMMON/HEAD" && meta_file_ok "$SG_COMMON/packed-refs" &&
-    meta_file_ok "$SG_COMMON/info/exclude" && meta_file_ok "$SG_COMMON/info/attributes" && meta_file_ok "$SG_COMMON/info/sparse-checkout" &&
+  meta_file_ok "$SG_GD/index" && meta_file_ok "$SG_GD/gitdir" && meta_file_ok "$SG_GD/info/sparse-checkout" &&
+    meta_file_ok "$SG_COMMON/HEAD" && meta_file_ok "$SG_COMMON/packed-refs" &&
+    meta_file_ok "$SG_COMMON/info/exclude" && meta_file_ok "$SG_COMMON/info/attributes" &&
     meta_file_ok "$SG_COMMON/shallow" && meta_file_ok "$SG_COMMON/objects/info/alternates" &&
     meta_file_ok "$SG_COMMON/refs/heads/spike/${wt##*/}" || return 3
   return 0
@@ -354,8 +376,11 @@ valid_row() {
   fi
 }
 
-# table <run-both.json>: one printable table (one row per CLI), then the notes. Returns jq's own exit status (not the filter's).
+# table <run-both.json>: one printable table (one row per CLI), then the notes. Returns non-zero if the input does not hold a rows array
+# of exactly two rows, or if ANY stage of the pipeline (jq, the output filter) failed.
 table() {
+  local st
+  "$JQ" -e '(.rows | type) == "array" and (.rows | length) == 2' "$1" > /dev/null 2>&1 || return 1
   "$JQ" -r '
     def pad($n): tostring | . + ([range(0; $n - length)] | map(" ") | add // "");
     def v: if . == null then "-" else . end;
@@ -372,10 +397,28 @@ table() {
       ( $rows[] | . as $row | ($row | cols) | map(.[1] as $w | (.[2] | tostring) | pad($w)) | join(" | ") ),
       ( $rows[] | select(.needs_mapping) | "note: \(.provider) has \(.unknown) unknown event(s): needs mapping (T-004)" ),
       ( $rows[] | select(.verdict == "FAIL") | "note: \(.provider) FAIL: \(.reasons | join("; "))" )' "$1" | printable
-  return "${PIPESTATUS[0]}"
+  st=("${PIPESTATUS[@]}")
+  [ "${st[0]}" = "0" ] && [ "${st[1]}" = "0" ]
 }
 
-# ---- end functions ------------------------------------------------------------------------------------------------------------
+# list_runs: the run-* entries directly under the scratch root, one per line, sorted (an unreadable or missing root lists nothing).
+list_runs() {
+  local sroot
+  sroot="$(spike_root)" || return 1
+  env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/find "$sroot" -mindepth 1 -maxdepth 1 -name 'run-*' -print 2>/dev/null | LC_ALL=C sort
+}
+
+# own_run <listing before> <listing after>: print the one entry present in the second listing and not in the first; return 1 and print
+# nothing if there are none or several (a name holding a newline counts as several).
+own_run() {
+  local n
+  n="$(printf '%s\n' "$2" | grep -vxF -f <(printf '%s\n' "$1") | grep -v '^$')"
+  case "$n" in
+    "" | *$'\n'*) return 1 ;;
+  esac
+  printf '%s\n' "$n"
+}
+
 cap_of() { # cap_of <cli>: print the one capture dir under $ROOT/<cli>/, else return 1
   set -- "$ROOT/$1"/*/
   [ "$#" -eq 1 ] && [ -d "$1" ] && [ ! -L "$1" ] || return 1
@@ -390,9 +433,15 @@ cap_of() { # cap_of <cli>: print the one capture dir under $ROOT/<cli>/, else re
 #   - the run dir is a real directory (no symlink) that is not older than this run's preflight.txt, so a leftover from an
 #     earlier run, or any other directory, is refused;
 #   - the capture's rundir.path (both run scripts write it) must be a safe file naming exactly the same run dir; a capture without it,
-#     or one naming another run dir, is refused.
+#     or one naming another run dir, is refused;
+#   - the run dir is the ONLY run-* entry that appeared under the scratch root while this CLI's run script ran (OWN_RUN_claude / OWN_RUN_codex,
+#     taken by this script around the call; the capture files are written by the CLI and can be forged consistently, this record
+#     cannot). Zero or several new entries: not verified.
 run_dir_of() {
-  local cap wt run sroot rd name
+  local cap wt run sroot rd name own
+  own="OWN_RUN_$1"
+  own="${!own:-}"
+  [ -n "$own" ] || return 1
   cap="$(cap_of "$1")" || return 1
   wt="$(read_wt "$cap/$2")" || return 1
   sroot="$(spike_root)" || return 1
@@ -410,9 +459,11 @@ run_dir_of() {
   [ ! "$ROOT/preflight.txt" -nt "$run" ] || return 1
   rd="$(read_wt "$cap/rundir.path")" || return 1
   [ "$rd" = "$run" ] || return 1
+  [ "$own" = "$run" ] || return 1
   printf '%s\n' "$run"
 }
 
+# ---- end functions ------------------------------------------------------------------------------------------------------------
 # leftover_note <cli> <worktree file>: say where the scratch run dir was left, as claude/run.sh does. The recorded location is only
 # read from a safe file, and is printed filtered and cut; it is text from a file the CLI could write, so it is only shown, never used.
 leftover_note() {
@@ -440,6 +491,8 @@ cleanup_one() {
 
 # cleanup_scratch: once only, and only for a CLI that was started. Skipped with --keep.
 CLEANED=0
+OWN_RUN_claude=""
+OWN_RUN_codex=""
 STARTED_CLAUDE=0
 STARTED_CODEX=0
 cleanup_scratch() {
@@ -451,7 +504,8 @@ cleanup_scratch() {
   return 0
 }
 
-# stop_if_signalled: after INT, TERM or HUP nothing new starts; clean up and exit 130, 143 or 129.
+# stop_if_signalled: after INT, TERM or HUP the next check stops the run, cleans up and exits 130, 143 or 129. Bash runs the trap only
+# after the foreground command ends, so a signal that lands between the last check and a launch is noticed only after that launch.
 stop_if_signalled() {
   if [ "$SIGNAL_RC" -ne 0 ]; then
     spike_err "stopped by a signal; nothing further was started"
@@ -528,15 +582,21 @@ fi
 # Each run script's output (stdout and stderr) goes through printable; its own exit status is taken from PIPESTATUS. The filter
 # ignores SIGINT: a terminal Ctrl-C reaches the whole foreground group, and a filter that died would close the pipe under the run
 # script, which would then die of SIGPIPE before its EXIT trap (its own cleanup) ran. The signal is still recorded by the trap above.
+# The run dirs a run script creates are recorded by this script, around the call, where the CLI cannot write: the one new run-* entry
+# under the scratch root is that CLI's run dir (see run_dir_of).
 STARTED_CLAUDE=1
+RUNS_BEFORE="$(list_runs)"
 SPIKE_CAPTURES_ROOT="$ROOT" "$HERE/claude/run.sh" < /dev/null 2>&1 | ( trap '' INT; printable )
 RC_CLAUDE="${PIPESTATUS[0]}"
+OWN_RUN_claude="$(own_run "$RUNS_BEFORE" "$(list_runs)")" || OWN_RUN_claude=""
 stop_if_signalled
 /bin/sleep "$GAP_SECS"
 stop_if_signalled
 STARTED_CODEX=1
+RUNS_BEFORE="$(list_runs)"
 SPIKE_CAPTURES_ROOT="$ROOT" "$HERE/codex/run.sh" < /dev/null 2>&1 | ( trap '' INT; printable )
 RC_CODEX="${PIPESTATUS[0]}"
+OWN_RUN_codex="$(own_run "$RUNS_BEFORE" "$(list_runs)")" || OWN_RUN_codex=""
 stop_if_signalled
 
 # ---- normalize, check, print ----------------------------------------------------------------------------------------------
