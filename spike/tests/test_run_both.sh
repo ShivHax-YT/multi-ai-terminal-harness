@@ -161,8 +161,25 @@ check "process_cli checks the worktree path before it reads hello.txt or lists c
 check "cleanup_one checks the worktree path before the library cleanup" test "$(awk '/^cleanup_one\(\)/ {f=1} f && /wt_path_ok/ && !a {a=NR} f && /spike_cleanup/ && !b {b=NR} END {exit !(a && b && a < b)}' "$RUN"; echo $?)" = "0"
 check "run_dir_of checks the run dir name for a slash" test "$(awk '/^run_dir_of\(\)/ {f=1} f && /\*\/\*\) return 1/ {n++} END {print n + 0}' "$RUN")" = "1"
 check "run_dir_of requires rundir.path for both CLIs (no claude-only guard)" test "$(awk '/^run_dir_of\(\)/ {f=1} f && /"\$1" = "claude"/ {n++} f && /read_wt "\$cap\/rundir.path"/ {m++} f && /^}/ {exit} END {print n + 0 "," m + 0}' "$RUN")" = "0,1"
-check "the run-both.json write is checked (in an if) and the failure exits 1 without a PASS line" test "$(awk '/^if ! \( "\$JQ" -n --argjson rows/ {f=1} f && /exit 1/ {print "x"; exit}' "$RUN")" = "x"
-check "the table call is checked" test "$(code_lines "$RUN" | grep -c '^if ! table "\$ROOT/run-both.json"; then$')" = "1"
+# the failure block of each checked call holds, in this order: the fixed message, cleanup_scratch, exit 1
+blk() { # blk <if-line regex> <message regex>: 0 if message, cleanup_scratch and exit 1 follow in the block that starts at the if line
+  START="$1" MSG="$2" awk '$0 ~ ENVIRON["START"] {f=1} f && $0 ~ ENVIRON["MSG"] {a=1} f && a && /^  cleanup_scratch$/ {b=1} f && b && /^  exit 1$/ {c=1} f && /^fi$/ {exit} END {exit !c}' "$RUN"
+}
+check "the run-both.json write is checked in an if whose block prints the fixed message, runs cleanup_scratch and exits 1" blk '^if ! \( "\$JQ" -n --argjson rows' 'could not write run-both.json'
+check "the table call is checked in an if whose block prints the fixed message, runs cleanup_scratch and exits 1" blk '^if ! table "\$ROOT/run-both.json"; then$' 'could not print the result table'
+check "the block matcher is not vacuous (it refuses a block without cleanup_scratch)" test "$(printf '%s\n' 'if ! table "$ROOT/run-both.json"; then' '  spike_err "could not print the result table"' '  exit 1' 'fi' > "$TMP/blk.sh"; awk -v start='^if ! table' -v msg='could not print' '$0 ~ start {f=1} f && $0 ~ msg {a=1} f && a && /^  cleanup_scratch$/ {b=1} f && b && /^  exit 1$/ {c=1} f && /^fi$/ {exit} END {exit !c}' "$TMP/blk.sh"; echo $?)" = "1"
+check "no unchecked table call remains" test "$(code_lines "$RUN" | grep -E '(^|[^A-Za-z_])table "' | grep -vcE '^if ! table ')" = "0"
+# D: the signal wording says what bash really does
+check "the signal comments no longer promise that a signal always stops before Codex" test "$(grep -cE 'A signal stops before|nothing new starts; clean up|once set, nothing new starts' "$RUN")" = "0"
+check "the signal comments say a signal in the instants before a launch is noticed only afterwards" test "$(grep -cE 'noticed only after Codex ran|except in the instants between the|noticed only after that launch' "$RUN")" -ge 3
+check "the dry-run text says a signal before the pre-Codex check stops the run" test "$(grep -c 'A signal received before the pre-Codex check stops the run before the codex run' "$RUN")" = "1"
+check "stop_if_signalled is documented as the next check stopping the run" test "$(grep -c 'after INT, TERM or HUP the next check stops the run, cleans up and exits 130, 143 or 129' "$RUN")" = "1"
+# C: the ownership record is taken by run-both.sh around each run script call
+check "each run script call is preceded by a listing of the scratch run dirs and followed by the ownership record" test "$(code_lines "$RUN" | grep -B1 -E '/(claude|codex)/run.sh" < /dev/null ' | grep -c '^RUNS_BEFORE="\$(list_runs)"$')" = "2" -a "$(code_lines "$RUN" | grep -cE '^OWN_RUN_(claude|codex)="\$\(own_run "\$RUNS_BEFORE" "\$\(list_runs\)"\)" \|\| OWN_RUN_(claude|codex)=""$')" = "2"
+check "run_dir_of compares the run dir with the ownership record" test "$(awk '/^run_dir_of\(\)/ {f=1} f && /\[ "\$own" = "\$run" \] \|\| return 1/ {n++} f && /^}/ {exit} END {print n + 0}' "$RUN")" = "1"
+check "scratch_repo_ok runs the whole-tree find with a closed environment, no symlink following, before it reads any file" test "$(awk '/^scratch_repo_ok\(\)/ {f=1} f && /env -i PATH=\/usr\/bin:\/bin LC_ALL=C \/usr\/bin\/find "\$SG_COMMON"/ && !a {a=NR} f && /config_absent_or_allowed/ && !b {b=NR} f && /^}/ {exit} END {print (a && b && a < b) ? "ok" : "no"}' "$RUN")" = "ok"
+check "scratch_repo_ok pins the worktree HEAD to the branch ref" test "$(awk '/^scratch_repo_ok\(\)/ {f=1} f && /want="ref: refs\/heads\/spike\/\$\{wt##\*\/\}"/ {n++} f && /^}/ {exit} END {print n + 0}' "$RUN")" = "1"
+check "info/sparse-checkout is checked in the worktree git dir, not the common dir" test "$(grep -c 'meta_file_ok "\$SG_GD/info/sparse-checkout"' "$RUN")" = "1" -a "$(grep -c 'meta_file_ok "\$SG_COMMON/info/sparse-checkout"' "$RUN")" = "0" -a "$(grep -c '\[ -L "\$SG_GD/info" \]' "$RUN")" = "1"
 check "the normalizer's exit status is kept (no || after the noclobber subshell)" test "$(code_lines "$RUN" | grep -c 'nrc=\$?')" = "1"
 
 # ---- the hello constants equal the text inside each merged run.sh TASK (the brief's drift guard) -----------------------------
@@ -245,7 +262,7 @@ JQ="$(spike_tool_path jq)"
 check "the probe path finds a native jq" test -n "$JQ"
 # shellcheck disable=SC1090
 . "$FUNCS"
-for fn in printable safe_input read_wt hello_ok git_new_enough config_allowed config_absent_or_allowed wt_path_ok meta_file_ok scratch_repo_ok changed_files build_row fail_row valid_row table; do
+for fn in printable safe_input read_wt hello_ok git_new_enough config_allowed config_absent_or_allowed wt_path_ok meta_file_ok scratch_repo_ok changed_files build_row fail_row valid_row table list_runs own_run cap_of run_dir_of; do
   check "function $fn is defined" test "$(type -t "$fn")" = "function"
 done
 
@@ -344,7 +361,7 @@ has "table: unknown events print needs mapping (T-004)" "$T2" 'needs mapping (T-
 has "table: a FAIL note names the reason" "$T2" 'note: claude FAIL:'
 # printable filter: control characters in a changed file name never reach the table
 esc="$(printf '\033[31m')"
-{ printf '{"rows":['; row claude 0 yes "name${esc}x" "$EXP/claude-sample.jsonl"; printf ']}\n'; } > "$TMP/esc.json"
+{ printf '{"rows":['; row claude 0 yes "name${esc}x" "$EXP/claude-sample.jsonl"; printf ','; row codex 0 yes "" "$EXP/codex-sample.jsonl"; printf ']}\n'; } > "$TMP/esc.json"
 T3="$(table "$TMP/esc.json")"
 eq "table output holds no escape character" "0" "$(printf '%s' "$T3" | LC_ALL=C grep -c "$(printf '\033')")"
 eq "printable keeps newlines and drops escapes" "ab
@@ -734,7 +751,7 @@ meta_case "worktree gitdir file" G gitdir
 meta_case "packed-refs" C packed-refs
 meta_case "info/exclude" C info/exclude
 meta_case "info/attributes" C info/attributes
-meta_case "info/sparse-checkout" C info/sparse-checkout
+meta_case "worktree info/sparse-checkout" G info/sparse-checkout
 meta_case "shallow" C shallow
 meta_case "objects/info/alternates" C objects/info/alternates
 meta_case "loose ref refs/heads/spike/claude-1" C refs/heads/spike/claude-1
@@ -791,6 +808,7 @@ dir_case "info" C info
 dir_case "objects" C objects
 dir_case "objects/info" C objects/info
 dir_case "worktree git dir" G claude-1
+dir_case "worktree info" G claude-1/info
 
 # changed_files keeps git's own exit status (a corrupt index): fixed text, status 4, none of git's output; the success path still lists
 mk_wt
@@ -837,6 +855,201 @@ check "table: a file without rows is a non-zero status" test "$?" != "0"
 printf 'not json\n' > "$TMP/not.json"
 table "$TMP/not.json" > /dev/null 2>&1
 check "table: a file that is not JSON is a non-zero status" test "$?" != "0"
+
+# -- round 4b: HEAD pinned, whole-tree check (find), per-worktree info/sparse-checkout
+mk_wt
+HEADF="$WREPO/.git/worktrees/claude-1/HEAD"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "HEAD pin: the HEAD git wrote (ref: refs/heads/spike/claude-1 and a newline) is accepted" "0" "$?"
+printf 'ref: refs/heads/spike/claude-1' > "$HEADF"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "HEAD pin: the same without a trailing newline is accepted" "0" "$?"
+for hv in 'ref: refs/heads/other\n' 'ref: refs/heads/spike/claude-1\n\n' 'ref: refs/heads/spike/claude-1 \n' 'ref: refs/heads/spike/claude-10\n' 'ref: refs/heads/main\n' \
+  '0123456789abcdef0123456789abcdef01234567\n' 'ref: ../../../elsewhere\n' ''; do
+  printf "$hv" > "$HEADF"
+  scratch_repo_ok "$GIT_BIN" "$WWT"
+  eq "HEAD pin: a HEAD holding [$hv] is refused" "3" "$?"
+done
+# a HEAD naming another ref whose file is a symlink to a CLI-home file: refused before git can follow it; the canary is never printed
+mk_wt
+printf 'ref: refs/heads/other\n' > "$WREPO/.git/worktrees/claude-1/HEAD"
+ln -s "$CLIHOME/canary.txt" "$WREPO/.git/refs/heads/other"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "HEAD naming another ref (symlinked to the canary): refused (3)" "3" "$?"
+CH="$(changed_files "$WWT" 2>&1)"
+eq "HEAD naming another ref: the fixed text, status 3, nothing else" "$FIXED_CFG,3" "$CH,$?"
+# the HEAD file as a FIFO never blocks the check
+mk_wt
+rm -f "$WREPO/.git/worktrees/claude-1/HEAD"
+mkfifo "$WREPO/.git/worktrees/claude-1/HEAD"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "a FIFO as the worktree HEAD is refused without blocking" "3" "$?"
+
+# the whole tree below the common git dir: only directories and one-link regular files
+tree_case() { # tree_case <label> <setup function>: the setup replaces something in the fresh scratch repo
+  local label="$1"
+  mk_wt
+  scratch_repo_ok "$GIT_BIN" "$WWT"
+  eq "tree $label: control, the fresh repo is accepted" "0" "$?"
+  "$2"
+  scratch_repo_ok "$GIT_BIN" "$WWT"
+  eq "tree $label: refused (3)" "3" "$?"
+  META_OUT="$(changed_files "$WWT" 2>&1)"
+  META_RC=$?
+  eq "tree $label: changed_files prints the fixed text and returns 3" "$FIXED_CFG,3" "$META_OUT,$META_RC"
+  lacks "tree $label: the canary text is never printed" "$META_OUT" "$CANARY"
+}
+first_obj() { find "$WREPO/.git/objects" -type f -path '*/??/*' | head -n 1; }
+t_obj_link() { local o; o="$(first_obj)"; rm -f "$o"; ln -s "$CLIHOME/canary.txt" "$o"; }
+t_obj_hard() { local o; o="$(first_obj)"; ln "$o" "$WREPO/.git/objects/extra-link"; }
+t_graph_link() { mkdir -p "$WREPO/.git/objects/info"; ln -s "$CLIHOME/canary.txt" "$WREPO/.git/objects/info/commit-graph"; }
+t_pack_link() { mkdir -p "$WREPO/.git/objects/pack"; ln -s "$CLIHOME/canary.txt" "$WREPO/.git/objects/pack/pack-1111.pack"; }
+t_pack_hard() { mkdir -p "$WREPO/.git/objects/pack"; printf 'x\n' > "$WREPO/.git/objects/pack/pack-2222.idx"; ln "$WREPO/.git/objects/pack/pack-2222.idx" "$TMP/pack-hard"; }
+t_grafts_link() { mkdir -p "$WREPO/.git/info"; ln -s "$CLIHOME/canary.txt" "$WREPO/.git/info/grafts"; }
+t_replace_link() { mkdir -p "$WREPO/.git/refs/replace"; ln -s "$CLIHOME/canary.txt" "$WREPO/.git/refs/replace/0123456789abcdef0123456789abcdef01234567"; }
+t_shared_link() { ln -s "$CLIHOME/canary.txt" "$WREPO/.git/worktrees/claude-1/sharedindex.0123456789abcdef"; }
+t_fifo() { mkfifo "$WREPO/.git/objects/fifo"; }
+t_fifo_deep() { mkdir -p "$WREPO/.git/refs/deep/er"; mkfifo "$WREPO/.git/refs/deep/er/fifo"; }
+t_logs_link() { mkdir -p "$WREPO/.git/logs/refs"; ln -s "$CLIHOME/canary.txt" "$WREPO/.git/logs/refs/x"; }
+t_wtgit_link() { ln -s "$CLIHOME/canary.txt" "$WREPO/.git/worktrees/claude-1/MERGE_HEAD"; }
+t_wtinfo_link() { mkdir -p "$WREPO/.git/worktrees/claude-1/info"; ln -s "$CLIHOME/canary.txt" "$WREPO/.git/worktrees/claude-1/info/sparse-checkout"; }
+tree_case "symlinked loose object" t_obj_link
+tree_case "hard-linked loose object" t_obj_hard
+tree_case "symlinked commit-graph" t_graph_link
+tree_case "symlinked pack file" t_pack_link
+tree_case "hard-linked pack index" t_pack_hard
+tree_case "symlinked info/grafts" t_grafts_link
+tree_case "symlinked refs/replace entry" t_replace_link
+tree_case "symlinked sharedindex" t_shared_link
+tree_case "FIFO in objects" t_fifo
+tree_case "FIFO deep in refs" t_fifo_deep
+tree_case "symlink under logs" t_logs_link
+tree_case "symlink in the worktree git dir" t_wtgit_link
+tree_case "symlinked worktree info/sparse-checkout" t_wtinfo_link
+# controls: a normal scratch repo with loose objects and a pack still passes, and git status still works on it
+mk_wt
+printf 'hello\n' > "$WWT/hello.txt"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "control: loose objects only: accepted" "0" "$?"
+check "control: the fresh repo really has loose objects" test -n "$(first_obj)"
+tg -C "$WWT" add hello.txt > /dev/null 2>&1
+tg -C "$WWT" commit -q -m h > /dev/null 2>&1
+tg -C "$WWT" gc -q > /dev/null 2>&1
+check "control: gc made a pack" test -n "$(find "$WREPO/.git/objects/pack" -type f -name '*.pack' | head -n 1)"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "control: loose objects and a pack: accepted" "0" "$?"
+printf 'more\n' > "$WWT/more.txt"
+eq "control: changed_files still lists on the packed repo" "more.txt" "$(changed_files "$WWT" 2>&1)"
+# per-worktree sparse-checkout lives in the worktree git dir
+mk_wt
+mkdir -p "$WREPO/.git/worktrees/claude-1/info"
+printf '/*\n' > "$WREPO/.git/worktrees/claude-1/info/sparse-checkout"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "a regular worktree info/sparse-checkout is accepted" "0" "$?"
+ln "$WREPO/.git/worktrees/claude-1/info/sparse-checkout" "$TMP/sp-hard"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "a hard-linked worktree info/sparse-checkout is refused" "3" "$?"
+rm -f "$TMP/sp-hard"
+
+# -- round 4b: table fails when ANY stage fails, and needs exactly two rows
+( printable() { cat > /dev/null; return 1; }; table "$good_json" > /dev/null 2>&1 )
+check "table: an output filter that fails gives a non-zero status" test "$?" != "0"
+( printable() { cat; return 0; }; table "$good_json" > /dev/null 2>&1 )
+eq "table: control, a working filter gives status 0" "0" "$?"
+: > "$TMP/empty.json"
+table "$TMP/empty.json" > /dev/null 2>&1
+check "table: an empty input file is a non-zero status" test "$?" != "0"
+table "$TMP/empty.json" > "$TMP/table-empty.out" 2>&1
+eq "table: an empty input prints nothing" "0" "$(wc -c < "$TMP/table-empty.out" | tr -d ' ')"
+{ printf '{"rows":['; row claude 0 yes "" "$EXP/claude-sample.jsonl"; printf ']}\n'; } > "$TMP/one-row.json"
+table "$TMP/one-row.json" > /dev/null 2>&1
+check "table: one row is a non-zero status (not two rows)" test "$?" != "0"
+{ printf '{"rows":['; row claude 0 yes "" "$EXP/claude-sample.jsonl"; printf ','; row codex 0 yes "" "$EXP/codex-sample.jsonl"; printf ','; row codex 0 yes "" "$EXP/codex-sample.jsonl"; printf ']}\n'; } > "$TMP/three-rows.json"
+table "$TMP/three-rows.json" > /dev/null 2>&1
+check "table: three rows is a non-zero status" test "$?" != "0"
+printf '{"rows":"x"}\n' > "$TMP/rows-string.json"
+table "$TMP/rows-string.json" > /dev/null 2>&1
+check "table: rows that is not an array is a non-zero status" test "$?" != "0"
+
+# -- round 4b: the ownership record (list_runs, own_run) and run_dir_of on synthetic captures
+SR="$(spike_root)"
+mkdir -p "$SR"
+RB="$(list_runs)"
+mkdir "$SR/run-own1"
+eq "own_run: exactly one new run-* entry is returned" "$SR/run-own1" "$(own_run "$RB" "$(list_runs)")"
+mkdir "$SR/run-own2"
+own_run "$RB" "$(list_runs)" > "$TMP/own.out" 2>&1
+check "own_run: two new entries are not verified (status 1)" test "$?" = "1"
+eq "own_run: two new entries print nothing" "0" "$(wc -c < "$TMP/own.out" | tr -d ' ')"
+RB2="$(list_runs)"
+own_run "$RB2" "$RB2" > /dev/null 2>&1
+check "own_run: no new entry is not verified (status 1)" test "$?" = "1"
+mkdir "$SR/run-nl"$'\n'"x"
+own_run "$RB2" "$(list_runs)" > /dev/null 2>&1
+check "own_run: a new name holding a newline counts as several (status 1)" test "$?" = "1"
+mkdir "$SR/notarun"
+eq "list_runs: only run-* entries are listed" "0" "$(list_runs | grep -c notarun)"
+rmdir "$SR/notarun" "$SR/run-own1" "$SR/run-own2" "$SR/run-nl"$'\n'"x"
+# listing a scratch root that does not exist yet lists nothing and is not an error for own_run's caller
+OLD_TMPDIR="$TMPDIR"
+TMPDIR="$TMP/no-such-tmp"
+eq "list_runs: a missing scratch root lists nothing" "" "$(list_runs)"
+TMPDIR="$OLD_TMPDIR"
+
+ROOT="$TMP/rd-root"
+rm -rf "$ROOT"
+mkdir -p "$ROOT/claude/20260101T000000Z" "$ROOT/codex/20260101T000001Z"
+: > "$ROOT/preflight.txt"
+touch -t 202001010000 "$ROOT/preflight.txt"
+RDN="run-20260101T000000Z-abcdef"
+rd_make() { # rd_make <name>: a run dir with repo-wt/claude-1 and repo-wt/codex-1 under the scratch root
+  mkdir -p "$SR/$1/repo-wt/claude-1" "$SR/$1/repo-wt/codex-1"
+}
+rd_files() { # rd_files <cli> <worktree> <rundir>: the two capture records the CLI could write
+  if [ "$1" = "claude" ]; then wf="worktree.path"; else wf="worktree.txt"; fi
+  printf '%s\n' "$2" > "$ROOT/$1/$(ls "$ROOT/$1")/$wf"
+  printf '%s\n' "$3" > "$ROOT/$1/$(ls "$ROOT/$1")/rundir.path"
+}
+rd_make "$RDN"
+RD="$SR/$RDN"
+rd_files claude "$RD/repo-wt/claude-1" "$RD"
+rd_files codex "$RD/repo-wt/codex-1" "$RD"
+OWN_RUN_claude="$RD"
+OWN_RUN_codex="$RD"
+eq "run_dir_of: claude, everything consistent and owned: the run dir" "$RD" "$(run_dir_of claude worktree.path)"
+eq "run_dir_of: codex, everything consistent and owned: the run dir" "$RD" "$(run_dir_of codex worktree.txt)"
+OWN_RUN_claude=""
+check "run_dir_of: no ownership record: refused" test "$(run_dir_of claude worktree.path >/dev/null 2>&1; echo $?)" = "1"
+OWN_RUN_claude="$SR/run-20260101T000000Z-zzzzzz"
+check "run_dir_of: both records name a run dir that this script did not see appear: refused" test "$(run_dir_of claude worktree.path >/dev/null 2>&1; echo $?)" = "1"
+OWN_RUN_claude="$RD"
+# a consistent forgery to ANOTHER fresh, correctly shaped run dir: records agree, shape and age are fine, only the ownership record refuses
+RDV="run-20260101T000000Z-victim"
+rd_make "$RDV"
+rd_files claude "$SR/$RDV/repo-wt/claude-1" "$SR/$RDV"
+check "run_dir_of: records forged consistently to another fresh run dir: refused (owned dir differs)" test "$(run_dir_of claude worktree.path >/dev/null 2>&1; echo $?)" = "1"
+OWN_RUN_claude="$SR/$RDV"
+eq "run_dir_of: control, the same records are accepted when that dir is the owned one" "$SR/$RDV" "$(run_dir_of claude worktree.path)"
+OWN_RUN_claude="$RD"
+# the older checks, each with a record that would otherwise be consistent and owned
+rd_files claude "$RD/repo-wt/codex-1" "$RD"
+check "run_dir_of: a worktree of the other CLI's shape: refused" test "$(run_dir_of claude worktree.path >/dev/null 2>&1; echo $?)" = "1"
+rd_files claude "$RD/repo-wt/claude-1" "$SR/$RDV"
+check "run_dir_of: rundir.path naming another run dir: refused" test "$(run_dir_of claude worktree.path >/dev/null 2>&1; echo $?)" = "1"
+rd_files claude "$RD/repo-wt/claude-1" "$RD"
+rm -f "$ROOT/claude/20260101T000000Z/rundir.path"
+check "run_dir_of: no rundir.path: refused" test "$(run_dir_of claude worktree.path >/dev/null 2>&1; echo $?)" = "1"
+rd_files claude "$RD/repo-wt/claude-1" "$RD"
+touch -t 201901010000 "$RD"
+check "run_dir_of: a run dir older than preflight.txt: refused" test "$(run_dir_of claude worktree.path >/dev/null 2>&1; echo $?)" = "1"
+touch "$RD"
+eq "run_dir_of: control, accepted again once the run dir is fresh" "$RD" "$(run_dir_of claude worktree.path)"
+mkdir -p "$SR/run-a/bcdefgT123456Z-abcdef/repo-wt/claude-1"
+OWN_RUN_claude="$SR/run-a/bcdefgT123456Z-abcdef"
+rd_files claude "$OWN_RUN_claude/repo-wt/claude-1" "$OWN_RUN_claude"
+check "run_dir_of: a two-segment run dir name, owned and consistent: refused" test "$(run_dir_of claude worktree.path >/dev/null 2>&1; echo $?)" = "1"
+OWN_RUN_claude=""
+rm -rf "$SR/$RDN" "$SR/$RDV" "$SR/run-a" "$ROOT"
 
 # the worktree's own .git file is never followed. The "CLI" rewrites it to a COPY of the git dirs whose config defines a filter driver
 # (the real config stays clean, so the allowlist passes); with the git dirs pinned from the path the copy is never read.
@@ -932,7 +1145,18 @@ mk_sandbox() { # mk_sandbox -> sets SB; the sandbox copy of run-both.sh is byte-
   # the one /bin/sleep line of the sandbox copy.
   printf '#!/bin/bash\necho "sleep $*" >> "$FAKE_LOG"\n[ -n "${FAKE_SLEEP_SIGNAL:-}" ] && kill -"$FAKE_SLEEP_SIGNAL" "$PPID"\nexit 0\n' > "$SB/fast/sleep"
   printf '#!/bin/bash\ncase "$*" in *%%Y%%m%%dT*) echo 20260101T000000Z ;; *) exec /bin/date "$@" ;; esac\n' > "$SB/fast/date"
-  printf '#!/bin/bash\nif [ -n "${FAKE_SLOWFLAG:-}" ] && [ -e "$FAKE_SLOWFLAG" ]; then rm -f "$FAKE_SLOWFLAG"; /bin/sleep 2; fi\nexec /usr/bin/tr "$@"\n' > "$SB/fast/tr"
+  # the tr shim: stalls once (FAKE_SLOWFLAG), and with FAKE_TR_FAILTABLE=1 fails only on the result table (the one stream holding the
+  # table header), so the table's output filter fails and nothing else does
+  cat > "$SB/fast/tr" <<'EOF'
+#!/bin/bash
+if [ -n "${FAKE_SLOWFLAG:-}" ] && [ -e "$FAKE_SLOWFLAG" ]; then rm -f "$FAKE_SLOWFLAG"; /bin/sleep 2; fi
+if [ "${FAKE_TR_FAILTABLE:-}" = "1" ]; then
+  in="$(cat; printf x)"
+  case "$in" in *"provider | exit"*) exit 1 ;; esac
+  printf '%s' "${in%x}" | exec /usr/bin/tr "$@"
+fi
+exec /usr/bin/tr "$@"
+EOF
   # a wc that, on its 2nd `wc -c` call (the second read_wt of the claude capture, after the path shape was accepted), swaps the claude
   # worktree for a symlink to $FAKE_WCSWAP_OTHER: the race the worktree path check closes
   cat > "$SB/fast/wc" <<'EOF'
@@ -955,6 +1179,23 @@ EOF
 #!/bin/bash
 printf 'preflight %s\n' "$(date +%s)" >> "$FAKE_LOG"
 printf 'fake preflight report\n'
+if [ -n "${FAKE_VICTIM:-}${FAKE_PRE_OREPO:-}" ]; then
+  HERE="$(cd -P "${BASH_SOURCE[0]%/*}" && pwd -P)"
+  . "$HERE/lib/common.sh"
+fi
+if [ -n "${FAKE_PRE_OREPO:-}" ]; then
+  # the "other" scratch repo of the repo-redirect scenario, made before any run script starts
+  spike_scratch_repo > "$FAKE_LOG.orepo"
+fi
+if [ -n "${FAKE_VICTIM:-}" ]; then
+  # a complete, correctly shaped, fresh scratch run dir (created after the last output, so not older than preflight.txt) that is NOT
+  # created by any run script: a consistent forgery target
+  VREPO="$(spike_scratch_repo)"
+  VWT="$(spike_worktree_add "$VREPO" "$FAKE_VICTIM")"
+  printf 'keep\n' > "$VWT/sentinel"
+  printf 'victim %s\n' "$VWT" >> "$FAKE_LOG"
+  printf '%s\n' "$VWT" > "$FAKE_LOG.victim"
+fi
 [ -n "${FAKE_PRE_SIGNAL:-}" ] && kill -"$FAKE_PRE_SIGNAL" "$PPID"
 exit "${FAKE_PRE_RC:-0}"
 EOF
@@ -977,6 +1218,13 @@ CAP="${CAP%/}"
 printf '%s\n' "$WT" > "$CAP/worktree.path"
 printf '%s\n' "$(dirname "$REPO")" > "$CAP/rundir.path"
 cp "$FAKE_CLAUDE_RAW" "$CAP/raw.jsonl"
+if [ "${FAKE_CLAUDE_FORGE2:-}" = "1" ]; then
+  # both capture records name the fresh run dir the preflight fake made (FAKE_VICTIM): a consistent forgery
+  VW="$(cat "$FAKE_LOG.victim")"
+  printf '%s\n' "$VW" > "$CAP/worktree.path"
+  printf '%s\n' "${VW%/repo-wt/*}" > "$CAP/rundir.path"
+fi
+[ "${FAKE_CLAUDE_EXTRA:-}" = "1" ] && mkdir "$(spike_root)/run-extra-$$"
 case "${FAKE_CLAUDE_HELLO:-ok}" in
   ok) printf 'hello from claude\n' > "$WT/hello.txt" ;;
   bad) printf 'hello from claude\nextra\n' > "$WT/hello.txt" ;;
@@ -1030,6 +1278,15 @@ case "${FAKE_META:-}" in
   info-dirlink) cp -R "$GC/info" "$GC/info.real"; rm -rf "$GC/info"; ln -s "$GC/info.real" "$GC/info" ;;
   gitdir-link) mv "$GD" "$GD.real"; ln -s "$GD.real" "$GD" ;;
   badindex) printf 'this is not an index\n' > "$GD/index" ;;
+  head-other) printf 'ref: refs/heads/other\n' > "$GD/HEAD"; ln -s "$FAKE_CANARY_FILE" "$GC/refs/heads/other" ;;
+  obj-link) o="$(find "$GC/objects" -type f -path '*/??/*' | head -n 1)"; rm -f "$o"; ln -s "$FAKE_CANARY_FILE" "$o" ;;
+  obj-hard) o="$(find "$GC/objects" -type f -path '*/??/*' | head -n 1)"; ln "$o" "$GC/objects/extra-link" ;;
+  graph-link) mkdir -p "$GC/objects/info"; ln -s "$FAKE_CANARY_FILE" "$GC/objects/info/commit-graph" ;;
+  pack-link) mkdir -p "$GC/objects/pack"; ln -s "$FAKE_CANARY_FILE" "$GC/objects/pack/pack-1111.pack" ;;
+  grafts-link) mkdir -p "$GC/info"; ln -s "$FAKE_CANARY_FILE" "$GC/info/grafts" ;;
+  replace-link) mkdir -p "$GC/refs/replace"; ln -s "$FAKE_CANARY_FILE" "$GC/refs/replace/0123456789abcdef0123456789abcdef01234567" ;;
+  fifo) mkfifo "$GC/objects/fifo" ;;
+  wtinfo-link) mkdir -p "$GD/info"; ln -s "$FAKE_CANARY_FILE" "$GD/info/sparse-checkout" ;;
 esac
 # the run-both.json target is not writable: a directory sits where the file will be written
 [ "${FAKE_RJSON_DIR:-}" = "1" ] && mkdir "$SPIKE_CAPTURES_ROOT/run-both.json"
@@ -1077,6 +1334,12 @@ case "${FAKE_CODEX_RUNDIR:-ok}" in
     ;;
 esac
 cp "$FAKE_CODEX_RAW" "$CAP/raw.jsonl"
+if [ "${FAKE_CODEX_FORGE2:-}" = "1" ]; then
+  VW="$(cat "$FAKE_LOG.victim")"
+  printf '%s\n' "$VW" > "$CAP/worktree.txt"
+  printf '%s\n' "${VW%/repo-wt/*}" > "$CAP/rundir.path"
+fi
+[ "${FAKE_CODEX_EXTRA:-}" = "1" ] && mkdir "$(spike_root)/run-extra-$$"
 case "${FAKE_CODEX_HELLO:-ok}" in
   ok) printf 'hello from codex\n' > "$WT/hello.txt" ;;
   bad) printf 'hello from codex\nextra\n' > "$WT/hello.txt" ;;
@@ -1119,7 +1382,7 @@ fi
 if [ "${FAKE_CODEX_REPOLINK:-}" = "1" ]; then
   # the "CLI" redirects <run>/repo to ANOTHER scratch repo that has an allowlisted config and a worktrees/codex-1 entry whose worktree
   # path lies in THIS run dir, so a git command run through the redirect (the library cleanup does that) would remove it
-  OREPO="$(spike_scratch_repo)"
+  OREPO="$(cat "$FAKE_LOG.orepo")"
   mv "$WT" "$WT.moved"
   _spike_git -C "$OREPO" worktree add -q -b spike/codex-1 "$WT" > /dev/null
   printf 'hello from codex\n' > "$WT/hello.txt"
@@ -1487,7 +1750,7 @@ has "N4: the codex leftover is reported" "$(cat "$SB/err")" 'codex: scratch run 
 
 # N5. <run>/repo is redirected to another scratch repo: no git runs through it, the other repo is untouched
 mk_fast
-rc="$(run_sb "$SB/$FASTP" "FAKE_CODEX_REPOLINK=1" --)"
+rc="$(run_sb "$SB/$FASTP" "FAKE_PRE_OREPO=1 FAKE_CODEX_REPOLINK=1" --)"
 eq "N5: a redirected repo: exit 1" "1" "$rc"
 OREPO="$(grep '^other ' "$SB/log" | cut -d' ' -f2)"
 check "N5: the other repo exists" test -d "$OREPO/.git"
@@ -1581,6 +1844,65 @@ mk_fast
 rc="$(run_sb "$SB/$FASTP" "" --)"
 eq "O4 control: a codex capture with a matching rundir.path: exit 0" "0" "$rc"
 check "O4 control: the fake codex wrote rundir.path" test -s "$(root_of)"/codex/*/rundir.path
+
+# O3b. round 4b: more things the "CLI" can replace in the scratch repo (a HEAD naming another ref, objects, commit-graph, packs, grafts,
+# refs/replace, a FIFO): same expectations as O3
+meta_flow head-other
+meta_flow obj-link
+meta_flow obj-hard
+meta_flow graph-link
+meta_flow pack-link
+meta_flow grafts-link
+meta_flow replace-link
+meta_flow fifo
+meta_flow wtinfo-link
+
+# O5. the capture files forged CONSISTENTLY (worktree file and rundir.path) to ANOTHER fresh, correctly shaped run dir that was already
+# there when the run script started: only the ownership record this script took around the call can refuse it. The other dir is untouched.
+forge_flow() { # forge_flow <claude|codex>
+  local cli="$1" idx other UC
+  if [ "$cli" = "claude" ]; then idx=0; other=1; UC=CLAUDE; else idx=1; other=0; UC=CODEX; fi
+  mk_fast
+  rc="$(run_sb "$SB/$FASTP" "FAKE_VICTIM=$cli-1 FAKE_${UC}_FORGE2=1" --)"
+  JO="$(cat "$(root_of)/run-both.json" 2>/dev/null)"
+  VICT="$(grep '^victim ' "$SB/log" | cut -d' ' -f2)"
+  eq "O5 $cli: consistent forgery to another fresh run dir: exit 1" "1" "$rc"
+  check "O5 $cli: the other run dir exists and was not deleted" test -f "$VICT/sentinel"
+  expect "O5 $cli: that row is FAIL and hello.txt was not read from the forged path" "$JO" ".rows[$idx].verdict == \"FAIL\" and .rows[$idx].hello_ok == false"
+  expect "O5 $cli: the other CLI's row is unaffected" "$JO" ".rows[$other].verdict == \"PASS\""
+  has "O5 $cli: the leftover is reported" "$(cat "$SB/err")" "$cli: scratch run dir NOT removed"
+  eq "O5 $cli: the real run dir and the other one are both left" "2" "$(scratch_left)"
+}
+forge_flow claude
+forge_flow codex
+# control: a fresh run dir that is merely there (not named by any capture file) is neither used nor touched; the real ones are cleaned
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "FAKE_VICTIM=claude-1" --)"
+VICT="$(grep '^victim ' "$SB/log" | cut -d' ' -f2)"
+eq "O5 control: an unrelated fresh run dir next to the run: exit 0" "0" "$rc"
+check "O5 control: the unrelated run dir was not deleted" test -f "$VICT/sentinel"
+eq "O5 control: only that run dir is left (both real ones were cleaned)" "1" "$(scratch_left)"
+
+# O6. an extra run-* entry appears while a run script runs: the CLI's run dir is not the only new entry, so nothing is verified
+for cli in claude codex; do
+  if [ "$cli" = "claude" ]; then idx=0; other=1; UC=CLAUDE; else idx=1; other=0; UC=CODEX; fi
+  mk_fast
+  rc="$(run_sb "$SB/$FASTP" "FAKE_${UC}_EXTRA=1" --)"
+  JO="$(cat "$(root_of)/run-both.json" 2>/dev/null)"
+  eq "O6 $cli: an extra run-* dir created during the run: exit 1" "1" "$rc"
+  expect "O6 $cli: that row is FAIL (hello.txt not read), the other CLI PASS" "$JO" ".rows[$idx].verdict == \"FAIL\" and .rows[$idx].hello_ok == false and .rows[$other].verdict == \"PASS\""
+  has "O6 $cli: the leftover is reported" "$(cat "$SB/err")" "$cli: scratch run dir NOT removed"
+  eq "O6 $cli: the real run dir and the extra one are both left, nothing deleted" "2" "$(scratch_left)"
+done
+
+# O7. the output filter fails while the table is printed: no PASS, one fixed message, exit 1, scratch cleaned
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "FAKE_TR_FAILTABLE=1" --)"
+eq "O7: the table's output filter fails: exit 1" "1" "$rc"
+has "O7: the fixed message is printed" "$(cat "$SB/err")" 'could not print the result table from run-both.json'
+eq "O7: no PASS anywhere" "0" "$(cat "$SB/out" "$SB/err" | grep -c 'PASS')"
+eq "O7: scratch cleanup ran" "0" "$(scratch_left)"
+check "O7: run-both.json was written before the table (the rows are on disk)" test -s "$(root_of)/run-both.json"
 
 # ---- the live gate in the real library is still intact (the sandbox override is only in the sandbox copy) -----------------------
 check "the real lib/common.sh was not changed by the sandbox override" test "$(grep -c 'spike_require_live() { :; }' "$SPIKE/lib/common.sh")" = "0"
