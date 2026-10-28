@@ -2061,13 +2061,20 @@ meta_flow alt-ext
 
 # O8c. an unreadable scratch root during the BEFORE-snapshot of the claude run: nothing is owned for claude, its run dir is left; codex is
 # unaffected (absent-root and readable-root cases are every other flow)
-mk_fast
-rc="$(run_sb "$SB/$FASTP" "FAKE_PRE_UNREADABLE=1" --)"
-JO="$(cat "$(root_of)/run-both.json" 2>/dev/null)"
-eq "O8c: a failed before-listing: exit 1" "1" "$rc"
-expect "O8c: the claude row is FAIL (hello.txt not read, run dir not owned), codex PASS" "$JO" '.rows[0].verdict == "FAIL" and .rows[0].hello_ok == false and .rows[1].verdict == "PASS"'
-has "O8c: the claude leftover is reported" "$(cat "$SB/err")" 'claude: scratch run dir NOT removed'
-eq "O8c: the claude run dir was not deleted, the codex one was cleaned" "1" "$(scratch_left)"
+probe_dir="$TMP/o8c-probe"; mkdir -p "$probe_dir/x"; chmod 0300 "$probe_dir"
+if ls "$probe_dir" > /dev/null 2>&1; then
+  chmod 700 "$probe_dir"
+  ok; ok; ok; ok # the suite runs as a user that can list a mode 0300 directory (root): the error path cannot be provoked here
+else
+  chmod 700 "$probe_dir"
+  mk_fast
+  rc="$(run_sb "$SB/$FASTP" "FAKE_PRE_UNREADABLE=1" --)"
+  JO="$(cat "$(root_of)/run-both.json" 2>/dev/null)"
+  eq "O8c: a failed before-listing: exit 1" "1" "$rc"
+  expect "O8c: the claude row is FAIL (hello.txt not read, run dir not owned), codex PASS" "$JO" '.rows[0].verdict == "FAIL" and .rows[0].hello_ok == false and .rows[1].verdict == "PASS"'
+  has "O8c: the claude leftover is reported" "$(cat "$SB/err")" 'claude: scratch run dir NOT removed'
+  eq "O8c: the claude run dir was not deleted, the codex one was cleaned" "1" "$(scratch_left)"
+fi
 
 # O8d. a hard link to a CLI-home file inside the worktree: no git status reads it; the row is FAIL with the existing fixed reason
 mk_fast

@@ -416,13 +416,14 @@ table() {
       ( $rows[] | select(.verdict == "FAIL") | "note: \(.provider) FAIL: \(.reasons | join("; "))" )' "$1" | printable
   # Read at once. A signal trap that ran after the pipeline can leave a one-element PIPESTATUS (bash 3.2): a missing element is a failure,
   # never an unbound-variable exit under set -u.
-  st=(${PIPESTATUS[@]+"${PIPESTATUS[@]}"})
+  st=("${PIPESTATUS[@]}")
   [ "${st[0]:-1}" = "0" ] && [ "${st[1]:-1}" = "0" ]
 }
 
 # list_runs: the run-* entries directly under the scratch root, one per line, sorted. A scratch root that does not exist yet is an empty
 # list and success; any error while listing (unreadable root, find failed) is a non-zero status, so an empty listing is never mistaken
-# for "nothing was there".
+# for "nothing was there". A parent of the scratch root that cannot be traversed also reads as "does not exist yet"; the run scripts could
+# not create a run dir there either, so nothing is owned by mistake.
 list_runs() {
   local sroot out rc
   sroot="$(spike_root)" || return 1

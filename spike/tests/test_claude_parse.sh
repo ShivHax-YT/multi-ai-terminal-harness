@@ -250,6 +250,8 @@ check "resume.sh strips before the symlink test" test "$(grep -nF 'ARG="${ARG%"$
 check "resume.sh reports unknown when the new session id is empty" grep -q 'reused="unknown"' "$RESUME"
 check "resume.sh only says no for a different, non-empty id" grep -qF 'if [ "$NEW_SID" = "$SID" ]; then reused="yes"; else reused="no"; fi' "$RESUME"
 check "run.sh prints the run dir when worktree or capture setup fails" test "$(grep -c 'scratch run dir left at' "$RUN")" -eq 2
+check "run.sh shell-quotes the run dir in the copy-paste cleanup hints (2 places)" test "$(grep -cF 'spike_cleanup $(printf '"'"'%q'"'"' "$RUN_DIR"))' "$RUN")" -eq 2
+check "run.sh shell-quotes the run dir in the final clean-up line" grep -qF 'spike_cleanup %q)' "$RUN"
 check "run.sh learns RUN_DIR right after the scratch repo exists" test "$(grep -n '^RUN_DIR=' "$RUN" | head -1 | cut -d: -f1)" -lt "$(grep -n '^WT=' "$RUN" | head -1 | cut -d: -f1)"
 
 # ---- completion_verdict: parsed completion decides success (extracted from each script and run offline) ----------------------------------
