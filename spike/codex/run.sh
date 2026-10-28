@@ -63,11 +63,11 @@ REPO="$(spike_scratch_repo)" || { spike_err "cannot make the scratch repo"; exit
 RUN_DIR="$(dirname "$REPO")"
 # From here on a scratch run directory exists; if setup fails, say where it is so the human can remove it.
 WT="$(spike_worktree_add "$REPO" codex-1)" || {
-  spike_err "cannot make the worktree; scratch run dir left at: $RUN_DIR (remove with: . spike/lib/common.sh; spike_cleanup $RUN_DIR)"
+  spike_err "cannot make the worktree; scratch run dir left at: $RUN_DIR (remove with: . spike/lib/common.sh; spike_cleanup $(printf '%q' "$RUN_DIR"))"
   exit 1
 }
 CAP="$(spike_capture_dir codex)" || {
-  spike_err "cannot make the capture directory; scratch run dir left at: $RUN_DIR (remove with: . spike/lib/common.sh; spike_cleanup $RUN_DIR)"
+  spike_err "cannot make the capture directory; scratch run dir left at: $RUN_DIR (remove with: . spike/lib/common.sh; spike_cleanup $(printf '%q' "$RUN_DIR"))"
   exit 1
 }
 CAP="${CAP%/}"

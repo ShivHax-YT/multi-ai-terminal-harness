@@ -260,6 +260,7 @@ check "resume.sh resumes by thread id" grep -qF -e ' -C "$WT" resume "$THREAD_ID
 check "run.sh writes rundir.path (the scratch run dir, as claude/run.sh does)" grep -qxF 'printf '"'"'%s\n'"'"' "$RUN_DIR" > "$CAP/rundir.path"' "$CODEX/run.sh"
 check "run.sh sets RUN_DIR to the scratch repo's parent" grep -qxF 'RUN_DIR="$(dirname "$REPO")"' "$CODEX/run.sh"
 check "run.sh says where the scratch run dir was left if setup fails (2 places)" test "$(grep -c 'scratch run dir left at: \$RUN_DIR' "$CODEX/run.sh")" = 2
+check "run.sh shell-quotes the run dir in the copy-paste cleanup hint (2 places)" test "$(grep -cF 'spike_cleanup $(printf '"'"'%q'"'"' "$RUN_DIR"))' "$CODEX/run.sh")" = 2
 check "run.sh task text is the brief's" grep -qF "TASK='Create a file named hello.txt whose only line is the three words hello from codex with no punctuation. Then reply DONE.'" "$CODEX/run.sh"
 check "resume.sh prompt is the brief's" grep -qF "PROMPT='Append a second line to hello.txt that is only the word resumed with no punctuation. Reply DONE.'" "$CODEX/resume.sh"
 check "parse.jq has no input/env/ltrimstr surprises: no \$ENV, no env, no input_filename" test "$(grep -vE '^[[:space:]]*#' "$CODEX/parse.jq" | grep -cE '\$ENV|\benv\b|input_filename|\$__prog')" = "0"
