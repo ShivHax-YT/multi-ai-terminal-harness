@@ -178,4 +178,4 @@ No limit was provoked (rules 1, 2, 10). Record only what appeared on its own.
 
 ## 12. Sign-off
 
-Human sign-off (name, date, "Phase 0 closed" or "not closed because ..."): ______________________________
+Human sign-off (name, date, "Phase 0 closed" or "not closed because ..."): ShivHax-YT, 2026-10-28, Phase 0 closed (report read and approved in chat; recorded by the lead)
