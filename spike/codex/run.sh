@@ -60,10 +60,12 @@ fi
 
 # ---- scratch repo, worktree, capture directory ------------------------------------------------------------------------------
 REPO="$(spike_scratch_repo)" || { spike_err "cannot make the scratch repo"; exit 1; }
+RUN_DIR="$(dirname "$REPO")"
 WT="$(spike_worktree_add "$REPO" codex-1)" || { spike_err "cannot make the worktree"; exit 1; }
 CAP="$(spike_capture_dir codex)" || { spike_err "cannot make the capture directory"; exit 1; }
 CAP="${CAP%/}"
 printf '%s\n' "$WT" > "$CAP/worktree.txt"
+printf '%s\n' "$RUN_DIR" > "$CAP/rundir.path"
 printf '%s\n' "$TASK" > "$CAP/task.txt"
 
 # ---- the one invocation (no retry, no loop) ------------------------------------------------------------------------------------

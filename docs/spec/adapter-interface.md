@@ -212,8 +212,8 @@ always turns used plus turns reserved:
   `turns_known` false is treated exactly as if no result had arrived. No failure path can make a run cheaper than its
   reservation.
 - **The count belongs to the task.** The 40 turns are counted per task, not per provider or session, and carry across a
-  failover to another provider: a failover never resets the count (fail-safe reading; round 5 decision C, pending the human's
-  confirmation).
+  failover to another provider: a failover never resets the count (fail-safe reading; round 5 decision C, confirmed by the
+  human 2026-10-27).
 
 Worked example. At 38 turns used, Claude gets `--max-turns` 2 (min(5, 40 minus 38)). At 40 turns used or reserved, nothing
 is dispatched. A Claude call reserved at 5 and killed before its `result` counts 5. A Claude call reserved at 5 whose `result`

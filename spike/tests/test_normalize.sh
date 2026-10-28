@@ -649,7 +649,7 @@ check "spec: check and reserve are one serialized step per task (atomic)" \
   grep -qF 'are one serialized step (one lock per task, nothing can run between the check and the record)' "$SPEC_FLAT"
 check "spec: two concurrent dispatches can never both reserve against the same count" \
   grep -qF 'Two concurrent dispatches can never both reserve against the same count' "$SPEC_FLAT"
-check "spec: the 40-turn count belongs to the task and a failover never resets it (decision C, pending the human)" \
+check "spec: the 40-turn count belongs to the task and a failover never resets it (decision C, confirmed 2026-10-27)" \
   grep -qF 'carry across a failover to another provider: a failover never resets the count' "$SPEC_FLAT"
 check "spec: the result event has turns_known in the event rules and the Claude and Codex mappings" \
   test "$(grep -c 'turns_known' "$SPEC")" -ge 6
