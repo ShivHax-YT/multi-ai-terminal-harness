@@ -97,7 +97,7 @@ No limit was provoked (rules 1, 2, 10). Record only what appeared on its own.
 |---|---|---|
 | Claude | known 2026-10-26, confirm: the session id was reused by `--resume` | T-002 `resume.sh` live run |
 | Codex | known 2026-10-26, confirm: the thread id was kept on `exec resume` | T-003 `resume.sh` live run |
-| Codex two-line `hello.txt` check after the wording fix | to confirm by a fresh T-003 run | |
+| Codex | T-003 resume check, to confirm by a fresh T-003 run: after `spike/codex/resume.sh`, `hello.txt` has line 1 `hello from codex` and line 2 `resumed`. Not part of the run-both.sh check, which expects exactly one line. | T-003 `resume.sh` |
 
 ## 7. stderr notes
 
@@ -110,6 +110,10 @@ No limit was provoked (rules 1, 2, 10). Record only what appeared on its own.
 
 - known 2026-10-26, confirm: the npm-installed `claude` is a launcher script and is refused by preflight (rule 6); the native installer's binary passes.
 - known 2026-10-26, confirm: the first Codex task wording was ambiguous (the sentence-ending period became part of `hello.txt`); fixed by a wording change, and this run is the fresh Codex run.
+- If the `run-both.sh` parent alone gets a TERM (not the process group), it waits for the running child process to finish
+  before it reacts. The parent checks for a signal before it starts Codex, so a signal received before that check keeps Codex
+  from starting. This is by design for a human-run spike, and the runner (`spike/lib/runner.pl`) is frozen. To stop at once,
+  press Ctrl-C or signal the process group: `kill -TERM -<pgid>`.
 - (add)
 
 ## 9. Implications
