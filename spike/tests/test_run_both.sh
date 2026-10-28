@@ -107,7 +107,7 @@ check "git status runs with submodules ignored and the git dirs pinned" test "$(
 check "the wait is /bin/sleep (no PATH lookup of sleep)" test "$(code_lines "$RUN" | grep -c '^/bin/sleep "\$GAP_SECS"$')" = "1" -a "$(code_lines "$RUN" | grep -vE '^[[:space:]]*printf' | grep -cE '(^|[^/A-Za-z_])sleep ')" = "0"
 check "every jq call on capture data goes through the probe-checked \$JQ" test "$(code_lines "$RUN" | grep -E '(^|[^A-Za-z_"$/-])jq ' | grep -vcE "printf|spike_err")" = "0"
 FILTER_TAIL="2>&1 | ( trap '' INT; printable )"
-check "the run scripts' output is filtered with printable and their status taken from PIPESTATUS" test "$(code_lines "$RUN" | grep -E '/(claude|codex)/run.sh" < /dev/null ' | grep -cF -- "$FILTER_TAIL")" = "2" -a "$(code_lines "$RUN" | grep -c 'PIPESTATUS\[0\]')" = "2"
+check "the run scripts' output is filtered with printable and their status taken from PIPESTATUS" test "$(code_lines "$RUN" | grep -E '/(claude|codex)/run.sh" < /dev/null ' | grep -cF -- "$FILTER_TAIL")" = "2" -a "$(code_lines "$RUN" | grep -cE '^RC_(CLAUDE|CODEX)="\$\{PIPESTATUS\[0\]\}"$')" = "2"
 check "the output filter after each run.sh ignores SIGINT (a Ctrl-C must not kill the pipe under the run script)" test "$(code_lines "$RUN" | grep -cF -- "| ( trap '' INT; printable )")" = "2" -a "$(code_lines "$RUN" | grep -cE '(claude|codex)/run.sh.*\| printable$')" = "0"
 # no [a-z]-style range in a case pattern (bash 3.2 orders ranges by the locale's collation). A bracket holding a dash between two
 # characters is a range; POSIX classes are fine. The pattern text is what comes before the first ) of a case line.
@@ -118,13 +118,51 @@ check "range detector: [A-Za-z0-9._-] holds ranges" has_range '*[!A-Za-z0-9._-]*
 check "range detector: a POSIX class is not a range" test "$(has_range '*[[:cntrl:]]*'; echo $?)" = "1"
 check "range detector: an explicit digit list is not a range" test "$(has_range '*[!0123456789]*'; echo $?)" = "1"
 check "range detector: a trailing dash is not a range" test "$(has_range '[._-]'; echo $?)" = "1"
-CASE_PATS="$(code_lines "$RUN" | grep -E ';;|(^|[^[:alnum:]_])case .* in( |$)' | sed 's/).*//')"
+# case_pats <file>: every case pattern of a script, one per output line. A small state machine: after `case X in` and after each `;;`
+# the next line starts a pattern (up to its first closing parenthesis), so a pattern on a line of its own is found as well as one
+# that shares its line with `;;` or with the command.
+case_pats() {
+  awk '
+    /^[[:space:]]*#/ { next }
+    {
+      s = $0
+      if (s ~ /(^|[^[:alnum:]_])case [^ ]+ in( |$)/) {
+        sub(/^.*case [^ ]+ in */, "", s)
+        expect = 1
+        if (s == "") next
+      }
+      if (expect) {
+        if (s ~ /^[[:space:]]*esac/) { expect = 0; next }
+        if (index(s, ")") > 0) {
+          p = s
+          sub(/\).*/, "", p)
+          print p
+          expect = (s ~ /;;[[:space:]]*$/) ? 1 : 0
+          next
+        }
+      }
+      if (s ~ /;;[[:space:]]*$/) expect = 1
+    }' "$1"
+}
+CASE_PATS="$(case_pats "$RUN")"
 check "the case patterns were found (at least 15 lines)" test "$(printf '%s\n' "$CASE_PATS" | wc -l | tr -d ' ')" -ge 15
 check "no [a-z]-style range in any case pattern of run-both.sh" test "$(printf '%s\n' "$CASE_PATS" | grep -cE '\[[^]]*[^][ :-]-[^]]')" = "0"
+# controls: a range in a pattern that sits on its own line (the command on the next lines) is found; a clean file yields none
+printf '%s\n' 'case "$x" in' '  *[!0-9]*)' '    echo a' '    ;;' '  ok) echo b ;;' 'esac' > "$TMP/pat-own-line.sh"
+check "case_pats finds a pattern on a line of its own" test "$(case_pats "$TMP/pat-own-line.sh" | grep -c '0-9')" = "1"
+check "case_pats finds both patterns of the fixture" test "$(case_pats "$TMP/pat-own-line.sh" | wc -l | tr -d ' ')" = "2"
+check "the range detector flags the own-line pattern" test "$(case_pats "$TMP/pat-own-line.sh" | grep -cE '\[[^]]*[^][ :-]-[^]]')" = "1"
+printf '%s\n' 'case "$x" in' '  *[!0123456789]*)' '    echo a' '    ;;' 'esac' > "$TMP/pat-clean.sh"
+check "case_pats and the detector see no range in an explicit digit list" test "$(case_pats "$TMP/pat-clean.sh" | grep -cE '\[[^]]*[^][ :-]-[^]]')" = "0"
+printf '%s\n' 'case "$x" in *[a-z]*) echo a ;; esac' > "$TMP/pat-oneline.sh"
+check "case_pats finds a pattern on a one-line case" test "$(case_pats "$TMP/pat-oneline.sh" | grep -c 'a-z')" = "1"
 check "the digit tests use an explicit digit list" test "$(code_lines "$RUN" | grep -cF -- '[!0123456789]')" = "4"
 check "process_cli checks the worktree path before it reads hello.txt or lists changed files" test "$(awk '/^process_cli\(\)/ {f=1} f && /wt_path_ok "\$wt"/ && !a {a=NR} f && /hello_ok "\$wt"/ && !b {b=NR} f && /changed_files "\$wt"/ && !c {c=NR} END {exit !(a && b && c && a < b && b < c)}' "$RUN"; echo $?)" = "0"
 check "cleanup_one checks the worktree path before the library cleanup" test "$(awk '/^cleanup_one\(\)/ {f=1} f && /wt_path_ok/ && !a {a=NR} f && /spike_cleanup/ && !b {b=NR} END {exit !(a && b && a < b)}' "$RUN"; echo $?)" = "0"
 check "run_dir_of checks the run dir name for a slash" test "$(awk '/^run_dir_of\(\)/ {f=1} f && /\*\/\*\) return 1/ {n++} END {print n + 0}' "$RUN")" = "1"
+check "run_dir_of requires rundir.path for both CLIs (no claude-only guard)" test "$(awk '/^run_dir_of\(\)/ {f=1} f && /"\$1" = "claude"/ {n++} f && /read_wt "\$cap\/rundir.path"/ {m++} f && /^}/ {exit} END {print n + 0 "," m + 0}' "$RUN")" = "0,1"
+check "the run-both.json write is checked (in an if) and the failure exits 1 without a PASS line" test "$(awk '/^if ! \( "\$JQ" -n --argjson rows/ {f=1} f && /exit 1/ {print "x"; exit}' "$RUN")" = "x"
+check "the table call is checked" test "$(code_lines "$RUN" | grep -c '^if ! table "\$ROOT/run-both.json"; then$')" = "1"
 check "the normalizer's exit status is kept (no || after the noclobber subshell)" test "$(code_lines "$RUN" | grep -c 'nrc=\$?')" = "1"
 
 # ---- the hello constants equal the text inside each merged run.sh TASK (the brief's drift guard) -----------------------------
@@ -207,7 +245,7 @@ JQ="$(spike_tool_path jq)"
 check "the probe path finds a native jq" test -n "$JQ"
 # shellcheck disable=SC1090
 . "$FUNCS"
-for fn in printable safe_input read_wt hello_ok git_new_enough config_allowed config_absent_or_allowed wt_path_ok scratch_repo_ok changed_files build_row fail_row valid_row table; do
+for fn in printable safe_input read_wt hello_ok git_new_enough config_allowed config_absent_or_allowed wt_path_ok meta_file_ok scratch_repo_ok changed_files build_row fail_row valid_row table; do
   check "function $fn is defined" test "$(type -t "$fn")" = "function"
 done
 
@@ -656,6 +694,150 @@ ln -s "$RUN2.real" "$RUN2"
 scratch_repo_ok "$GIT_BIN" "$WWT"
 eq "scratch_repo_ok refuses a worktree path whose run dir is a symlink (physical path of .git differs)" "3" "$?"
 
+# every git metadata file that `git status` opens must pass safe_input before git runs (rule 4): a symlink to a file inside a CLI home
+# and a hard-linked copy are refused with the fixed text and status 3; the canary text is never printed; a missing optional file is fine
+FIXED_CFG="(not listed: repo config changed)"
+meta_case() { # meta_case <label> <C|G> <relative file> : C = common git dir, G = the worktree's git dir
+  local label="$1" f
+  mk_wt
+  if [ "$2" = "C" ]; then f="$WREPO/.git/$3"; else f="$WREPO/.git/worktrees/claude-1/$3"; fi
+  if [ ! -e "$f" ]; then
+    mkdir -p "$(dirname "$f")"
+    printf '# placeholder\n' > "$f"
+  fi
+  cp "$f" "$TMP/meta.orig"
+  scratch_repo_ok "$GIT_BIN" "$WWT"
+  eq "meta $label: control, a regular file is accepted" "0" "$?"
+  rm -f "$f"
+  ln -s "$CLIHOME/canary.txt" "$f"
+  scratch_repo_ok "$GIT_BIN" "$WWT"
+  eq "meta $label: a symlink to a CLI-home file is refused (3)" "3" "$?"
+  META_OUT="$(changed_files "$WWT" 2>&1)"
+  META_RC=$?
+  eq "meta $label: symlink: changed_files status 3" "3" "$META_RC"
+  eq "meta $label: symlink: only the fixed text is printed (so the canary is not)" "$FIXED_CFG" "$META_OUT"
+  rm -f "$f"
+  cp "$TMP/meta.orig" "$f"
+  ln "$f" "$f.hard"
+  scratch_repo_ok "$GIT_BIN" "$WWT"
+  eq "meta $label: a hard-linked file is refused (3)" "3" "$?"
+  META_OUT="$(changed_files "$WWT" 2>&1)"
+  eq "meta $label: hard link: the fixed text" "$FIXED_CFG" "$META_OUT"
+  rm -f "$f.hard"
+  scratch_repo_ok "$GIT_BIN" "$WWT"
+  eq "meta $label: control, accepted again once the extra link is gone" "0" "$?"
+}
+meta_case "common HEAD" C HEAD
+meta_case "worktree HEAD" G HEAD
+meta_case "worktree index" G index
+meta_case "worktree gitdir file" G gitdir
+meta_case "packed-refs" C packed-refs
+meta_case "info/exclude" C info/exclude
+meta_case "info/attributes" C info/attributes
+meta_case "info/sparse-checkout" C info/sparse-checkout
+meta_case "shallow" C shallow
+meta_case "objects/info/alternates" C objects/info/alternates
+meta_case "loose ref refs/heads/spike/claude-1" C refs/heads/spike/claude-1
+# a CLI-home path never appears in the output even when the symlink target is a directory
+mk_wt
+rm -f "$WREPO/.git/worktrees/claude-1/index"
+ln -s "$CLIHOME" "$WREPO/.git/worktrees/claude-1/index"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "meta: an index that is a symlink to the CLI home directory is refused" "3" "$?"
+
+# a missing optional file is fine; a missing worktree HEAD is not
+mk_wt
+rm -f "$WREPO/.git/packed-refs" "$WREPO/.git/info/exclude" "$WREPO/.git/info/attributes" "$WREPO/.git/worktrees/claude-1/index"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "meta: missing packed-refs, info/exclude, info/attributes and index are fine" "0" "$?"
+rm -f "$WREPO/.git/worktrees/claude-1/HEAD"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "meta: a missing worktree HEAD is refused (3)" "3" "$?"
+mk_wt
+rm -rf "$WREPO/.git/info"
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "meta: a missing info directory is fine" "0" "$?"
+# packed refs written by git itself (no loose branch ref left) are accepted and status still works
+mk_wt
+printf 'hello\n' > "$WWT/hello.txt"
+tg -C "$WWT" pack-refs --all > /dev/null 2>&1
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "meta: packed refs written by git are accepted" "0" "$?"
+check "meta: status after pack-refs still lists the file" test "$(changed_files "$WWT" 2>&1)" = "hello.txt"
+
+# symlinked directories: refs, refs/heads, refs/heads/spike, logs, info, objects, objects/info and the worktree's git dir
+dir_case() { # dir_case <label> <C|G> <relative dir>
+  local label="$1" d
+  mk_wt
+  if [ "$2" = "C" ]; then d="$WREPO/.git/$3"; else d="$WREPO/.git/worktrees/$3"; fi
+  mkdir -p "$d"
+  mv "$d" "$d.real"
+  ln -s "$d.real" "$d"
+  scratch_repo_ok "$GIT_BIN" "$WWT"
+  eq "dir $label: a symlinked directory is refused (3)" "3" "$?"
+  META_OUT="$(changed_files "$WWT" 2>&1)"
+  META_RC=$?
+  eq "dir $label: changed_files prints the fixed text and returns 3" "$FIXED_CFG,3" "$META_OUT,$META_RC"
+  rm -f "$d"
+  mv "$d.real" "$d"
+  scratch_repo_ok "$GIT_BIN" "$WWT"
+  eq "dir $label: control, accepted once the directory is real again" "0" "$?"
+}
+dir_case "refs" C refs
+dir_case "refs/heads" C refs/heads
+dir_case "refs/heads/spike" C refs/heads/spike
+dir_case "logs" C logs
+dir_case "info" C info
+dir_case "objects" C objects
+dir_case "objects/info" C objects/info
+dir_case "worktree git dir" G claude-1
+
+# changed_files keeps git's own exit status (a corrupt index): fixed text, status 4, none of git's output; the success path still lists
+mk_wt
+printf 'hello\n' > "$WWT/hello.txt"
+CH="$(changed_files "$WWT" 2>&1)"
+eq "changed_files success path: lists the file" "hello.txt" "$CH"
+changed_files "$WWT" > /dev/null 2>&1
+eq "changed_files success path: status 0" "0" "$?"
+for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do printf 'x\n' > "$WWT/many$n.txt"; done
+CH="$(changed_files "$WWT" 2>&1)"
+CRC=$?
+eq "changed_files with 31 changed files: status 0 (a pipe closed early is not a git failure)" "0" "$CRC"
+eq "changed_files lists at most 20 lines" "20" "$(printf '%s\n' "$CH" | wc -l | tr -d ' ')"
+GIDX="$WREPO/.git/worktrees/claude-1/index"
+cp "$GIDX" "$TMP/index.good"
+printf 'this is not an index file at all\n' > "$GIDX"
+CH="$(changed_files "$WWT" 2>"$TMP/cf.err")"
+CRC=$?
+eq "a garbage index: the fixed text and nothing else" "(not listed: git status failed)" "$CH"
+eq "a garbage index: status 4 (distinct from 0 and 3)" "4" "$CRC"
+eq "a garbage index: git's own error text is not shown" "0" "$(wc -c < "$TMP/cf.err" | tr -d ' ')"
+head -c 20 "$TMP/index.good" > "$GIDX"
+CH="$(changed_files "$WWT" 2>&1)"
+eq "a truncated index: the fixed text, status 4" "(not listed: git status failed),4" "$CH,$?"
+: > "$GIDX"
+CH="$(changed_files "$WWT" 2>&1)"
+eq "an empty index file: the fixed text" "(not listed: git status failed)" "$CH"
+cp "$TMP/index.good" "$GIDX"
+CH="$(changed_files "$WWT" 2>&1)"
+eq "the same repo with its index restored lists files again" "0" "$?"
+has "restored index: hello.txt listed" "$CH" "hello.txt"
+# the row is built from a status-4 listing exactly like from any listing: the verdict is decided by the run, not by the changed files
+R="$(build_row claude 0 yes "(not listed: git status failed)" "$EXP/claude-sample.jsonl")"
+expect "a changed-files note of git status failed does not change a PASS" "$R" '.verdict == "PASS" and .changed == ["(not listed: git status failed)"]'
+
+# table returns jq's own status
+table "$good_json" > /dev/null 2>&1
+eq "table: status 0 on a good file" "0" "$?"
+table "$TMP/does-not-exist.json" > /dev/null 2>&1
+check "table: a missing file is a non-zero status" test "$?" != "0"
+printf '{"rows":[]}\n' > "$TMP/no-rows.json"
+table "$TMP/no-rows.json" > /dev/null 2>&1
+check "table: a file without rows is a non-zero status" test "$?" != "0"
+printf 'not json\n' > "$TMP/not.json"
+table "$TMP/not.json" > /dev/null 2>&1
+check "table: a file that is not JSON is a non-zero status" test "$?" != "0"
+
 # the worktree's own .git file is never followed. The "CLI" rewrites it to a COPY of the git dirs whose config defines a filter driver
 # (the real config stays clean, so the allowlist passes); with the git dirs pinned from the path the copy is never read.
 mk_wt
@@ -819,6 +1001,7 @@ CFG="$REPO/.git/config"
 case "${FAKE_HOSTILE:-}" in
   filter | process)
     printf 'aaaa\n' > "$WT/f.txt"
+    touch -t 202001010000 "$WT/f.txt" # an old mtime: the rewrite below is always stat-dirty, never in the same timestamp tick
     printf 'f.txt filter=x\n' > "$WT/.gitattributes"
     _spike_git -C "$WT" add f.txt .gitattributes
     _spike_git -C "$WT" commit -q -m f
@@ -830,16 +1013,38 @@ case "${FAKE_HOSTILE:-}" in
   worktree) _spike_git config --file "$CFG" core.worktree "$SPIKE_CAPTURES_ROOT/elsewhere" ;;
   foobar) _spike_git config --file "$CFG" foo.bar 1 ;;
 esac
+# the "CLI" replaces one git metadata file (or directory) of the scratch repo by a symlink to a file inside a fake CLI home
+# (FAKE_CANARY_FILE) or by a hard-linked copy; the config stays clean, so only the metadata checks can refuse it
+GC="$REPO/.git"
+GD="$GC/worktrees/claude-1"
+case "${FAKE_META:-}" in
+  index-link) rm -f "$GD/index"; ln -s "$FAKE_CANARY_FILE" "$GD/index" ;;
+  index-hard) ln "$GD/index" "$GD/index.hard" ;;
+  head-link) rm -f "$GD/HEAD"; ln -s "$FAKE_CANARY_FILE" "$GD/HEAD" ;;
+  commonhead-link) rm -f "$GC/HEAD"; ln -s "$FAKE_CANARY_FILE" "$GC/HEAD" ;;
+  exclude-link) mkdir -p "$GC/info"; rm -f "$GC/info/exclude"; ln -s "$FAKE_CANARY_FILE" "$GC/info/exclude" ;;
+  packed-link) rm -f "$GC/packed-refs"; ln -s "$FAKE_CANARY_FILE" "$GC/packed-refs" ;;
+  ref-link) rm -f "$GC/refs/heads/spike/claude-1"; ln -s "$FAKE_CANARY_FILE" "$GC/refs/heads/spike/claude-1" ;;
+  refs-dirlink) cp -R "$GC/refs" "$GC/refs.real"; rm -rf "$GC/refs"; ln -s "$GC/refs.real" "$GC/refs" ;;
+  logs-dirlink) mkdir -p "$GC/logs.real"; rm -rf "$GC/logs"; ln -s "$GC/logs.real" "$GC/logs" ;;
+  info-dirlink) cp -R "$GC/info" "$GC/info.real"; rm -rf "$GC/info"; ln -s "$GC/info.real" "$GC/info" ;;
+  gitdir-link) mv "$GD" "$GD.real"; ln -s "$GD.real" "$GD" ;;
+  badindex) printf 'this is not an index\n' > "$GD/index" ;;
+esac
+# the run-both.json target is not writable: a directory sits where the file will be written
+[ "${FAKE_RJSON_DIR:-}" = "1" ] && mkdir "$SPIKE_CAPTURES_ROOT/run-both.json"
 [ -n "${FAKE_CLAUDE_SIGNAL:-}" ] && kill -"$FAKE_CLAUDE_SIGNAL" "$PPID"
 if [ "${FAKE_CLAUDE_CTRLC:-}" = "1" ]; then
   # a terminal Ctrl-C reaches every process of the foreground group: simulate it on run-both.sh and on the other members of its pipeline
   # (the output filter and its child), then keep writing. This script's own EXIT trap (like the real run.sh cleanup) must still run.
   trap 'printf "claude exit-trap\n"; printf "claude exit-trap\n" >> "$FAKE_LOG"' EXIT
   kill -INT "$PPID"
+  # every pid that really received the signal is logged, so the test can tell that the filter was reached (a missing pgrep, or no
+  # filter process, leaves no "signalled" line and fails the check instead of being skipped)
   for p in $(pgrep -P "$PPID"); do
     [ "$p" = "$$" ] && continue
-    for c in $(pgrep -P "$p"); do kill -INT "$c" 2>/dev/null; done
-    kill -INT "$p" 2>/dev/null
+    for c in $(pgrep -P "$p"); do kill -INT "$c" 2>/dev/null && echo "signalled child $c" >> "$FAKE_LOG"; done
+    kill -INT "$p" 2>/dev/null && echo "signalled filter $p" >> "$FAKE_LOG"
   done
   /bin/sleep 1
   printf 'claude after the interrupt\n'
@@ -859,6 +1064,18 @@ WT="$(spike_worktree_add "$REPO" codex-1)"
 CAP="$(spike_capture_dir codex)"
 CAP="${CAP%/}"
 printf '%s\n' "$WT" > "$CAP/worktree.txt"
+# like the real codex/run.sh (and claude/run.sh): the scratch run dir of this run
+case "${FAKE_CODEX_RUNDIR:-ok}" in
+  ok) printf '%s\n' "$(dirname "$REPO")" > "$CAP/rundir.path" ;;
+  none) ;;
+  other)
+    # a complete, fresh scratch run dir that is NOT the one the worktree path names
+    VREPO="$(spike_scratch_repo)"
+    printf '%s\n' "$(dirname "$VREPO")" > "$CAP/rundir.path"
+    printf 'victim %s\n' "$(dirname "$VREPO")" >> "$FAKE_LOG"
+    printf 'keep\n' > "$(dirname "$VREPO")/sentinel"
+    ;;
+esac
 cp "$FAKE_CODEX_RAW" "$CAP/raw.jsonl"
 case "${FAKE_CODEX_HELLO:-ok}" in
   ok) printf 'hello from codex\n' > "$WT/hello.txt" ;;
@@ -872,11 +1089,15 @@ if [ "${FAKE_CODEX_FORGE:-}" = "old" ]; then
   touch -t 200001010000 "$(dirname "$VREPO")"
   printf 'victim %s\n' "$VWT" >> "$FAKE_LOG"
   printf '%s\n' "$VWT" > "$CAP/worktree.txt"
+  # a fully consistent forgery except for its age: rundir.path names the old run dir too, so only the freshness check can refuse it
+  printf '%s\n' "$(dirname "$VREPO")" > "$CAP/rundir.path"
 fi
 if [ "${FAKE_CODEX_FORGE:-}" = "claude" ]; then
   # the other CLI's worktree path
   CW="$(cat "$SPIKE_CAPTURES_ROOT"/claude/*/worktree.path)"
   printf '%s\n' "$CW" > "$CAP/worktree.txt"
+  # consistent with it (the claude run dir), so only the <cli>-1 shape check can refuse it
+  cp "$SPIKE_CAPTURES_ROOT"/claude/*/rundir.path "$CAP/rundir.path"
 fi
 if [ "${FAKE_CODEX_FORGE:-}" = "slash" ]; then
   # a complete, fresh scratch repo and worktree whose run dir has TWO path segments (run-a/bcdefgT123456Z-abcdef) that a case
@@ -892,6 +1113,8 @@ if [ "${FAKE_CODEX_FORGE:-}" = "slash" ]; then
   printf 'keep\n' > "$V/repo-wt/codex-1/sentinel"
   printf 'victim %s\n' "$V/repo-wt/codex-1" >> "$FAKE_LOG"
   printf '%s\n' "$V/repo-wt/codex-1" > "$CAP/worktree.txt"
+  # consistent with it, so only the one-segment check of the run dir name can refuse it
+  printf '%s\n' "$V" > "$CAP/rundir.path"
 fi
 if [ "${FAKE_CODEX_REPOLINK:-}" = "1" ]; then
   # the "CLI" redirects <run>/repo to ANOTHER scratch repo that has an allowlisted config and a worktrees/codex-1 entry whose worktree
@@ -1237,6 +1460,7 @@ check "N1: the other directory was not touched" test "$(ls -A "$SB/tmp/other" | 
 mk_fast
 rc="$(run_sb "$SB/$FASTP" "FAKE_CLAUDE_CTRLC=1" --)"
 eq "N2: Ctrl-C during the claude run: exit 130" "130" "$rc"
+if [ "$(logcount 'signalled filter')" -ge 1 ]; then ok; else bad "N2: at least one output-filter pid was signalled (pgrep missing or no filter process found: the test would prove nothing)"; fi
 eq "N2: the run script's EXIT trap ran (the filter did not die and close the pipe under it)" "1" "$(logcount 'claude exit-trap')"
 has "N2: the EXIT trap output reached the screen (the filter was still alive to show it)" "$(cat "$SB/out")" "claude exit-trap"
 has "N2: the output written after the interrupt was still shown" "$(cat "$SB/out")" 'claude after the interrupt'
@@ -1275,6 +1499,88 @@ check "N5: nothing in the other repo changed (git worktree list and file listing
 check "N5: the other repo still has its worktrees/codex-1 entry" test -d "$OREPO/.git/worktrees/codex-1"
 expect "N5: the codex row is FAIL with exactly the fixed reason" "$(cat "$(root_of)/run-both.json")" '.rows[1].verdict == "FAIL" and .rows[1].reasons == ["scratch repo config changed"]'
 has "N5: the leftover is reported (no cleanup through the redirect)" "$(cat "$SB/err")" 'codex: scratch run dir NOT removed'
+
+# O. round 4 (Codex findings), whole flow
+# O1. run-both.json cannot be written (a directory sits at that path): no PASS, one fixed message, exit 1, scratch cleaned
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "FAKE_RJSON_DIR=1" --)"
+eq "O1: an unwritable run-both.json: exit 1" "1" "$rc"
+check "O1: the fake really made a directory at the path" test -d "$(root_of)/run-both.json"
+has "O1: the fixed message is printed" "$(cat "$SB/err")" 'could not write run-both.json; the result is not recorded'
+lacks "O1: no PASS summary line" "$(cat "$SB/out" "$SB/err")" 'run-both: PASS'
+eq "O1: no PASS at all (the table was not printed)" "0" "$(cat "$SB/out" "$SB/err" | grep -c 'PASS')"
+lacks "O1: the table was not printed" "$(cat "$SB/out")" '== run-both result =='
+eq "O1: scratch cleanup ran" "0" "$(scratch_left)"
+eq "O1: the same message once" "1" "$(grep -c 'could not write run-both.json' "$SB/err")"
+# the same flow with --keep: still exit 1 and no PASS, and the scratch dirs are kept (cleanup_scratch honours --keep)
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "FAKE_RJSON_DIR=1" -- --keep)"
+eq "O1: --keep and an unwritable run-both.json: exit 1" "1" "$rc"
+eq "O1: --keep: no PASS" "0" "$(cat "$SB/out" "$SB/err" | grep -c 'PASS')"
+eq "O1: --keep: the scratch dirs are kept" "2" "$(scratch_left)"
+
+# O2. git status fails (a corrupt worktree index): the row keeps its verdict, the changed files say so, exit 0 when both PASS
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "FAKE_META=badindex" --)"
+JO="$(cat "$(root_of)/run-both.json" 2>/dev/null)"
+eq "O2: a corrupt index does not change the exit status: 0" "0" "$rc"
+expect "O2: the claude row is still PASS" "$JO" '.rows[0].verdict == "PASS" and .rows[0].reasons == []'
+expect "O2: the claude changed files say git status failed" "$JO" '.rows[0].changed == ["(not listed: git status failed)"]'
+expect "O2: the codex row is unaffected" "$JO" '.rows[1].verdict == "PASS" and .rows[1].changed == ["hello.txt"]'
+has "O2: the failure is reported on stderr" "$(cat "$SB/err")" 'claude: git status failed'
+has "O2: the table shows the fixed text" "$(cat "$SB/out")" '(not listed: git status failed)'
+
+# O3. a git metadata file or directory of the scratch repo replaced by a symlink (to a file in a fake CLI home) or a hard link:
+# no git runs, the row is FAIL with the existing fixed reason, the canary text is never printed
+meta_flow() { # meta_flow <FAKE_META value>
+  mk_fast
+  mkdir -p "$SB/home/$DENY_NAME"
+  printf '%s\n' "$CANARY" > "$SB/home/$DENY_NAME/canary.txt"
+  rc="$(run_sb "$SB/$FASTP" "FAKE_META=$1 FAKE_CANARY_FILE=$SB/home/$DENY_NAME/canary.txt" --)"
+  HJ="$(cat "$(root_of)/run-both.json" 2>/dev/null)"
+  eq "O3 $1: exit 1" "1" "$rc"
+  expect "O3 $1: the claude row is FAIL with exactly the fixed reason" "$HJ" '.rows[0].verdict == "FAIL" and .rows[0].reasons == ["scratch repo config changed"]'
+  expect "O3 $1: changed files show the fixed not-listed text" "$HJ" '.rows[0].changed == ["(not listed: repo config changed)"]'
+  expect "O3 $1: the codex row is unaffected" "$HJ" '.rows[1].verdict == "PASS" and .rows[1].changed == ["hello.txt"]'
+  eq "O3 $1: the canary text is never printed or stored" "0" "$(cat "$SB/out" "$SB/err" "$(root_of)/run-both.json" | grep -c "$CANARY")"
+  has "O3 $1: the leftover is reported (no cleanup through the repo)" "$(cat "$SB/err")" 'claude: scratch run dir NOT removed'
+  eq "O3 $1: the claude scratch dir is left, the codex one removed" "1" "$(scratch_left)"
+}
+meta_flow index-link
+meta_flow index-hard
+meta_flow head-link
+meta_flow commonhead-link
+meta_flow exclude-link
+meta_flow packed-link
+meta_flow ref-link
+meta_flow refs-dirlink
+meta_flow logs-dirlink
+meta_flow info-dirlink
+meta_flow gitdir-link
+
+# O4. codex rundir.path is required, as for claude
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "FAKE_CODEX_RUNDIR=none" --)"
+JO="$(cat "$(root_of)/run-both.json" 2>/dev/null)"
+eq "O4: a codex capture without rundir.path: exit 1" "1" "$rc"
+expect "O4: the codex row is FAIL and hello.txt was not read (the run dir was not bound), claude PASS" "$JO" '.rows[0].verdict == "PASS" and .rows[1].verdict == "FAIL" and .rows[1].hello_ok == false'
+has "O4: the refusal is reported" "$(cat "$SB/err")" 'codex: the worktree path file is missing or was refused'
+has "O4: the leftover is reported" "$(cat "$SB/err")" 'codex: scratch run dir NOT removed'
+eq "O4: the codex run dir is not removed (only the claude one is)" "1" "$(scratch_left)"
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "FAKE_CODEX_RUNDIR=other" --)"
+JO="$(cat "$(root_of)/run-both.json" 2>/dev/null)"
+VICT="$(grep '^victim ' "$SB/log" | cut -d' ' -f2)"
+eq "O4: a codex rundir.path naming another run dir: exit 1" "1" "$rc"
+expect "O4: the codex row is FAIL (nothing read from the unbound run dir), claude PASS" "$JO" '.rows[0].verdict == "PASS" and .rows[1].verdict == "FAIL" and .rows[1].hello_ok == false'
+check "O4: the other run dir (a complete scratch repo) was not deleted" test -f "$VICT/sentinel"
+has "O4: the leftover is reported" "$(cat "$SB/err")" 'codex: scratch run dir NOT removed'
+eq "O4: the real codex run dir and the other one are both left" "2" "$(scratch_left)"
+# control: the default fake writes rundir.path for codex like the real run script, and the flow passes (scenario A)
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "" --)"
+eq "O4 control: a codex capture with a matching rundir.path: exit 0" "0" "$rc"
+check "O4 control: the fake codex wrote rundir.path" test -s "$(root_of)"/codex/*/rundir.path
 
 # ---- the live gate in the real library is still intact (the sandbox override is only in the sandbox copy) -----------------------
 check "the real lib/common.sh was not changed by the sandbox override" test "$(grep -c 'spike_require_live() { :; }' "$SPIKE/lib/common.sh")" = "0"

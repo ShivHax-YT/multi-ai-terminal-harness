@@ -189,11 +189,22 @@ wt_path_ok() {
   return 0
 }
 
+# meta_file_ok <file>: 0 if the file does not exist at all (an optional git metadata file), else safe_input (a regular file, no symlink,
+# one link, outside every CLI home; rule 4).
+meta_file_ok() {
+  if [ ! -e "$1" ] && [ ! -L "$1" ]; then return 0; fi
+  safe_input "$1"
+}
+
 # scratch_repo_ok <git> <worktree>: no git command runs on the scratch repo, only `config --file` on its config files. 0 = the layout is the
 # one the run scripts create (<run>/repo/.git and <run>/repo/.git/worktrees/<name>) and is pinned: <run>/repo is not a symlink, the
 # physical path of the common git dir is exactly <run>/repo/.git (so no component above it redirects elsewhere), the worktree's
-# commondir file is a safe regular file holding exactly ../.., and every config file git would read (the repo config, and
-# config.worktree if present) passes the allowlist; 2 = the path is not a scratch worktree path; 3 = a config file or the layout
+# commondir file is a safe regular file holding exactly ../.., every config file git would read (the repo config, and
+# config.worktree if present) passes the allowlist, and every other metadata FILE that `git status` opens passes safe_input when it
+# exists (common dir: HEAD, packed-refs, info/exclude, info/attributes, info/sparse-checkout, shallow, objects/info/alternates and
+# the loose ref refs/heads/spike/<name>; worktree gitdir: HEAD (required), index, gitdir) while refs, refs/heads, refs/heads/spike,
+# logs, info, objects and objects/info must not be symlinks (rule 4: git must not open a CLI-home file through the repo); a missing
+# optional file is fine; 2 = the path is not a scratch worktree path; 3 = a config file, a metadata file or the layout
 # changed. Sets SG_COMMON and SG_GD (the pinned git dirs) for the caller; the worktree's own .git file is never read.
 scratch_repo_ok() {
   local g="$1" wt="$2" rest repo phys got
@@ -220,19 +231,32 @@ scratch_repo_ok() {
   got="$(cat -- "$SG_GD/commondir" 2>/dev/null; printf x)"
   got="${got%x}"
   [ "$got" = "../.." ] || [ "$got" = "../.."$'\n' ] || return 3
+  # The rest of what `git status` opens. No loop: one explicit chain each (the file has no loop at all, rule 1).
+  if [ -L "$SG_COMMON/refs" ] || [ -L "$SG_COMMON/refs/heads" ] || [ -L "$SG_COMMON/refs/heads/spike" ] || [ -L "$SG_COMMON/logs" ] ||
+    [ -L "$SG_COMMON/info" ] || [ -L "$SG_COMMON/objects" ] || [ -L "$SG_COMMON/objects/info" ]; then
+    return 3
+  fi
+  safe_input "$SG_GD/HEAD" || return 3
+  meta_file_ok "$SG_GD/index" && meta_file_ok "$SG_GD/gitdir" && meta_file_ok "$SG_COMMON/HEAD" && meta_file_ok "$SG_COMMON/packed-refs" &&
+    meta_file_ok "$SG_COMMON/info/exclude" && meta_file_ok "$SG_COMMON/info/attributes" && meta_file_ok "$SG_COMMON/info/sparse-checkout" &&
+    meta_file_ok "$SG_COMMON/shallow" && meta_file_ok "$SG_COMMON/objects/info/alternates" &&
+    meta_file_ok "$SG_COMMON/refs/heads/spike/${wt##*/}" || return 3
   return 0
 }
 
 # changed_files <worktree>: names from git status --porcelain, printable only, at most 20 lines. The scratch repo's config sits where the
 # CLI could write it, so, before git runs on the repo at all:
 #   - git must be 2.32 or newer, else it prints "(not listed: git too old)" and runs nothing (not a failure by itself);
-#   - scratch_repo_ok must pass. A changed layout or any key outside the allowlist prints "(not listed: repo config changed)", runs
-#     NO git on the repo and returns 3 (the row FAILs with the fixed reason "scratch repo config changed").
+#   - scratch_repo_ok must pass. A changed layout, a refused metadata file or any key outside the allowlist prints
+#     "(not listed: repo config changed)", runs NO git on the repo and returns 3 (the row FAILs with the fixed reason "scratch repo
+#     config changed").
 # Then status runs with a closed environment, the git dirs pinned (the worktree's .git file is not followed), no global or system
 # config, fsmonitor, hooks and untracked cache forced off, and submodules ignored (a submodule would start a second git inside a
-# directory the CLI controls).
+# directory the CLI controls). Git's own exit status is kept: if status fails (a corrupt index, say) it prints
+# "(not listed: git status failed)", none of git's partial output, and returns 4. Status 4 is NOT a verdict input: the changed files are
+# a note for the human, never part of PASS, so the caller only reports it (only status 3 sets a flag).
 changed_files() {
-  local g wt="$1" rc
+  local g wt="$1" rc raw gst
   g="$(spike_tool_path git)" || { printf '(not listed: git unavailable)\n'; return 0; }
   git_new_enough "$g" || { printf '(not listed: git too old)\n'; return 0; }
   scratch_repo_ok "$g" "$wt"
@@ -245,11 +269,20 @@ changed_files() {
     printf '(not listed: repo config changed)\n'
     return 3
   fi
-  env -i PATH=/usr/bin:/bin HOME=/nonexistent LC_ALL=C GIT_OPTIONAL_LOCKS=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
+  # The whole output is read first (a pipe closed early by `head` could make git die of SIGPIPE and look like a failure); git's exit
+  # status is appended after it as a marker.
+  raw="$(env -i PATH=/usr/bin:/bin HOME=/nonexistent LC_ALL=C GIT_OPTIONAL_LOCKS=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
     GIT_DIR="$SG_GD" GIT_COMMON_DIR="$SG_COMMON" GIT_WORK_TREE="$wt" \
     GIT_CONFIG_COUNT=3 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false \
     GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null GIT_CONFIG_KEY_2=core.untrackedCache GIT_CONFIG_VALUE_2=false \
-    "$g" -C "$wt" status --porcelain --ignore-submodules=all 2>/dev/null | cut -c4- | printable | head -n 20
+    "$g" -C "$wt" status --porcelain --ignore-submodules=all 2>/dev/null; printf 'rc=%s' "$?")"
+  gst="${raw##*rc=}"
+  raw="${raw%rc=*}"
+  if [ "$gst" != "0" ]; then
+    printf '(not listed: git status failed)\n'
+    return 4
+  fi
+  printf '%s' "$raw" | cut -c4- | printable | head -n 20
   return 0
 }
 
@@ -321,7 +354,7 @@ valid_row() {
   fi
 }
 
-# table <run-both.json>: one printable table (one row per CLI), then the notes.
+# table <run-both.json>: one printable table (one row per CLI), then the notes. Returns jq's own exit status (not the filter's).
 table() {
   "$JQ" -r '
     def pad($n): tostring | . + ([range(0; $n - length)] | map(" ") | add // "");
@@ -339,6 +372,7 @@ table() {
       ( $rows[] | . as $row | ($row | cols) | map(.[1] as $w | (.[2] | tostring) | pad($w)) | join(" | ") ),
       ( $rows[] | select(.needs_mapping) | "note: \(.provider) has \(.unknown) unknown event(s): needs mapping (T-004)" ),
       ( $rows[] | select(.verdict == "FAIL") | "note: \(.provider) FAIL: \(.reasons | join("; "))" )' "$1" | printable
+  return "${PIPESTATUS[0]}"
 }
 
 # ---- end functions ------------------------------------------------------------------------------------------------------------
@@ -355,7 +389,8 @@ cap_of() { # cap_of <cli>: print the one capture dir under $ROOT/<cli>/, else re
 #     run dir name is one path segment (a ? in the pattern would also match a slash);
 #   - the run dir is a real directory (no symlink) that is not older than this run's preflight.txt, so a leftover from an
 #     earlier run, or any other directory, is refused;
-#   - for claude, whose capture also holds rundir.path, that file must name the same run dir (codex writes no such file).
+#   - the capture's rundir.path (both run scripts write it) must be a safe file naming exactly the same run dir; a capture without it,
+#     or one naming another run dir, is refused.
 run_dir_of() {
   local cap wt run sroot rd name
   cap="$(cap_of "$1")" || return 1
@@ -373,10 +408,8 @@ run_dir_of() {
   esac
   [ -d "$run" ] && [ ! -L "$run" ] || return 1
   [ ! "$ROOT/preflight.txt" -nt "$run" ] || return 1
-  if [ "$1" = "claude" ]; then
-    rd="$(read_wt "$cap/rundir.path")" || return 1
-    [ "$rd" = "$run" ] || return 1
-  fi
+  rd="$(read_wt "$cap/rundir.path")" || return 1
+  [ "$rd" = "$run" ] || return 1
   printf '%s\n' "$run"
 }
 
@@ -453,6 +486,8 @@ process_cli() {
         if [ "$crc" -eq 3 ]; then
           flags="$flags cfg"
           spike_err "$cli: scratch repo config changed; no git command was run on that repo"
+        elif [ "$crc" -eq 4 ]; then
+          spike_err "$cli: git status failed; the changed files are not listed (this does not change the verdict)"
         fi
       else
         flags="$flags wt"
@@ -516,9 +551,18 @@ if [ -z "$ROWS" ]; then
   cleanup_scratch
   exit 1
 fi
-"$JQ" -n --argjson rows "$ROWS" '{rows: $rows}' > "$ROOT/run-both.json"
+# The write and the table are checked: a result that was not recorded or not printed is never reported as PASS.
+if ! ( "$JQ" -n --argjson rows "$ROWS" '{rows: $rows}' > "$ROOT/run-both.json" ) 2>/dev/null; then
+  spike_err "could not write run-both.json; the result is not recorded"
+  cleanup_scratch
+  exit 1
+fi
 printf '\n== run-both result ==\n'
-table "$ROOT/run-both.json"
+if ! table "$ROOT/run-both.json"; then
+  spike_err "could not print the result table from run-both.json"
+  cleanup_scratch
+  exit 1
+fi
 printf 'captures (gitignored; redact before committing anything): %s\n' "$ROOT"
 
 cleanup_scratch
