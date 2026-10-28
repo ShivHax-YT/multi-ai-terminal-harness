@@ -160,14 +160,14 @@ No limit was provoked (rules 1, 2, 10). Record only what appeared on its own.
 - [x] Both CLIs finished the scripted task and returned parsed, normalized results (`run-both.sh` printed PASS for both, section 3).
 - [ ] The compliance CI fails on a planted violation of each check: `make compliance-selftest` result: MAKE_CHECK_SELFTEST
 - [ ] `make check` passes on the Mac: result: MAKE_CHECK_RESULT
-- [ ] A redacted `observed.jsonl` per CLI was committed (T-002 and T-003 handoff steps; scrubbed, redacted, read by the human) and `/bin/bash spike/tests/test_normalize.sh` is green with them. Status: both files built (`scrub-init.jq` + `spike_redact` for Claude; `observed.redacted.jsonl` for Codex), 0 `@` and 0 home paths, read by the lead, `test_normalize.sh` green (803 passed). **Waiting for the human to read both files.**
+- [x] A redacted `observed.jsonl` per CLI was committed (T-002 and T-003 handoff steps; scrubbed, redacted, read by the human) and `/bin/bash spike/tests/test_normalize.sh` is green with them. Status: both files built (`scrub-init.jq` + `spike_redact` for Claude; `observed.redacted.jsonl` for Codex), 0 `@` and 0 home paths, read by the lead and by the human (2026-10-28), committed with their goldens; `test_normalize.sh` green (803 passed).
 - [x] Stack decision recorded (`docs/adr/0001-stack.md`, accepted 2026-10-25), plan and handoff formats written, adapter interface written (T-004, merged into T-007).
 
 ## 11. Follow-ups
 
 | # | What | Owner | File |
 |---|---|---|---|
-| 1 | The human reads `spike/fixtures/claude/observed.jsonl` and `spike/fixtures/codex/observed.jsonl` before T-007 merges | human | those two files |
+| 1 | Done 2026-10-28: the human read both observed fixtures; committed | human | `spike/fixtures/{claude,codex}/observed.jsonl` |
 | 2 | Confirm the pinned team ids against the vendors' published values before release | human | `spike/lib/runner.pl` |
 | 3 | A fresh T-003 resume run to confirm the two-line `hello.txt` (section 6) | human, optional | `spike/codex/resume.sh` |
 | 4 | Round the cost column in the table (cosmetic) | later lib task | `spike/run-both.sh` |

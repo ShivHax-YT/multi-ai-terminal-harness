@@ -1,0 +1,8 @@
+{"type":"session_started","provider":"codex","seq":1,"ts":null,"raw":"thread.started","session_id":"<ID-1>"}
+{"type":"warning","provider":"codex","seq":2,"ts":null,"raw":"item.completed:error","kind":"item_error","message":"`[features].codex_hooks` is deprecated. Use `[features].hooks` instead. (Enable it with `--enable hooks` or `[features].hooks` in config.toml. See https://developers.openai.com/codex/config-basic#feature-flags for details.)"}
+{"type":"warning","provider":"codex","seq":3,"ts":null,"raw":"item.completed:error","kind":"item_error","message":"Under-development features enabled: chronicle. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in $HOME/..."}
+{"type":"message","provider":"codex","seq":5,"ts":null,"raw":"item.completed:agent_message","role":"assistant","text":"I’ll create hello.txt with the exact line.\n","truncated":false}
+{"type":"tool_call","provider":"codex","seq":6,"ts":null,"raw":"item.started:command_execution","id":"item_3","name":"command_execution"}
+{"type":"tool_result","provider":"codex","seq":7,"ts":null,"raw":"item.completed:command_execution","id":"item_3","is_error":false}
+{"type":"message","provider":"codex","seq":8,"ts":null,"raw":"item.completed:agent_message","role":"assistant","text":"DONE","truncated":false}
+{"type":"result","provider":"codex","seq":9,"ts":null,"raw":"turn.completed","is_error":false,"turns":1,"turns_known":true,"tokens":{"input":48690,"output":60,"cache_read":37376,"cache_write":0,"reasoning":0},"tokens_known":true,"cost_usd":null,"cost_is_estimate":true}
