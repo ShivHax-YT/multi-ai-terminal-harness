@@ -21,7 +21,7 @@ def mapped_keys: [
   "result/*"
 ];
 def ignored_keys: [
-  "system/status", "system/thinking_tokens",
+  "system/status", "system/thinking_tokens", "system/commands_changed",
   "assistant:thinking", "assistant:redacted_thinking",
   "user:text",
   "assistant.message.usage"

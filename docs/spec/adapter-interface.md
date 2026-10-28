@@ -268,13 +268,16 @@ Ignored (no event, no `unknown`):
 <!-- ignored:claude:start -->
 - `system/status`
 - `system/thinking_tokens`
+- `system/commands_changed`
 - `assistant:thinking`
 - `assistant:redacted_thinking`
 - `user:text`
 - `assistant.message.usage`
 <!-- ignored:claude:end -->
 
-`system/thinking_tokens` is observed; the others are from docs. `assistant.message.usage` is a field, not an event: the per-message
+`system/thinking_tokens` and `system/commands_changed` are observed (the latter in the 2026-10-28 run-both live run: the whole
+slash-command list, personal entries included, so `spike/claude/scrub-init.jq` scrubs it before a capture becomes a fixture); the
+others are from docs. `assistant.message.usage` is a field, not an event: the per-message
 usage is skipped because the `result` has the totals.
 
 ## Mapping, Codex (`codex exec --json`)

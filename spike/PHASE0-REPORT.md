@@ -1,4 +1,4 @@
-# Phase 0 report (template, T-007)
+# Phase 0 report (T-007, filled 2026-10-28 from the human's live run)
 
 > **How this is used.** The human runs `spike/run-both.sh` once on the Mac (the live opt-in is set by the human, never by an
 > agent; see `spike/README.md`) and sends the output to the lead. The lead fills the blanks below from that output and from the
@@ -11,39 +11,42 @@
 
 | Item | Value |
 |---|---|
-| Date (UTC) | |
-| macOS version | |
-| bash version (`/bin/bash --version`, expected 3.2) | |
-| `jq` version | |
-| Repo commit (`git rev-parse --short HEAD`) | |
-| Capture root printed by the run (`spike/captures/run-both/<stamp>`) | |
-| Command | `spike/run-both.sh` with the live opt-in set by the human; `--keep` used: yes / no |
-| Exit status of `run-both.sh` | |
-| Preflight output stored in `preflight.txt`: reviewed | yes / no |
+| Date (UTC) | 2026-10-28 02:54 (capture stamp `20261028T025406Z`) |
+| macOS version | 27.0.1 |
+| bash version (`/bin/bash --version`, expected 3.2) | 3.2.57(1)-release (arm64-apple-darwin26) |
+| `jq` version | jq-1.7.1-apple (`/usr/bin/jq`); git 2.55.0 |
+| Repo commit (`git rev-parse --short HEAD`) | `273bd9d` (branch T-007, round 4c, before merge) |
+| Capture root printed by the run (`spike/captures/run-both/<stamp>`) | `spike/captures/run-both/20261028T025406Z` |
+| Command | `spike/run-both.sh` with the live opt-in set by the human; `--keep` used: no |
+| Exit status of `run-both.sh` | 0 (`run-both: PASS (both CLIs)`) |
+| Preflight output stored in `preflight.txt`: reviewed | yes (lead) |
 
 ## 2. Per CLI
 
 | Item | Claude Code | Codex |
 |---|---|---|
-| Version (`--version`) | confirm: Claude Code native install; version as printed by preflight: ______ | known 2026-10-26, confirm: codex-cli 0.162.0 |
-| `--max-turns 5` honoured (Claude only; see the comment in `spike/claude/run.sh`: the flag is documented but hidden from `--help`) | confirm: the run stopped within 5 turns (the `turns` column of section 3 is 5 or less): yes / no | not applicable |
-| Install method | known 2026-10-26, confirm: native installer binary passes; the npm-installed `claude` is refused by preflight (launcher script) | |
-| Code signature result (preflight SIGNATURE column) | | |
-| Signer and team id (as printed) | | |
-| Sign-in check (exit code only; output never stored) | | |
-| `run.sh` exit status | | |
+| Version (`--version`) | 2.1.310 (Claude Code), native install | codex-cli 0.162.0 (confirmed) |
+| `--max-turns 5` honoured (Claude only; see the comment in `spike/claude/run.sh`: the flag is documented but hidden from `--help`) | yes: the run took 2 turns | not applicable |
+| Install method | native installer binary (Mach-O, in the installer's versions directory); passes preflight (confirmed) | standalone release package (Mach-O, in the CLI's own packages directory, path as printed by preflight) |
+| Code signature result (preflight SIGNATURE column) | valid | valid |
+| Signer and team id (as printed) | Developer ID Application: Anthropic PBC; team Q6L2SF6YDW | Developer ID Application: OpenAI OpCo, LLC; team 2DC432GLL2 |
+| Sign-in check (exit code only; output never stored) | signed in (exit 0) | signed in (exit 0) |
+| `run.sh` exit status | 0 | 0 |
 
 The pinned team ids in `spike/lib/runner.pl` are still to be confirmed against vendor-published values before release
-(`spike/README.md`). Record here whether the printed team ids match the pins: yes / no.
+(`spike/README.md`). The printed team ids match the pins: yes (Q6L2SF6YDW, 2DC432GLL2). Confirming the pins against the
+vendors' published values is still open (section 11).
 
 ## 3. run-both rows
 
-Paste the printed table. The same rows are in `run-both.json` under the capture root.
+The printed table (session ids cut by the script). The same rows are in `run-both.json` under the capture root.
 
 ```
-provider | exit | session | turns | in | out | cache_r | cache_w | cost~ | warn | rl | unk | changed | hello | verdict
-<claude row>
-<codex row>
+provider | exit | session  | turns | in      | out     | cache_r | cache_w | cost~    | warn | rl  | unk | changed                  | hello | verdict
+---------+------+----------+-------+---------+---------+---------+---------+----------+------+-----+-----+--------------------------+-------+--------
+claude   | 0    | b98e...  | 2     | 4       | 234     | 31726   | 12889   | 0.0030124600000000007 | 0    | 0   | 2   | hello.txt                | yes   | PASS
+codex    | 0    | 01a1...  | 1     | 48690   | 60      | 37376   | 0       | -        | 2    | 0   | 0   | hello.txt                | yes   | PASS
+note: claude has 2 unknown event(s): needs mapping (T-004)
 ```
 
 PASS rule: run.sh exit 0, exactly one `session_started`, exactly one `result` with `is_error` false and numeric tokens, 0
@@ -52,11 +55,11 @@ The cost column is an estimate from the CLI's own number, never a bill.
 
 | | Claude Code | Codex |
 |---|---|---|
-| Verdict | | |
-| Turns (Codex: 1 per `exec` call by T-004 decision) | | |
-| Tokens in / out / cache read / cache write | | |
-| Changed files in the worktree | | |
-| Notes (reasons printed under the table) | | |
+| Verdict | PASS | PASS |
+| Turns (Codex: 1 per `exec` call by T-004 decision) | 2 | 1 |
+| Tokens in / out / cache read / cache write | 4 / 234 / 31726 / 12889 | 48690 / 60 / 37376 / 0 |
+| Changed files in the worktree | `hello.txt` | `hello.txt` |
+| Notes (reasons printed under the table) | 2 unknown events, both `system/commands_changed` (now ignored, section 4) | 2 warnings: config notices from the user's own Codex config (section 5) |
 
 ## 4. Event types seen versus `spike/claude/EVENTS.md` and `spike/codex/EVENTS.md`
 
@@ -65,18 +68,26 @@ For each type in the normalized output (`<cli>.normalized.jsonl`) and each raw t
 
 | CLI | Raw type | Status | Normalized as | Action |
 |---|---|---|---|---|
-| Claude | `system/init` | | `session_started` | |
-| Claude | `rate_limit_event` | known 2026-10-26, confirm: routine on a normal run (`allowed` / `allowed_warning`) | `limit_notice` | |
-| Claude | `result/success` | | `result` | |
-| Claude | (add rows) | | | |
-| Codex | `thread.started` | known 2026-10-26, confirm: observed | `session_started` | |
-| Codex | `turn.completed` | known 2026-10-26, confirm: observed, usage has all five numbers | `result` | |
-| Codex | `item.completed:command_execution` | known 2026-10-26, confirm: observed | `tool_call` + `tool_result` | |
-| Codex | `item.completed:error` | known 2026-10-26, confirm: observed as config warnings in a completed run | `warning` | |
-| Codex | (add rows) | | | |
+| Claude | `system/init` | observed | `session_started` | none |
+| Claude | `rate_limit_event` | observed, routine (`status: allowed`; `rateLimitType: overage`) | `limit_notice` | none |
+| Claude | `result/success` | observed (`num_turns` 2, `is_error` false) | `result` | none |
+| Claude | `assistant:tool_use` | observed (one `Write` of `hello.txt`) | `tool_call` | none |
+| Claude | `user:tool_result` | observed | `tool_result` | none |
+| Claude | `assistant:text` | observed (`DONE`) | `message` | none |
+| Claude | `assistant:thinking` | observed (empty text plus an opaque signature) | ignored | none |
+| Claude | `system/thinking_tokens` | observed twice (`estimated_tokens`, `estimated_tokens_delta`) | ignored | none |
+| Claude | `system/commands_changed` | **was "from docs"; observed twice** (the whole slash-command list, 65 entries, about 23 KB each) | was `unknown`; now ignored | done 2026-10-28: added to `claude.jq` ignored keys, the spec's ignored list and EVENTS.md; `scrub-init.jq` now redacts its `commands` (personal configuration) |
+| Codex | `thread.started` | observed (confirmed) | `session_started` | none |
+| Codex | `turn.started` | observed | ignored | none |
+| Codex | `turn.completed` | observed (confirmed); usage has all five numbers (`input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`) | `result` | none |
+| Codex | `item.started:command_execution` | observed | none (the completed item carries the call) | none |
+| Codex | `item.completed:command_execution` | observed (confirmed): `/bin/zsh -lc "printf 'hello from codex\\n' > hello.txt"`, exit 0 | `tool_call` + `tool_result` | note for T-122 (login shell, section 9) |
+| Codex | `item.completed:agent_message` | observed twice | `message` | none |
+| Codex | `item.completed:error` | observed twice (confirmed): config warnings in a completed run | `warning` | none |
 
-Unknown events (count from the table, list the raw types): ______. Each needs a row in EVENTS.md and a mapping or an
-ignore entry in `docs/spec/adapter-interface.md` and the matching `spike/normalize/<cli>.jq` (T-004), together.
+Unknown events (count from the table, list the raw types): 2, both Claude `system/commands_changed`. Mapped as ignored, with
+the spec, `claude.jq` and EVENTS.md changed together; `spike/tests/test_normalize.sh` now runs over both observed captures with
+0 unknown and byte-exact goldens (`spike/normalize/expected/{claude,codex}-observed.jsonl`).
 
 ## 5. Rate-limit shapes: observed versus documented
 
@@ -84,58 +95,86 @@ No limit was provoked (rules 1, 2, 10). Record only what appeared on its own.
 
 | Shape | Documented | Observed in this run |
 |---|---|---|
-| Claude `rate_limit_event` with `allowed` / `allowed_warning` | yes | known 2026-10-26, confirm: routine on a normal run, mapped to `limit_notice` |
-| Claude `rate_limit_event` with `rejected` | yes | none expected |
-| Claude `system/api_retry` | yes | |
-| Codex `error` / `turn.failed` carrying limit wording | text heuristic only (no SDK limit event) | none expected |
-| Codex `item.completed:error` items | not a limit | known 2026-10-26, confirm: config warnings (deprecated key, under-development feature) inside a run that still completed; mapped to `warning` |
-| `rate_limited` count in the table | | |
+| Claude `rate_limit_event` with `allowed` / `allowed_warning` | yes | observed (confirmed): `allowed`, routine, mapped to `limit_notice`; this one also carried `rateLimitType: overage`, `overageStatus: allowed`, `overageInUse: true`, `isUsingOverage: false` |
+| Claude `rate_limit_event` with `rejected` | yes | none |
+| Claude `system/api_retry` | yes | none |
+| Codex `error` / `turn.failed` carrying limit wording | text heuristic only (no SDK limit event) | none |
+| Codex `item.completed:error` items | not a limit | observed (confirmed): two config warnings (a deprecated `[features]` key; an under-development feature enabled) inside a run that completed; mapped to `warning` |
+| `rate_limited` count in the table | | 0 and 0 |
 
 ## 6. Resume results (from T-002 and T-003; this script does not resume)
 
 | CLI | Result | Source |
 |---|---|---|
-| Claude | known 2026-10-26, confirm: the session id was reused by `--resume` | T-002 `resume.sh` live run |
-| Codex | known 2026-10-26, confirm: the thread id was kept on `exec resume` | T-003 `resume.sh` live run |
-| Codex | T-003 resume check, to confirm by a fresh T-003 run: after `spike/codex/resume.sh`, `hello.txt` has line 1 `hello from codex` and line 2 `resumed`. Not part of the run-both.sh check, which expects exactly one line. | T-003 `resume.sh` |
+| Claude | known 2026-10-26, confirm: the session id was reused by `--resume` | T-002 `resume.sh` live run (not re-run; run-both never resumes) |
+| Codex | known 2026-10-26, confirm: the thread id was kept on `exec resume` | T-003 `resume.sh` live run (not re-run) |
+| Codex | T-003 resume check, to confirm by a fresh T-003 run: after `spike/codex/resume.sh`, `hello.txt` has line 1 `hello from codex` and line 2 `resumed`. Not part of the run-both.sh check, which expects exactly one line. | T-003 `resume.sh` (still open, section 11) |
 
 ## 7. stderr notes
 
 | CLI | Observation |
 |---|---|
-| Codex | known 2026-10-26, confirm: one stderr line, "Reading additional input from stdin...", even with stdin from `/dev/null` |
-| Claude | |
+| Codex | confirmed: one stderr line, "Reading additional input from stdin...", even with stdin from `/dev/null` (39 bytes) |
+| Claude | empty (0 lines) |
 
 ## 8. Surprises
 
-- known 2026-10-26, confirm: the npm-installed `claude` is a launcher script and is refused by preflight (rule 6); the native installer's binary passes.
-- known 2026-10-26, confirm: the first Codex task wording was ambiguous (the sentence-ending period became part of `hello.txt`); fixed by a wording change, and this run is the fresh Codex run.
+- confirmed: the native `claude` binary passes preflight (the npm launcher-script refusal was not re-tested in this run).
+- confirmed: the reworded Codex task produced a byte-exact one-line `hello.txt` (`printf 'hello from codex\n'`).
+- **Claude `system/commands_changed` carries personal configuration.** It repeats the whole slash-command list, with the name
+  and description of every one of the user's own skills and plugin commands (65 entries, about 23 KB, twice per run). The old
+  `scrub-init.jq` only scrubbed `system/init`, so the first fixture attempt still held that list (found by the `@` check).
+  `scrub-init.jq` now redacts `commands` too, with a count, and `test_claude_parse.sh` checks both the scrub and the committed
+  `observed.jsonl`. Any adapter log in Phase 1 must treat this event the same way (no personal configuration in logs).
+- **The Claude model was not chosen by us.** The run script passes no model, and the CLI used `claude-haiku-5-5` (the user's own
+  default). A role-based app must pass the model explicitly.
+- **Codex runs commands through the user's login shell** (`/bin/zsh -lc ...`), so the user's shell profile runs inside each
+  sandboxed command.
+- **Codex config warnings come from the user's own config** (`[features]` keys) and arrive as `item.completed:error`. They are
+  correctly warnings, not errors.
+- The table's cost column prints the CLI's raw float (`0.0030124600000000007`) and breaks the column alignment. Cosmetic.
+- The human's terminal masked the `captures (gitignored; ...)` line as "key material" because of its long path. Cosmetic.
 - If the `run-both.sh` parent alone gets a TERM (not the process group), it waits for the running child process to finish
   before it reacts. The parent checks for a signal before it starts Codex, so a signal received before that check keeps Codex
   from starting. This is by design for a human-run spike, and the runner (`spike/lib/runner.pl`) is frozen. To stop at once,
-  press Ctrl-C or signal the process group: `kill -TERM -<pgid>`.
-- (add)
+  press Ctrl-C or signal the process group: `kill -TERM -<pgid>`. (Not exercised in this run.)
 
 ## 9. Implications
 
-- **T-004 (adapter interface, normalizers):** unknown raw types to map; any new field; `error` carrying non-fatal notices in Codex; the `thinking_tokens` shape. List here:
-- **T-120 (event types and serde):** nothing in the schema is expected to change unless section 4 has a **new** row. List here:
-- **T-121 (Claude adapter) and T-122 (Codex adapter):** the exact argv used by the two run scripts, the sign-in check by exit code, `loginArgv` words to confirm, install-method handling (launcher script versus native binary). List here:
-- **ADR 0001 impact (`docs/adr/0001-stack.md`):** none / describe. The stack decision depends on both CLIs being drivable through their documented headless interfaces and on their output being parseable; state whether this run supports that.
+- **T-004 (adapter interface, normalizers):** `system/commands_changed` is now an observed, ignored Claude type (done). The
+  `system/thinking_tokens` shape is `{estimated_tokens, estimated_tokens_delta}` (ignored). Codex `turn.completed` usage has a
+  fifth number, `cache_write_input_tokens` (0 here). No other new field.
+- **T-120 (event types and serde):** no change. No **new** normalized type; every raw type mapped to an existing event or ignore.
+- **T-121 (Claude adapter):** argv as in `spike/claude/run.sh` (`-p`, `--output-format stream-json`, `--verbose`,
+  `--permission-mode acceptEdits`, `--max-turns`, honoured). Sign-in by exit code worked. Pass `--model` explicitly per role.
+  Treat `system/commands_changed` (and the `system/init` lists) as personal configuration: never log them unscrubbed.
+- **T-122 (Codex adapter):** argv as in `spike/codex/run.sh` (`exec --json --sandbox workspace-write -C <worktree> <task>`).
+  Sign-in by exit code worked. Expect the stdin notice on stderr and user-config warnings as `warning` events. Commands run via
+  the user's login shell.
+- **ADR 0001 impact (`docs/adr/0001-stack.md`):** none. Both CLIs were driven only through their documented headless
+  interfaces, their output parsed into the normalized events with no screen text, and both runs passed. The run supports the
+  decision.
 
 ## 10. Phase 0 done-when checklist (`docs/BUILD_PLAN.md`)
 
-- [ ] Both CLIs finished the scripted task and returned parsed, normalized results (`run-both.sh` printed PASS for both, section 3).
-- [ ] The compliance CI fails on a planted violation of each check: `make compliance-selftest` result: ______
-- [ ] `make check` passes on the Mac: result: ______
-- [ ] A redacted `observed.jsonl` per CLI was committed (T-002 and T-003 handoff steps; scrubbed, redacted, read by the human) and `/bin/bash spike/tests/test_normalize.sh` is green with them.
-- [ ] Stack decision recorded (`docs/adr/0001-stack.md`), plan and handoff formats written, adapter interface written (T-004).
+- [x] Both CLIs finished the scripted task and returned parsed, normalized results (`run-both.sh` printed PASS for both, section 3).
+- [ ] The compliance CI fails on a planted violation of each check: `make compliance-selftest` result: MAKE_CHECK_SELFTEST
+- [ ] `make check` passes on the Mac: result: MAKE_CHECK_RESULT
+- [ ] A redacted `observed.jsonl` per CLI was committed (T-002 and T-003 handoff steps; scrubbed, redacted, read by the human) and `/bin/bash spike/tests/test_normalize.sh` is green with them. Status: both files built (`scrub-init.jq` + `spike_redact` for Claude; `observed.redacted.jsonl` for Codex), 0 `@` and 0 home paths, read by the lead, `test_normalize.sh` green (803 passed). **Waiting for the human to read both files.**
+- [x] Stack decision recorded (`docs/adr/0001-stack.md`, accepted 2026-10-25), plan and handoff formats written, adapter interface written (T-004, merged into T-007).
 
 ## 11. Follow-ups
 
 | # | What | Owner | File |
 |---|---|---|---|
-| 1 | | | |
+| 1 | The human reads `spike/fixtures/claude/observed.jsonl` and `spike/fixtures/codex/observed.jsonl` before T-007 merges | human | those two files |
+| 2 | Confirm the pinned team ids against the vendors' published values before release | human | `spike/lib/runner.pl` |
+| 3 | A fresh T-003 resume run to confirm the two-line `hello.txt` (section 6) | human, optional | `spike/codex/resume.sh` |
+| 4 | Round the cost column in the table (cosmetic) | later lib task | `spike/run-both.sh` |
+| 5 | Pass the model explicitly; never log `commands_changed` / init lists unscrubbed | T-121 | Claude adapter |
+| 6 | Document the login-shell behaviour and the stdin notice | T-122 | Codex adapter |
+| 7 | `spike_cleanup` closed environment, and the accepted "directory replacement" residual (T-007 handoff) | later lib task | `spike/lib/common.sh` |
+| 8 | Three old scratch run dirs from 2026-10-26 remain under the scratch root; remove with `spike_cleanup <run dir>` | human, optional | scratch root |
 
 ## 12. Sign-off
 
