@@ -97,7 +97,8 @@ JQ="$(spike_tool_path jq)" || { spike_err "a native jq in a system or package-ma
 # printable <stdin>: keep printable characters and newlines only, so a CLI cannot inject terminal escape sequences.
 printable() { LC_ALL=C tr -cd '[:print:]\n'; }
 
-# safe_input <file>: 0 only for a regular file that is not a symlink, has one link and is outside every CLI home (rule 4).
+# safe_input <file>: 0 only for a regular file that is not a symlink and is outside every CLI home (rule 4). The refusal of a hard-linked
+# file (more than one link) comes from spike_under_cli_home, which safe_input calls; it is not tested here separately.
 safe_input() {
   [ -n "${1:-}" ] || return 1
   [ -f "$1" ] && [ ! -L "$1" ] || return 1
@@ -210,7 +211,9 @@ meta_file_ok() {
 #       `ref: refs/heads/spike/<name>` (so HEAD can name no other ref);
 #     - every config file git would read (the repo config, config.worktree if present) passes the allowlist;
 #     - these files pass safe_input when they exist (missing is fine): common dir HEAD, packed-refs, info/exclude, info/attributes,
-#       shallow, objects/info/alternates and the loose ref refs/heads/spike/<name>; worktree git dir index, gitdir, info/sparse-checkout;
+#       shallow, objects/info/alternates, objects/info/http-alternates and the loose ref refs/heads/spike/<name>; worktree git dir index, gitdir, info/sparse-checkout;
+#     - objects/info/alternates and objects/info/http-alternates, if present, are EMPTY (a scratch repo is self-contained; a non-empty one
+#       can name an object store outside the tree the find visits);
 #     - refs, refs/heads, refs/heads/spike, logs, info, objects, objects/info of the common dir, and info of the worktree git dir, are
 #       not symlinks (the tree check already refuses them; kept as a second, cheaper test);
 #   2 = the path is not a scratch worktree path;
@@ -258,10 +261,13 @@ scratch_repo_ok() {
     [ -L "$SG_COMMON/info" ] || [ -L "$SG_COMMON/objects" ] || [ -L "$SG_COMMON/objects/info" ] || [ -L "$SG_GD/info" ]; then
     return 3
   fi
+  # A scratch repo is self-contained: an alternates file naming an object store (possibly outside the tree the find visited) is refused
+  # when it has any content (an empty one is harmless); the same for http-alternates.
+  [ ! -s "$SG_COMMON/objects/info/alternates" ] && [ ! -s "$SG_COMMON/objects/info/http-alternates" ] || return 3
   meta_file_ok "$SG_GD/index" && meta_file_ok "$SG_GD/gitdir" && meta_file_ok "$SG_GD/info/sparse-checkout" &&
     meta_file_ok "$SG_COMMON/HEAD" && meta_file_ok "$SG_COMMON/packed-refs" &&
     meta_file_ok "$SG_COMMON/info/exclude" && meta_file_ok "$SG_COMMON/info/attributes" &&
-    meta_file_ok "$SG_COMMON/shallow" && meta_file_ok "$SG_COMMON/objects/info/alternates" &&
+    meta_file_ok "$SG_COMMON/shallow" && meta_file_ok "$SG_COMMON/objects/info/alternates" && meta_file_ok "$SG_COMMON/objects/info/http-alternates" &&
     meta_file_ok "$SG_COMMON/refs/heads/spike/${wt##*/}" || return 3
   return 0
 }
@@ -274,11 +280,12 @@ scratch_repo_ok() {
 #     config changed").
 # Then status runs with a closed environment, the git dirs pinned (the worktree's .git file is not followed), no global or system
 # config, fsmonitor, hooks and untracked cache forced off, and submodules ignored (a submodule would start a second git inside a
-# directory the CLI controls). Git's own exit status is kept: if status fails (a corrupt index, say) it prints
+# directory the CLI controls). The worktree itself must hold no hard-linked file and no FIFO, socket or device outside .git (checked with
+# find; same "repo config changed" refusal, status 3). Git's own exit status is kept: if status fails (a corrupt index, say) it prints
 # "(not listed: git status failed)", none of git's partial output, and returns 4. Status 4 is NOT a verdict input: the changed files are
 # a note for the human, never part of PASS, so the caller only reports it (only status 3 sets a flag).
 changed_files() {
-  local g wt="$1" rc raw gst
+  local g wt="$1" rc raw gst wtc
   g="$(spike_tool_path git)" || { printf '(not listed: git unavailable)\n'; return 0; }
   git_new_enough "$g" || { printf '(not listed: git too old)\n'; return 0; }
   scratch_repo_ok "$g" "$wt"
@@ -288,6 +295,16 @@ changed_files() {
     return 0
   fi
   if [ "$rc" -ne 0 ]; then
+    printf '(not listed: repo config changed)\n'
+    return 3
+  fi
+  # Git also reads and hashes the files of the worktree itself: a hard link there could be a CLI-home file. No file of the worktree
+  # outside .git may have more than one link, and nothing may be a FIFO, socket or device (symlinks are fine: git does not follow them,
+  # and the version gate above guarantees a git that does not).
+  wtc="$(env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/find "$wt" -path "$wt/.git" -prune -o \( -type f -links +1 -print \) -o \( ! -type d ! -type f ! -type l -print \) 2>/dev/null; printf 'rc=%s' "$?")"
+  gst="${wtc##*rc=}"
+  wtc="${wtc%rc=*}"
+  if [ "$gst" != "0" ] || [ -n "$wtc" ]; then
     printf '(not listed: repo config changed)\n'
     return 3
   fi
@@ -397,22 +414,33 @@ table() {
       ( $rows[] | . as $row | ($row | cols) | map(.[1] as $w | (.[2] | tostring) | pad($w)) | join(" | ") ),
       ( $rows[] | select(.needs_mapping) | "note: \(.provider) has \(.unknown) unknown event(s): needs mapping (T-004)" ),
       ( $rows[] | select(.verdict == "FAIL") | "note: \(.provider) FAIL: \(.reasons | join("; "))" )' "$1" | printable
-  st=("${PIPESTATUS[@]}")
-  [ "${st[0]}" = "0" ] && [ "${st[1]}" = "0" ]
+  # Read at once. A signal trap that ran after the pipeline can leave a one-element PIPESTATUS (bash 3.2): a missing element is a failure,
+  # never an unbound-variable exit under set -u.
+  st=(${PIPESTATUS[@]+"${PIPESTATUS[@]}"})
+  [ "${st[0]:-1}" = "0" ] && [ "${st[1]:-1}" = "0" ]
 }
 
-# list_runs: the run-* entries directly under the scratch root, one per line, sorted (an unreadable or missing root lists nothing).
+# list_runs: the run-* entries directly under the scratch root, one per line, sorted. A scratch root that does not exist yet is an empty
+# list and success; any error while listing (unreadable root, find failed) is a non-zero status, so an empty listing is never mistaken
+# for "nothing was there".
 list_runs() {
-  local sroot
+  local sroot out rc
   sroot="$(spike_root)" || return 1
-  env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/find "$sroot" -mindepth 1 -maxdepth 1 -name 'run-*' -print 2>/dev/null | LC_ALL=C sort
+  if [ ! -e "$sroot" ] && [ ! -L "$sroot" ]; then return 0; fi
+  out="$(env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/find "$sroot" -mindepth 1 -maxdepth 1 -name 'run-*' -print 2>/dev/null; printf 'rc=%s' "$?")"
+  rc="${out##*rc=}"
+  out="${out%rc=*}"
+  [ "$rc" = "0" ] || return 1
+  printf '%s' "$out" | LC_ALL=C sort
 }
 
-# own_run <listing before> <listing after>: print the one entry present in the second listing and not in the first; return 1 and print
-# nothing if there are none or several (a name holding a newline counts as several).
+# own_run <listing before> <status of that listing> <listing after> <status of that listing>: print the one entry present in the second
+# listing and not in the first; return 1 and print nothing if either listing failed, or if there are none or several new entries (a
+# name holding a newline counts as several).
 own_run() {
   local n
-  n="$(printf '%s\n' "$2" | grep -vxF -f <(printf '%s\n' "$1") | grep -v '^$')"
+  [ "$2" = "0" ] && [ "$4" = "0" ] || return 1
+  n="$(printf '%s\n' "$3" | grep -vxF -f <(printf '%s\n' "$1") | grep -v '^$')"
   case "$n" in
     "" | *$'\n'*) return 1 ;;
   esac
@@ -583,20 +611,26 @@ fi
 # ignores SIGINT: a terminal Ctrl-C reaches the whole foreground group, and a filter that died would close the pipe under the run
 # script, which would then die of SIGPIPE before its EXIT trap (its own cleanup) ran. The signal is still recorded by the trap above.
 # The run dirs a run script creates are recorded by this script, around the call, where the CLI cannot write: the one new run-* entry
-# under the scratch root is that CLI's run dir (see run_dir_of).
+# under the scratch root is that CLI's run dir (see run_dir_of). If either listing failed, nothing is owned and the dir is left behind.
 STARTED_CLAUDE=1
 RUNS_BEFORE="$(list_runs)"
+RB_RC=$?
 SPIKE_CAPTURES_ROOT="$ROOT" "$HERE/claude/run.sh" < /dev/null 2>&1 | ( trap '' INT; printable )
 RC_CLAUDE="${PIPESTATUS[0]}"
-OWN_RUN_claude="$(own_run "$RUNS_BEFORE" "$(list_runs)")" || OWN_RUN_claude=""
+RUNS_AFTER="$(list_runs)"
+RA_RC=$?
+OWN_RUN_claude="$(own_run "$RUNS_BEFORE" "$RB_RC" "$RUNS_AFTER" "$RA_RC")" || OWN_RUN_claude=""
 stop_if_signalled
 /bin/sleep "$GAP_SECS"
 stop_if_signalled
 STARTED_CODEX=1
 RUNS_BEFORE="$(list_runs)"
+RB_RC=$?
 SPIKE_CAPTURES_ROOT="$ROOT" "$HERE/codex/run.sh" < /dev/null 2>&1 | ( trap '' INT; printable )
 RC_CODEX="${PIPESTATUS[0]}"
-OWN_RUN_codex="$(own_run "$RUNS_BEFORE" "$(list_runs)")" || OWN_RUN_codex=""
+RUNS_AFTER="$(list_runs)"
+RA_RC=$?
+OWN_RUN_codex="$(own_run "$RUNS_BEFORE" "$RB_RC" "$RUNS_AFTER" "$RA_RC")" || OWN_RUN_codex=""
 stop_if_signalled
 
 # ---- normalize, check, print ----------------------------------------------------------------------------------------------
@@ -619,6 +653,7 @@ if ! ( "$JQ" -n --argjson rows "$ROWS" '{rows: $rows}' > "$ROOT/run-both.json" )
 fi
 printf '\n== run-both result ==\n'
 if ! table "$ROOT/run-both.json"; then
+  stop_if_signalled
   spike_err "could not print the result table from run-both.json"
   cleanup_scratch
   exit 1
