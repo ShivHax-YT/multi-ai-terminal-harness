@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/schemas/event.schema.json",
+  "title": "NormalizedEvent",
+  "description": "One normalized adapter event (docs/spec/adapter-interface.md, T-004). Both provider CLIs map onto this one shape. Produced by spike/normalize/claude.jq and spike/normalize/codex.jq; T-120 mirrors it in serde types and T-121/T-122 must match the golden files in spike/normalize/expected/. Every string that came from a CLI is untrusted data: control characters except newline and tab are replaced by spaces, message text is clipped to 4000 characters, every other text to 300. Optional fields are absent when unknown (never an empty string). cost_usd is always present, a number or null.",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/session_started" },
+    { "$ref": "#/$defs/message" },
+    { "$ref": "#/$defs/tool_call" },
+    { "$ref": "#/$defs/tool_result" },
+    { "$ref": "#/$defs/warning" },
+    { "$ref": "#/$defs/limit_notice" },
+    { "$ref": "#/$defs/rate_limited" },
+    { "$ref": "#/$defs/error" },
+    { "$ref": "#/$defs/result" },
+    { "$ref": "#/$defs/exited" },
+    { "$ref": "#/$defs/unknown" }
+  ],
+  "$defs": {
+    "event_type": {
+      "description": "The closed set of event types. A type outside this list is a bug in the normalizer, never a new event.",
+      "enum": [
+        "session_started",
+        "message",
+        "tool_call",
+        "tool_result",
+        "warning",
+        "limit_notice",
+        "rate_limited",
+        "error",
+        "result",
+        "exited",
+        "unknown"
+      ]
+    },
+    "provider": {
+      "enum": ["claude", "codex", "grok", "kimi", "gemini"]
+    },
+    "transport": {
+      "description": "How an adapter talks to its CLI. There is deliberately no terminal value (hard rule 3): the human-watched terminal is not a transport.",
+      "enum": ["headless", "acp"]
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport", "resume", "mcp", "hooks", "native_turn_cap"],
+      "properties": {
+        "transport": { "$ref": "#/$defs/transport" },
+        "resume": { "type": "boolean" },
+        "mcp": { "type": "boolean" },
+        "hooks": { "type": "boolean" },
+        "native_turn_cap": { "type": "boolean" }
+      }
+    },
+    "tokens": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input", "output", "cache_read", "cache_write", "reasoning"],
+      "properties": {
+        "input": { "type": "integer", "minimum": 0 },
+        "output": { "type": "integer", "minimum": 0 },
+        "cache_read": { "type": "integer", "minimum": 0 },
+        "cache_write": { "type": "integer", "minimum": 0 },
+        "reasoning": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "envelope": {
+      "description": "Fields every event carries. seq is the 1-based raw input line the event came from (several events can share one line; exited uses the line count plus one). ts is null unless the caller supplies a timestamp. raw names the raw key the event came from, for example system/init or item.completed:agent_message.",
+      "type": "object",
+      "required": ["type", "provider", "seq", "ts", "raw"],
+      "properties": {
+        "type": { "$ref": "#/$defs/event_type" },
+        "provider": { "$ref": "#/$defs/provider" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "ts": { "type": ["string", "null"] },
+        "raw": { "type": "string", "minLength": 1 }
+      }
+    },
+    "session_started": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "required": ["session_id"],
+          "properties": {
+            "type": { "const": "session_started" },
+            "session_id": { "type": "string", "minLength": 1 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "message": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "required": ["role", "text", "truncated"],
+          "properties": {
+            "type": { "const": "message" },
+            "role": { "const": "assistant" },
+            "text": { "type": "string", "maxLength": 4000 },
+            "truncated": { "type": "boolean" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "tool_call": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "required": ["id", "name"],
+          "properties": {
+            "type": { "const": "tool_call" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 100 },
+            "name": { "type": "string", "minLength": 1, "maxLength": 64 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "tool_result": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "required": ["id", "is_error"],
+          "properties": {
+            "type": { "const": "tool_result" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 100 },
+            "is_error": { "type": "boolean" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "warning": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "required": ["kind", "message"],
+          "properties": {
+            "type": { "const": "warning" },
+            "kind": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "message": { "type": "string", "maxLength": 300 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "limit_notice": {
+      "description": "A routine, non-blocking usage notice. Never a limit hit: it never counts toward rule 10 backoff. utilization is a fraction and stays a number; reset_at is whole epoch seconds (the normalizers floor it).",
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "required": ["status"],
+          "properties": {
+            "type": { "const": "limit_notice" },
+            "status": { "enum": ["allowed", "allowed_warning"] },
+            "utilization": { "type": "number" },
+            "reset_at": { "type": "integer" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "rate_limited": {
+      "description": "A limit was hit, or the CLI reported a limit state this spec does not know (fail safe, rule 10). reset_at is epoch seconds, retry_after_s is seconds; both are absent when the CLI gave none.",
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "required": ["raw_kind"],
+          "properties": {
+            "type": { "const": "rate_limited" },
+            "raw_kind": { "type": "string", "maxLength": 64 },
+            "reset_at": { "type": "integer" },
+            "retry_after_s": { "type": "integer" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "error": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "required": ["kind", "fatal", "message"],
+          "properties": {
+            "type": { "const": "error" },
+            "kind": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "fatal": { "type": "boolean" },
+            "message": { "type": "string", "maxLength": 300 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "result": {
+      "description": "End of one invocation. turns is the number of turns this invocation used (Claude num_turns; Codex 1 per exec call). turns_known is false when Claude's num_turns is missing, not a number or negative; turns is then 0 and carries no information, and the scheduler keeps the full turn reservation as if no result had arrived (rule 1). Codex is always true. tokens_known is false when the CLI reported no usage (a failed Codex turn); the five token fields are then 0. cost_is_estimate is always true for subscription logins.",
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "required": ["is_error", "turns", "turns_known", "tokens", "tokens_known", "cost_usd", "cost_is_estimate"],
+          "properties": {
+            "type": { "const": "result" },
+            "is_error": { "type": "boolean" },
+            "subtype": { "type": "string", "maxLength": 64 },
+            "turns": { "type": "integer", "minimum": 0 },
+            "turns_known": { "type": "boolean" },
+            "tokens": { "$ref": "#/$defs/tokens" },
+            "tokens_known": { "type": "boolean" },
+            "cost_usd": { "type": ["number", "null"] },
+            "cost_is_estimate": { "const": true },
+            "stop_reason": { "type": "string", "maxLength": 64 },
+            "duration_ms": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "exited": {
+      "description": "The child process ended. Appended by the normalizer only when the caller passes the exit status.",
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "properties": {
+            "type": { "const": "exited" },
+            "code": { "type": "integer" },
+            "signal": { "type": "string", "maxLength": 32 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "unknown": {
+      "description": "A raw event this spec neither maps nor ignores. Carries key names only, never values.",
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "required": ["raw_type", "keys"],
+          "properties": {
+            "type": { "const": "unknown" },
+            "raw_type": { "type": "string", "maxLength": 64 },
+            "keys": { "type": "array", "items": { "type": "string", "maxLength": 40 }, "maxItems": 20 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}

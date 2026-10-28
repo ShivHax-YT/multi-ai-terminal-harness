@@ -1,8 +1,7 @@
 # Codex headless events (`codex exec --json`), T-003
 
 Input for T-004 (adapter interface and normalized event schema). Everything here is marked **observed** (seen in a real
-run on the human's Mac) or **from docs** (taken from official material, not yet seen). Only the CLI flag placement is observed (via `--help`, codex-cli 0.162.0); no event stream is observed yet: the live
-run is the human's step, and the implementer of T-003 never ran a Codex binary. When the human has run `run.sh` and
+run on the human's Mac) or **from docs** (taken from official material, not yet seen). Flag placement is observed (via `--help`, codex-cli 0.162.0), and the points under "Observed (live, 2026-10-26, codex-cli 0.162.0)" come from the human's live run; the implementer of T-003 never ran a Codex binary. When the human has run `run.sh` and
 `resume.sh`, change "from docs" to "observed" row by row, add `spike/fixtures/codex/observed.jsonl` (redacted with
 `spike_redact`, read by a human first), and record differences in the last section.
 
@@ -28,7 +27,7 @@ confirm on the Mac" at the end.
 | `run.sh` runs `exec --json --sandbox workspace-write -C <worktree> "<task>"`; `resume.sh` runs `exec --json --sandbox workspace-write -C <worktree> resume <thread_id> "<prompt>"`. The test pins this exact argument vector on the single `spike_run_live` line of each script: nothing may be appended after `-C "$WT"` (or after the prompt), and `--enable`, `--disable`, `--ignore-user-config`, `--strict-config`, `--ignore-rules`, `-c`/`-ckey=value`, `--config`, `--profile` are explicitly rejected | design | brief T-003, S1, S3 |
 | Sandbox modes: `read-only`, `workspace-write`, `danger-full-access`; the scripts use only `workspace-write` | from docs | S1 |
 | A thread has many turns; each `exec` or `exec resume` call is one turn (`turn.started` ... `turn.completed` or `turn.failed`) | from docs | S1 |
-| A resumed run is expected to report the same `thread_id` in its own `thread.started` | to confirm | `resume.sh` prints whether it did |
+| A resumed run reports the same `thread_id` as the first run | observed (live, 2026-10-26, codex-cli 0.162.0) | the human's live run |
 | Exit status: success 0; a failed turn is expected to give a non-zero status | to confirm | not in S1 |
 | stderr: `spike_run_live_split` (T-008) writes stdout to `raw.jsonl` and stderr to `stderr.txt` as separate files | design | `spike/lib/common.sh` |
 
@@ -38,9 +37,9 @@ The JSON key `type` selects the event. Fields below are all the fields S1 declar
 
 | `type` | Fields | Status | Meaning |
 |---|---|---|---|
-| `thread.started` | `thread_id` (string) | from docs | first event; the id to resume with |
+| `thread.started` | `thread_id` (string) | observed (live, 2026-10-26, codex-cli 0.162.0) | first event; the id to resume with |
 | `turn.started` | none | from docs | a prompt was sent; events until `turn.completed` or `turn.failed` belong to this turn |
-| `turn.completed` | `usage` (object, see below) | from docs | the turn ended normally |
+| `turn.completed` | `usage` (object, see below) | observed (live, 2026-10-26, codex-cli 0.162.0) | the turn ended normally |
 | `turn.failed` | `error.message` (string) | from docs | the turn ended with an error |
 | `item.started` | `item` | from docs | an item was added, usually in progress |
 | `item.updated` | `item` | from docs | an item changed (for example the to-do list) |
@@ -66,15 +65,34 @@ An item is the `item` object in `item.started`, `item.updated` and `item.complet
 |---|---|---|---|
 | `agent_message` | `text` | from docs | the model's reply; JSON text when a schema was requested; `final.last_message_excerpt` comes from the last one |
 | `reasoning` | `text` | from docs | the model's reasoning summary |
-| `command_execution` | `command`, `aggregated_output`, `exit_code` (only after exit), `status` (`in_progress`, `completed`, `failed`) | from docs | a shell command the agent ran; `commands_run` lists these |
+| `command_execution` | `command`, `aggregated_output`, `exit_code` (only after exit), `status` (`in_progress`, `completed`, `failed`) | observed (live, 2026-10-26, codex-cli 0.162.0): one item, status `completed`, exit 0 | a shell command the agent ran; `commands_run` lists these |
 | `file_change` | `changes` (list of `path` and `kind`: `add`, `delete`, `update`), `status` (`completed`, `failed`) | from docs | emitted once the patch succeeds or fails |
 | `mcp_tool_call` | `server`, `tool`, `arguments`, `result` (success), `error.message` (failure), `status` | from docs | not used by the spike task |
 | `web_search` | `query` | from docs | not used by the spike task |
 | `todo_list` | `items` (list of `text` and `completed`) | from docs | starts when the plan is issued, updates as steps change, completes at turn end |
-| `error` | `message` | from docs | a non-fatal error shown as an item; it is not a turn failure |
+| `error` | `message` | observed (live, 2026-10-26, codex-cli 0.162.0) | a non-fatal error shown as an item; it is not a turn failure (see "Observed (live ...)" below) |
 
 An item type that is not in this table lands in `unknown` with `kind: "item"`. `sample.jsonl` carries one synthetic unknown
 item type, `future_item_kind`.
+
+## Observed (live, 2026-10-26, codex-cli 0.162.0)
+
+From the human's live run of `run.sh` then `resume.sh` on their Mac. Only what is listed here is observed; every other row
+in this file stays "from docs" until a fixture is added. No path or text from the run is reproduced here.
+
+1. **Config warnings arrive as `item.error` items.** Warnings about the user's own Codex config (a deprecated
+   `[features].codex_hooks` key; an under-development feature notice) arrived as `item.error` items during a run that still
+   ended `completed`. An `item.error` is therefore not a failure on its own: T-004 must not treat it as one, and must decide
+   success from `turn.completed` / `turn.failed` and the exit status.
+2. **stderr carried one line**, "Reading additional input from stdin...", even though stdin was `/dev/null`. It is a notice,
+   not an error; do not treat any stderr text as a result.
+3. **The run used one `command_execution` item** (a `/bin/zsh -lc "printf ... > hello.txt"` shell command), status
+   `completed`, exit code 0. `turn.completed` usage had `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`,
+   `output_tokens` and `reasoning_output_tokens` (all five numbers).
+4. **Resume kept the same thread id** as the first run.
+5. **Prompt wording matters.** The first wording ended the task sentence with a period after the file content; Codex wrote
+   the period into `hello.txt` (`hello from codex.`). The prompts were reworded to say "with no punctuation" (T-003 amended
+   2026-10-26); a fresh run is needed to confirm the file checks pass.
 
 ## Error and rate-limit shapes
 

@@ -233,9 +233,20 @@ check "scrub: idempotent" test "$(printf '%s\n' "$SC" | jq -c -f "$SCRUB")" = "$
 printf '%s\n' '{"type":"system","subtype":"init","tools":[],"mcp_servers":"corp","agents":null}' > "$TMP/odd-init.jsonl"
 expect "scrub: empty list stays empty, string becomes redacted, null stays null" "$(jq -c -f "$SCRUB" "$TMP/odd-init.jsonl")" \
   '.tools == [] and .mcp_servers == "<redacted>" and .agents == null and .scrubbed_counts == {"tools":0,"mcp_servers":null,"agents":null}'
+printf '%s\n' '{"type":"system","subtype":"commands_changed","session_id":"abcdefgh-1","commands":[{"name":"acme-deploy","description":"deploy acme","argumentHint":"","builtin":false},{"name":"help","builtin":true}]}' \
+  '{"type":"system","subtype":"commands_changed","commands":[]}' '{"type":"system","subtype":"thinking_tokens","commands":["keep-me"]}' > "$TMP/cmds.jsonl"
+SCC="$(jq -c -f "$SCRUB" "$TMP/cmds.jsonl")"
+expect "scrub: commands_changed lists are redacted with a count" "$(printf '%s\n' "$SCC" | sed -n 1p)" \
+  '.commands == ["<redacted>"] and .scrubbed_counts == {"commands":2} and .session_id == "abcdefgh-1"'
+expect "scrub: an empty commands_changed list stays empty" "$(printf '%s\n' "$SCC" | sed -n 2p)" '.commands == [] and .scrubbed_counts == {"commands":0}'
+check "scrub: commands on another system subtype pass through unchanged" test "$(printf '%s\n' "$SCC" | sed -n 3p)" = "$(sed -n 3p "$TMP/cmds.jsonl" | jq -c .)"
+check "scrub: no personal command survives commands_changed" test -z "$(printf '%s\n' "$SCC" | grep -i 'acme')"
+check "scrub: commands_changed scrub is idempotent" test "$(printf '%s\n' "$SCC" | jq -c -f "$SCRUB")" = "$SCC"
+expect "scrub: init does not gain a commands count" "$SC1" '(.scrubbed_counts | has("commands")) | not'
 SCP="$(jq -c -f "$SCRUB" "$TMP/personal.jsonl" | parse 2>/dev/null)"
 expect "scrub: a scrubbed capture still parses" "$SCP" '.session_id == "abcdefgh-1" and (.malformed | length) == 0'
 if [ -f "$FIX/observed.jsonl" ]; then
+  check "observed.jsonl: commands_changed lists are scrubbed" test "$(jq -c 'select(.type == "system" and .subtype == "commands_changed") | .commands | (. == [] or . == ["<redacted>"])' "$FIX/observed.jsonl" | grep -c false)" -eq 0
   check "observed.jsonl: init lists are scrubbed" test "$(jq -c 'select(.type == "system" and .subtype == "init") | [.mcp_servers, .plugins, .skills, .slash_commands, .agents, .tools] | map(select(. != null)) | all(. == [] or . == ["<redacted>"])' "$FIX/observed.jsonl" | grep -c false)" -eq 0
 fi
 
@@ -250,6 +261,8 @@ check "resume.sh strips before the symlink test" test "$(grep -nF 'ARG="${ARG%"$
 check "resume.sh reports unknown when the new session id is empty" grep -q 'reused="unknown"' "$RESUME"
 check "resume.sh only says no for a different, non-empty id" grep -qF 'if [ "$NEW_SID" = "$SID" ]; then reused="yes"; else reused="no"; fi' "$RESUME"
 check "run.sh prints the run dir when worktree or capture setup fails" test "$(grep -c 'scratch run dir left at' "$RUN")" -eq 2
+check "run.sh shell-quotes the run dir in the copy-paste cleanup hints (2 places)" test "$(grep -cF 'spike_cleanup $(printf '"'"'%q'"'"' "$RUN_DIR"))' "$RUN")" -eq 2
+check "run.sh shell-quotes the run dir in the final clean-up line" grep -qF 'spike_cleanup %q)' "$RUN"
 check "run.sh learns RUN_DIR right after the scratch repo exists" test "$(grep -n '^RUN_DIR=' "$RUN" | head -1 | cut -d: -f1)" -lt "$(grep -n '^WT=' "$RUN" | head -1 | cut -d: -f1)"
 
 # ---- completion_verdict: parsed completion decides success (extracted from each script and run offline) ----------------------------------

@@ -145,18 +145,23 @@ most Linux have it; only core modules are used).
 | `preflight.sh` | done (T-001) | table of install path, version, code-signature result and sign-in state for each CLI; verifies the resolved real binary in place and runs only that verified path |
 | `tests/test_common.sh` | done (T-001) | offline tests for `lib/common.sh` and `lib/runner.pl` |
 | `tests/test_preflight.sh` | done (T-001) | offline tests for `preflight.sh` using fake CLIs on a private PATH |
-| `plan/hash.sh`, `plan/check.jq`, `tests/test_plan.sh` | planned (T-005) | plan hash and approval-binding checker |
+| `plan/hash.sh`, `plan/check.jq`, `tests/test_plan.sh` | done (T-005, merged) | plan hash and approval-binding checker |
 | `handoff/parse.sh`, `tests/test_handoff.sh` | done (T-006, merged) | HANDOFF.md parser |
-| `claude/run.sh`, `claude/resume.sh`, `claude/parse.jq`, `tests/test_claude_parse.sh` | planned (T-002) | Claude Code headless spike |
-| `codex/run.sh`, `codex/resume.sh`, `codex/parse.jq`, `tests/test_codex_parse.sh` | planned (T-003) | Codex headless spike |
-| `normalize/claude.jq`, `normalize/codex.jq`, `tests/test_normalize.sh` | planned (T-004) | normalized event mapping |
-| `run-both.sh` | planned (T-007) | end-to-end run of both CLIs (`--dry-run` supported) |
+| `claude/run.sh`, `claude/resume.sh`, `claude/parse.jq`, `tests/test_claude_parse.sh` | done (T-002, live run and resume passed 2026-10-26) | Claude Code headless spike |
+| `codex/run.sh`, `codex/resume.sh`, `codex/parse.jq`, `tests/test_codex_parse.sh` | done (T-003, live run and resume passed 2026-10-26) | Codex headless spike |
+| `normalize/claude.jq`, `normalize/codex.jq`, `normalize/expected/`, `fixtures/normalize/`, `tests/test_normalize.sh` | done (T-004) | normalized event mapping (spec: `docs/spec/adapter-interface.md`, `docs/spec/event.schema.json`) |
+| `run-both.sh`, `tests/test_run_both.sh` | done (T-007; live run is the human's) | end-to-end run of both CLIs, one each, 5 s apart (`--dry-run`, `--keep`) |
+| `PHASE0-REPORT.md` | template (T-007) | Phase 0 exit report, filled in after the live `run-both.sh` |
 
 ## Running the offline tests
 
 ```
+make spike-test                        # every suite in spike/tests/ (also part of make check)
 /bin/bash spike/tests/test_common.sh
 /bin/bash spike/tests/test_preflight.sh
+/bin/bash spike/tests/test_normalize.sh
+/bin/bash spike/tests/test_run_both.sh
+spike/run-both.sh --dry-run            # prints the end-to-end steps, runs nothing
 spike/preflight.sh
 ```
 

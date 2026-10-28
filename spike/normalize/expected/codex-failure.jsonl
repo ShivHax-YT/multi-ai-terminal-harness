@@ -1,0 +1,9 @@
+{"type":"session_started","provider":"codex","seq":1,"ts":null,"raw":"thread.started","session_id":"0199a213-81c0-7800-8aa1-bbab2a035a54"}
+{"type":"rate_limited","provider":"codex","seq":3,"ts":null,"raw":"error","raw_kind":"codex_text_hint"}
+{"type":"error","provider":"codex","seq":3,"ts":null,"raw":"error","kind":"stream_error","fatal":true,"message":"synthetic: stream error, last status: 429 Too Many Requests"}
+{"type":"rate_limited","provider":"codex","seq":4,"ts":null,"raw":"turn.failed","raw_kind":"codex_text_hint"}
+{"type":"error","provider":"codex","seq":4,"ts":null,"raw":"turn.failed","kind":"turn_failed","fatal":true,"message":"synthetic: usage limit reached, try again in 3 hours"}
+{"type":"result","provider":"codex","seq":4,"ts":null,"raw":"turn.failed","is_error":true,"turns":1,"turns_known":true,"tokens":{"input":0,"output":0,"cache_read":0,"cache_write":0,"reasoning":0},"tokens_known":false,"cost_usd":null,"cost_is_estimate":true}
+{"type":"error","provider":"codex","seq":5,"ts":null,"raw":"error","kind":"stream_error","fatal":true,"message":"synthetic: sandbox could not start"}
+{"type":"error","provider":"codex","seq":6,"ts":null,"raw":"turn.failed","kind":"turn_failed","fatal":true,"message":"synthetic: sandbox could not start"}
+{"type":"result","provider":"codex","seq":6,"ts":null,"raw":"turn.failed","is_error":true,"turns":1,"turns_known":true,"tokens":{"input":0,"output":0,"cache_read":0,"cache_write":0,"reasoning":0},"tokens_known":false,"cost_usd":null,"cost_is_estimate":true}

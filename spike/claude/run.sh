@@ -107,11 +107,11 @@ REPO="$(spike_scratch_repo)" || { spike_err "cannot create the scratch repo"; ex
 RUN_DIR="$(dirname "$REPO")"
 # From here on a scratch run directory exists; if setup fails, say where it is so the human can remove it.
 WT="$(spike_worktree_add "$REPO" claude-1)" || {
-  spike_err "cannot create the worktree; scratch run dir left at: $RUN_DIR (remove with: . spike/lib/common.sh; spike_cleanup $RUN_DIR)"
+  spike_err "cannot create the worktree; scratch run dir left at: $RUN_DIR (remove with: . spike/lib/common.sh; spike_cleanup $(printf '%q' "$RUN_DIR"))"
   exit 1
 }
 CAP="$(spike_capture_dir claude)" || {
-  spike_err "cannot create the capture directory; scratch run dir left at: $RUN_DIR (remove with: . spike/lib/common.sh; spike_cleanup $RUN_DIR)"
+  spike_err "cannot create the capture directory; scratch run dir left at: $RUN_DIR (remove with: . spike/lib/common.sh; spike_cleanup $(printf '%q' "$RUN_DIR"))"
   exit 1
 }
 CAP="${CAP%/}"
@@ -159,7 +159,7 @@ printf -- '-- summary (bounded fields only; text is untrusted data) --\n'
 jq . "$CAP/summary.json" | tr -cd '[:print:]\n'
 printf -- '-- next --\n'
 printf 'Resume once:  SPIKE_LIVE=1 spike/claude/resume.sh %s\n' "$CAP"
-printf 'Clean up:     (source spike/lib/common.sh; spike_cleanup %s)\n' "$RUN_DIR"
+printf 'Clean up:     (source spike/lib/common.sh; spike_cleanup %q)\n' "$RUN_DIR"
 printf 'No retry was made. If the status above is an error, report it; do not re-run in a loop (rule 10).\n'
 
 # The verdict alone decides the exit status; hello.txt above is information and never rescues a failing verdict.

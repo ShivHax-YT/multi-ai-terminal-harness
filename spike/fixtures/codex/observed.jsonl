@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"<ID-1>"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`[features].codex_hooks` is deprecated. Use `[features].hooks` instead. (Enable it with `--enable hooks` or `[features].hooks` in config.toml. See https://developers.openai.com/codex/config-basic#feature-flags for details.)"}}
+{"type":"item.completed","item":{"id":"item_1","type":"error","message":"Under-development features enabled: chronicle. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in $HOME/..."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"I’ll create hello.txt with the exact line.\n"}}
+{"type":"item.started","item":{"id":"item_3","type":"command_execution","command":"/bin/zsh -lc \"printf 'hello from codex\\\\n' > hello.txt\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"/bin/zsh -lc \"printf 'hello from codex\\\\n' > hello.txt\"","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_4","type":"agent_message","text":"DONE"}}
+{"type":"turn.completed","usage":{"input_tokens":48690,"cached_input_tokens":37376,"cache_write_input_tokens":0,"output_tokens":60,"reasoning_output_tokens":0}}

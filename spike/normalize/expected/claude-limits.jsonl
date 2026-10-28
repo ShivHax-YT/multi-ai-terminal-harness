@@ -1,0 +1,8 @@
+{"type":"session_started","provider":"claude","seq":1,"ts":null,"raw":"system/init","session_id":"22222222-2222-4222-8222-222222222222"}
+{"type":"warning","provider":"claude","seq":2,"ts":null,"raw":"system/api_retry","kind":"api_retry","message":"attempt 2 of 10, status 429, error rate_limit"}
+{"type":"rate_limited","provider":"claude","seq":3,"ts":null,"raw":"rate_limit_event","raw_kind":"claude_rejected","reset_at":1790003600}
+{"type":"rate_limited","provider":"claude","seq":4,"ts":null,"raw":"rate_limit_event","raw_kind":"claude_credits_required"}
+{"type":"warning","provider":"claude","seq":5,"ts":null,"raw":"system/permission_denied","kind":"permission_denied","message":"tool Bash"}
+{"type":"rate_limited","provider":"claude","seq":6,"ts":null,"raw":"assistant","raw_kind":"claude_assistant_rate_limit"}
+{"type":"message","provider":"claude","seq":6,"ts":null,"raw":"assistant:text","role":"assistant","text":"You've hit your session limit","truncated":false}
+{"type":"result","provider":"claude","seq":7,"ts":null,"raw":"result/error_max_turns","is_error":true,"subtype":"error_max_turns","turns":5,"turns_known":true,"tokens":{"input":50,"output":10,"cache_read":0,"cache_write":0,"reasoning":0},"tokens_known":true,"cost_usd":0.002,"cost_is_estimate":true,"duration_ms":900}
