@@ -175,7 +175,13 @@ check "the signal comments say a signal in the instants before a launch is notic
 check "the dry-run text says a signal before the pre-Codex check stops the run" test "$(grep -c 'A signal received before the pre-Codex check stops the run before the codex run' "$RUN")" = "1"
 check "stop_if_signalled is documented as the next check stopping the run" test "$(grep -c 'after INT, TERM or HUP the next check stops the run, cleans up and exits 130, 143 or 129' "$RUN")" = "1"
 # C: the ownership record is taken by run-both.sh around each run script call
-check "each run script call is preceded by a listing of the scratch run dirs and followed by the ownership record" test "$(code_lines "$RUN" | grep -B1 -E '/(claude|codex)/run.sh" < /dev/null ' | grep -c '^RUNS_BEFORE="\$(list_runs)"$')" = "2" -a "$(code_lines "$RUN" | grep -cE '^OWN_RUN_(claude|codex)="\$\(own_run "\$RUNS_BEFORE" "\$\(list_runs\)"\)" \|\| OWN_RUN_(claude|codex)=""$')" = "2"
+check "each run script call is preceded by a listing and its status, and followed by the second listing, its status and the ownership record" test "$(code_lines "$RUN" | grep -B2 -E '/(claude|codex)/run.sh" < /dev/null ' | grep -cE '^(RUNS_BEFORE="\$\(list_runs\)"|RB_RC=\$\?)$')" = "4" -a "$(code_lines "$RUN" | grep -cE '^RUNS_AFTER="\$\(list_runs\)"$')" = "2" -a "$(code_lines "$RUN" | grep -cE '^RA_RC=\$\?$')" = "2" -a "$(code_lines "$RUN" | grep -cE '^OWN_RUN_(claude|codex)="\$\(own_run "\$RUNS_BEFORE" "\$RB_RC" "\$RUNS_AFTER" "\$RA_RC"\)" \|\| OWN_RUN_(claude|codex)=""$')" = "2"
+check "table guards every PIPESTATUS element (a missing one is a failure, never an unbound variable)" test "$(awk '/^table\(\)/ {f=1} f && /"\$\{st\[0\]:-1\}" = "0"/ && /"\$\{st\[1\]:-1\}" = "0"/ {n++} f && /^}/ {exit} END {print n + 0}' "$RUN")" = "1" -a "$(awk '/^table\(\)/ {f=1} f && /\$\{st\[[0-9]\]\}/ {n++} f && /^}/ {exit} END {print n + 0}' "$RUN")" = "0"
+check "the table-failure block calls stop_if_signalled before it prints its message" test "$(awk '/^if ! table "\$ROOT\/run-both.json"; then$/ {f=1; next} f && /^  stop_if_signalled$/ {a=NR} f && /could not print the result table/ {b=NR} f && /^fi$/ {exit} END {print (a && b && a < b) ? "ok" : "no"}' "$RUN")" = "ok"
+check "scratch_repo_ok refuses a non-empty alternates or http-alternates file" test "$(grep -c '\[ ! -s "\$SG_COMMON/objects/info/alternates" \] && \[ ! -s "\$SG_COMMON/objects/info/http-alternates" \] || return 3' "$RUN")" = "1"
+check "changed_files runs the worktree find (hard links, FIFOs; .git pruned) after scratch_repo_ok and before git status" test "$(awk '/^changed_files\(\)/ {f=1} f && /scratch_repo_ok "\$g" "\$wt"/ && !a {a=NR} f && /\/usr\/bin\/find "\$wt" -path "\$wt\/.git" -prune -o/ && /-type f -links \+1 -print/ && /! -type d ! -type f ! -type l -print/ && !b {b=NR} f && /status --porcelain/ && !c {c=NR} f && /^}/ {exit} END {print (a && b && c && a < b && b < c) ? "ok" : "no"}' "$RUN")" = "ok"
+check "list_runs reports an enumeration error and own_run needs both statuses" test "$(awk '/^list_runs\(\)/ {f=1} f && /\[ "\$rc" = "0" \] \|\| return 1/ {n++} f && /^}/ {exit} END {print n + 0}' "$RUN")" = "1" -a "$(awk '/^own_run\(\)/ {f=1} f && /\[ "\$2" = "0" \] && \[ "\$4" = "0" \] \|\| return 1/ {n++} f && /^}/ {exit} END {print n + 0}' "$RUN")" = "1"
+check "the safe_input header says the hard-link refusal comes from spike_under_cli_home" test "$(grep -c 'comes from spike_under_cli_home' "$RUN")" = "1"
 check "run_dir_of compares the run dir with the ownership record" test "$(awk '/^run_dir_of\(\)/ {f=1} f && /\[ "\$own" = "\$run" \] \|\| return 1/ {n++} f && /^}/ {exit} END {print n + 0}' "$RUN")" = "1"
 check "scratch_repo_ok runs the whole-tree find with a closed environment, no symlink following, before it reads any file" test "$(awk '/^scratch_repo_ok\(\)/ {f=1} f && /env -i PATH=\/usr\/bin:\/bin LC_ALL=C \/usr\/bin\/find "\$SG_COMMON"/ && !a {a=NR} f && /config_absent_or_allowed/ && !b {b=NR} f && /^}/ {exit} END {print (a && b && a < b) ? "ok" : "no"}' "$RUN")" = "ok"
 check "scratch_repo_ok pins the worktree HEAD to the branch ref" test "$(awk '/^scratch_repo_ok\(\)/ {f=1} f && /want="ref: refs\/heads\/spike\/\$\{wt##\*\/\}"/ {n++} f && /^}/ {exit} END {print n + 0}' "$RUN")" = "1"
@@ -753,7 +759,6 @@ meta_case "info/exclude" C info/exclude
 meta_case "info/attributes" C info/attributes
 meta_case "worktree info/sparse-checkout" G info/sparse-checkout
 meta_case "shallow" C shallow
-meta_case "objects/info/alternates" C objects/info/alternates
 meta_case "loose ref refs/heads/spike/claude-1" C refs/heads/spike/claude-1
 # a CLI-home path never appears in the output even when the symlink target is a directory
 mk_wt
@@ -976,16 +981,16 @@ SR="$(spike_root)"
 mkdir -p "$SR"
 RB="$(list_runs)"
 mkdir "$SR/run-own1"
-eq "own_run: exactly one new run-* entry is returned" "$SR/run-own1" "$(own_run "$RB" "$(list_runs)")"
+eq "own_run: exactly one new run-* entry is returned" "$SR/run-own1" "$(own_run "$RB" 0 "$(list_runs)" 0)"
 mkdir "$SR/run-own2"
-own_run "$RB" "$(list_runs)" > "$TMP/own.out" 2>&1
+own_run "$RB" 0 "$(list_runs)" 0 > "$TMP/own.out" 2>&1
 check "own_run: two new entries are not verified (status 1)" test "$?" = "1"
 eq "own_run: two new entries print nothing" "0" "$(wc -c < "$TMP/own.out" | tr -d ' ')"
 RB2="$(list_runs)"
-own_run "$RB2" "$RB2" > /dev/null 2>&1
+own_run "$RB2" 0 "$RB2" 0 > /dev/null 2>&1
 check "own_run: no new entry is not verified (status 1)" test "$?" = "1"
 mkdir "$SR/run-nl"$'\n'"x"
-own_run "$RB2" "$(list_runs)" > /dev/null 2>&1
+own_run "$RB2" 0 "$(list_runs)" 0 > /dev/null 2>&1
 check "own_run: a new name holding a newline counts as several (status 1)" test "$?" = "1"
 mkdir "$SR/notarun"
 eq "list_runs: only run-* entries are listed" "0" "$(list_runs | grep -c notarun)"
@@ -1050,6 +1055,122 @@ rd_files claude "$OWN_RUN_claude/repo-wt/claude-1" "$OWN_RUN_claude"
 check "run_dir_of: a two-segment run dir name, owned and consistent: refused" test "$(run_dir_of claude worktree.path >/dev/null 2>&1; echo $?)" = "1"
 OWN_RUN_claude=""
 rm -rf "$SR/$RDN" "$SR/$RDV" "$SR/run-a" "$ROOT"
+
+# -- round 4c: table survives a signal trap that leaves a short PIPESTATUS (no unbound variable under set -u), and still fails
+rm -f "$TMP/tsig.out" "$TMP/tsig.err"
+(
+  set -u
+  trap 'SEEN_TERM=1' TERM
+  me="$(exec /bin/sh -c 'echo $PPID')"
+  printable() { kill -TERM "$me"; cat; }
+  table "$good_json" > /dev/null 2> "$TMP/tsig.err"
+  echo "rc=$? after-table" > "$TMP/tsig.out"
+)
+check "table + TERM during the pipeline: the function returns (no unbound-variable exit)" test -s "$TMP/tsig.out"
+check "table + TERM during the pipeline: no unbound variable message" test "$(grep -c 'unbound' "$TMP/tsig.err")" = "0"
+# a pipeline whose PIPESTATUS really is one element long (a trap handler resets it): the guard treats the missing element as failure
+rm -f "$TMP/tsig2.out"
+(
+  set -u
+  # a stand-in for the last pipeline: run table with PIPESTATUS replaced by a one-element array right before the status test
+  eval "$(declare -f table | sed 's/^ *st=(.*$/    st=(0)/')"
+  table "$good_json" > /dev/null 2>&1
+  echo "rc=$?" > "$TMP/tsig2.out"
+)
+eq "table with a one-element status array: returns 1 and does not abort" "rc=1" "$(cat "$TMP/tsig2.out" 2>/dev/null)"
+
+# -- round 4c: objects/info/alternates (and http-alternates) must be empty if present
+ALTN=0
+alt_case() { # alt_case <label> <file under objects/info> <content kind: ext|empty|link>
+  local label="$1" f alt ext
+  ALTN=$((ALTN + 1))
+  mk_wt
+  f="$WREPO/.git/objects/info/$2"
+  ext="$TMP/ext-objs-$ALTN"
+  mkdir -p "$ext"
+  ln -s "$CLIHOME/canary.txt" "$ext/obj"
+  case "$3" in
+    ext) printf '%s\n' "$ext" > "$f" ;;
+    empty) : > "$f" ;;
+    link) : > "$TMP/empty-target-$ALTN"; ln -s "$TMP/empty-target-$ALTN" "$f" ;;
+  esac
+  scratch_repo_ok "$GIT_BIN" "$WWT"
+  alt_rc=$?
+  META_OUT="$(changed_files "$WWT" 2>&1)"
+  META_RC=$?
+  if [ "$3" = "empty" ]; then
+    eq "alternates $label: an empty file is accepted" "0" "$alt_rc"
+    check "alternates $label: the listing still works" test "$META_RC" = "0"
+  else
+    eq "alternates $label: refused (3)" "3" "$alt_rc"
+    eq "alternates $label: the fixed text and status 3" "$FIXED_CFG,3" "$META_OUT,$META_RC"
+    lacks "alternates $label: the canary text is never printed" "$META_OUT" "$CANARY"
+  fi
+}
+alt_case "naming an external object store with a symlinked object" alternates ext
+alt_case "http-alternates naming an external store" http-alternates ext
+alt_case "empty alternates" alternates empty
+alt_case "empty http-alternates" http-alternates empty
+alt_case "a symlinked (empty) alternates" alternates link
+mk_wt
+scratch_repo_ok "$GIT_BIN" "$WWT"
+eq "alternates: control, no alternates file at all is accepted" "0" "$?"
+
+# -- round 4c: list_runs distinguishes "no scratch root yet" from an enumeration error; own_run needs both listings to have succeeded
+OLD_TMPDIR="$TMPDIR"
+TMPDIR="$TMP/no-such-tmp2"
+LR="$(list_runs)"
+eq "list_runs: a scratch root that does not exist yet is an empty list and success" "0,[]" "$?,[$LR]"
+TMPDIR="$TMP/unread-tmp"
+mkdir -p "$TMPDIR/harness-spike/run-hidden"
+chmod 000 "$TMPDIR/harness-spike"
+if ls "$TMPDIR/harness-spike" > /dev/null 2>&1; then
+  ok # the suite runs as a user that can read a mode 000 directory (root): the error path cannot be provoked here
+  ok
+else
+  LR="$(list_runs)"
+  LRC=$?
+  check "list_runs: an unreadable scratch root is a non-zero status" test "$LRC" != "0"
+  eq "list_runs: an unreadable scratch root prints nothing" "" "$LR"
+fi
+chmod 700 "$TMPDIR/harness-spike"
+TMPDIR="$OLD_TMPDIR"
+SR="$(spike_root)"
+RB="$(list_runs)"
+mkdir "$SR/run-st1"
+eq "own_run: both listings succeeded: the new entry" "$SR/run-st1" "$(own_run "$RB" 0 "$(list_runs)" 0)"
+own_run "$RB" 1 "$(list_runs)" 0 > "$TMP/own.out" 2>&1
+check "own_run: a failed before-listing: not owned (status 1)" test "$?" = "1"
+eq "own_run: a failed before-listing prints nothing" "0" "$(wc -c < "$TMP/own.out" | tr -d ' ')"
+own_run "$RB" 0 "$(list_runs)" 1 > /dev/null 2>&1
+check "own_run: a failed after-listing: not owned (status 1)" test "$?" = "1"
+rmdir "$SR/run-st1"
+
+# -- round 4c: the worktree itself: no hard-linked file, no FIFO/socket/device outside .git before git status reads it
+mk_wt
+printf 'hello\n' > "$WWT/hello.txt"
+eq "worktree check: control, a normal worktree with hello.txt is listed" "hello.txt" "$(changed_files "$WWT" 2>&1)"
+ln "$CLIHOME/canary.txt" "$WWT/linked.txt"
+CH="$(changed_files "$WWT" 2>&1)"
+eq "worktree check: a hard link to a CLI-home file: the fixed text, status 3" "$FIXED_CFG,3" "$CH,$?"
+lacks "worktree check: the canary text is never printed" "$CH" "$CANARY"
+check "worktree check: the CLI-home file was not touched" test "$(cat "$CLIHOME/canary.txt")" = "$CANARY"
+rm -f "$WWT/linked.txt"
+ln "$WWT/hello.txt" "$WWT/hello-twin.txt"
+CH="$(changed_files "$WWT" 2>&1)"
+eq "worktree check: two names for one file inside the worktree: refused too" "$FIXED_CFG,3" "$CH,$?"
+rm -f "$WWT/hello-twin.txt"
+mkfifo "$WWT/fifo"
+CH="$(changed_files "$WWT" 2>&1)"
+eq "worktree check: a FIFO in the worktree: refused" "$FIXED_CFG,3" "$CH,$?"
+rm -f "$WWT/fifo"
+ln -s "$CLIHOME/canary.txt" "$WWT/sym.txt"
+CH="$(changed_files "$WWT" 2>&1)"
+eq "worktree check: a symlink in the worktree is fine (git does not follow it), status 0" "0" "$?"
+has "worktree check: the symlink name is listed" "$CH" "sym.txt"
+lacks "worktree check: the symlink target's content is never printed" "$CH" "$CANARY"
+rm -f "$WWT/sym.txt"
+eq "worktree check: control, listed again once the extras are gone" "hello.txt" "$(changed_files "$WWT" 2>&1)"
 
 # the worktree's own .git file is never followed. The "CLI" rewrites it to a COPY of the git dirs whose config defines a filter driver
 # (the real config stays clean, so the allowlist passes); with the git dirs pinned from the path the copy is never read.
@@ -1152,7 +1273,17 @@ mk_sandbox() { # mk_sandbox -> sets SB; the sandbox copy of run-both.sh is byte-
 if [ -n "${FAKE_SLOWFLAG:-}" ] && [ -e "$FAKE_SLOWFLAG" ]; then rm -f "$FAKE_SLOWFLAG"; /bin/sleep 2; fi
 if [ "${FAKE_TR_FAILTABLE:-}" = "1" ]; then
   in="$(cat; printf x)"
-  case "$in" in *"provider | exit"*) exit 1 ;; esac
+  case "$in" in
+    *"provider | exit"*)
+      if [ -n "${FAKE_TR_SIGNAL:-}" ]; then
+        # a signal for the main script: the preflight fake recorded its parent (run-both.sh itself) in <log>.mainpid
+        pid="$(cat "$FAKE_LOG.mainpid")"
+        echo "tr-signalled $pid" >> "$FAKE_LOG"
+        kill -"$FAKE_TR_SIGNAL" "$pid"
+      fi
+      exit 1
+      ;;
+  esac
   printf '%s' "${in%x}" | exec /usr/bin/tr "$@"
 fi
 exec /usr/bin/tr "$@"
@@ -1178,8 +1309,9 @@ EOF
   cat > "$SB/spike/preflight.sh" <<'EOF'
 #!/bin/bash
 printf 'preflight %s\n' "$(date +%s)" >> "$FAKE_LOG"
+printf '%s\n' "$PPID" > "$FAKE_LOG.mainpid"
 printf 'fake preflight report\n'
-if [ -n "${FAKE_VICTIM:-}${FAKE_PRE_OREPO:-}" ]; then
+if [ -n "${FAKE_VICTIM:-}${FAKE_PRE_OREPO:-}${FAKE_PRE_UNREADABLE:-}" ]; then
   HERE="$(cd -P "${BASH_SOURCE[0]%/*}" && pwd -P)"
   . "$HERE/lib/common.sh"
 fi
@@ -1196,6 +1328,11 @@ if [ -n "${FAKE_VICTIM:-}" ]; then
   printf 'victim %s\n' "$VWT" >> "$FAKE_LOG"
   printf '%s\n' "$VWT" > "$FAKE_LOG.victim"
 fi
+if [ -n "${FAKE_PRE_UNREADABLE:-}" ]; then
+  # the scratch root exists but cannot be listed (mode 0300): the claude fake restores it right after the before-snapshot was taken
+  mkdir -p "$(spike_root)"
+  chmod 0300 "$(spike_root)"
+fi
 [ -n "${FAKE_PRE_SIGNAL:-}" ] && kill -"$FAKE_PRE_SIGNAL" "$PPID"
 exit "${FAKE_PRE_RC:-0}"
 EOF
@@ -1204,6 +1341,7 @@ EOF
 set -u
 HERE="$(cd -P "${BASH_SOURCE[0]%/*}" && pwd -P)"
 . "$HERE/../lib/common.sh"
+[ -n "${FAKE_PRE_UNREADABLE:-}" ] && chmod 700 "$(spike_root)"
 printf 'claude start %s\n' "$(date +%s)" >> "$FAKE_LOG"
 printf 'claude root %s\n' "${SPIKE_CAPTURES_ROOT:-none}" >> "$FAKE_LOG"
 printf 'claude says hello\n'
@@ -1286,6 +1424,8 @@ case "${FAKE_META:-}" in
   grafts-link) mkdir -p "$GC/info"; ln -s "$FAKE_CANARY_FILE" "$GC/info/grafts" ;;
   replace-link) mkdir -p "$GC/refs/replace"; ln -s "$FAKE_CANARY_FILE" "$GC/refs/replace/0123456789abcdef0123456789abcdef01234567" ;;
   fifo) mkfifo "$GC/objects/fifo" ;;
+  alt-ext) ext="$(dirname "$GC")/ext-objects"; mkdir -p "$ext"; ln -s "$FAKE_CANARY_FILE" "$ext/obj"; mkdir -p "$GC/objects/info"; printf '%s\n' "$ext" > "$GC/objects/info/alternates" ;;
+  wt-hard) ln "$FAKE_CANARY_FILE" "$WT/linked.txt" ;;
   wtinfo-link) mkdir -p "$GD/info"; ln -s "$FAKE_CANARY_FILE" "$GD/info/sparse-checkout" ;;
 esac
 # the run-both.json target is not writable: a directory sits where the file will be written
@@ -1903,6 +2043,43 @@ has "O7: the fixed message is printed" "$(cat "$SB/err")" 'could not print the r
 eq "O7: no PASS anywhere" "0" "$(cat "$SB/out" "$SB/err" | grep -c 'PASS')"
 eq "O7: scratch cleanup ran" "0" "$(scratch_left)"
 check "O7: run-both.json was written before the table (the rows are on disk)" test -s "$(root_of)/run-both.json"
+
+# O8. round 4c, whole flow
+# O8a. Ctrl-C (INT) arrives while the table is printed and the table's output filter fails: the signal is reported first, exit 130 after
+# cleanup, and NOT the "could not print the result table" message
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "FAKE_TR_FAILTABLE=1 FAKE_TR_SIGNAL=INT" --)"
+eq "O8a: INT during a failing table: exit 130" "130" "$rc"
+lacks "O8a: the table-failure message is not printed (the signal comes first)" "$(cat "$SB/err")" 'could not print the result table'
+has "O8a: the signal is reported" "$(cat "$SB/err")" 'stopped by a signal'
+eq "O8a: no PASS anywhere" "0" "$(cat "$SB/out" "$SB/err" | grep -c 'PASS')"
+eq "O8a: scratch cleanup ran" "0" "$(scratch_left)"
+eq "O8a: the shim really signalled (the log has the marker)" "1" "$(grep -c '^tr-signalled' "$SB/log")"
+
+# O8b. alternates naming an object store outside the tree (with a symlinked object): refused, canary never printed
+meta_flow alt-ext
+
+# O8c. an unreadable scratch root during the BEFORE-snapshot of the claude run: nothing is owned for claude, its run dir is left; codex is
+# unaffected (absent-root and readable-root cases are every other flow)
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "FAKE_PRE_UNREADABLE=1" --)"
+JO="$(cat "$(root_of)/run-both.json" 2>/dev/null)"
+eq "O8c: a failed before-listing: exit 1" "1" "$rc"
+expect "O8c: the claude row is FAIL (hello.txt not read, run dir not owned), codex PASS" "$JO" '.rows[0].verdict == "FAIL" and .rows[0].hello_ok == false and .rows[1].verdict == "PASS"'
+has "O8c: the claude leftover is reported" "$(cat "$SB/err")" 'claude: scratch run dir NOT removed'
+eq "O8c: the claude run dir was not deleted, the codex one was cleaned" "1" "$(scratch_left)"
+
+# O8d. a hard link to a CLI-home file inside the worktree: no git status reads it; the row is FAIL with the existing fixed reason
+mk_fast
+mkdir -p "$SB/home/$DENY_NAME"
+printf '%s\n' "$CANARY" > "$SB/home/$DENY_NAME/canary.txt"
+rc="$(run_sb "$SB/$FASTP" "FAKE_META=wt-hard FAKE_CANARY_FILE=$SB/home/$DENY_NAME/canary.txt" --)"
+HJ="$(cat "$(root_of)/run-both.json" 2>/dev/null)"
+eq "O8d: a hard link in the worktree: exit 1" "1" "$rc"
+expect "O8d: the claude row is FAIL with exactly the fixed reason" "$HJ" '.rows[0].verdict == "FAIL" and .rows[0].reasons == ["scratch repo config changed"]'
+expect "O8d: changed files show the fixed not-listed text, the codex row is unaffected" "$HJ" '.rows[0].changed == ["(not listed: repo config changed)"] and .rows[1].verdict == "PASS"'
+eq "O8d: the canary text is never printed or stored" "0" "$(cat "$SB/out" "$SB/err" "$(root_of)/run-both.json" | grep -c "$CANARY")"
+check "O8d: the CLI-home file itself is intact" test "$(cat "$SB/home/$DENY_NAME/canary.txt")" = "$CANARY"
 
 # ---- the live gate in the real library is still intact (the sandbox override is only in the sandbox copy) -----------------------
 check "the real lib/common.sh was not changed by the sandbox override" test "$(grep -c 'spike_require_live() { :; }' "$SPIKE/lib/common.sh")" = "0"
