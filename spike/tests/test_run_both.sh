@@ -1020,6 +1020,7 @@ RD="$SR/$RDN"
 rd_files claude "$RD/repo-wt/claude-1" "$RD"
 rd_files codex "$RD/repo-wt/codex-1" "$RD"
 OWN_RUN_claude="$RD"
+# shellcheck disable=SC2034 # read indirectly by run_dir_of through ${!own}
 OWN_RUN_codex="$RD"
 eq "run_dir_of: claude, everything consistent and owned: the run dir" "$RD" "$(run_dir_of claude worktree.path)"
 eq "run_dir_of: codex, everything consistent and owned: the run dir" "$RD" "$(run_dir_of codex worktree.txt)"
@@ -1054,7 +1055,7 @@ OWN_RUN_claude="$SR/run-a/bcdefgT123456Z-abcdef"
 rd_files claude "$OWN_RUN_claude/repo-wt/claude-1" "$OWN_RUN_claude"
 check "run_dir_of: a two-segment run dir name, owned and consistent: refused" test "$(run_dir_of claude worktree.path >/dev/null 2>&1; echo $?)" = "1"
 OWN_RUN_claude=""
-rm -rf "$SR/$RDN" "$SR/$RDV" "$SR/run-a" "$ROOT"
+rm -rf "${SR:?}/${RDN:?}" "${SR:?}/${RDV:?}" "${SR:?}/run-a" "$ROOT"
 
 # -- round 4c: table survives a signal trap that leaves a short PIPESTATUS (no unbound variable under set -u), and still fails
 rm -f "$TMP/tsig.out" "$TMP/tsig.err"
@@ -1082,7 +1083,7 @@ eq "table with a one-element status array: returns 1 and does not abort" "rc=1" 
 # -- round 4c: objects/info/alternates (and http-alternates) must be empty if present
 ALTN=0
 alt_case() { # alt_case <label> <file under objects/info> <content kind: ext|empty|link>
-  local label="$1" f alt ext
+  local label="$1" f ext
   ALTN=$((ALTN + 1))
   mk_wt
   f="$WREPO/.git/objects/info/$2"

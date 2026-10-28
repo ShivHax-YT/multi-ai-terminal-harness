@@ -520,7 +520,9 @@ cleanup_one() {
 
 # cleanup_scratch: once only, and only for a CLI that was started. Skipped with --keep.
 CLEANED=0
+# shellcheck disable=SC2034 # read indirectly by run_dir_of through ${!own}
 OWN_RUN_claude=""
+# shellcheck disable=SC2034 # read indirectly by run_dir_of through ${!own}
 OWN_RUN_codex=""
 STARTED_CLAUDE=0
 STARTED_CODEX=0
@@ -620,6 +622,7 @@ SPIKE_CAPTURES_ROOT="$ROOT" "$HERE/claude/run.sh" < /dev/null 2>&1 | ( trap '' I
 RC_CLAUDE="${PIPESTATUS[0]}"
 RUNS_AFTER="$(list_runs)"
 RA_RC=$?
+# shellcheck disable=SC2034 # read indirectly by run_dir_of through ${!own}
 OWN_RUN_claude="$(own_run "$RUNS_BEFORE" "$RB_RC" "$RUNS_AFTER" "$RA_RC")" || OWN_RUN_claude=""
 stop_if_signalled
 /bin/sleep "$GAP_SECS"
@@ -631,6 +634,7 @@ SPIKE_CAPTURES_ROOT="$ROOT" "$HERE/codex/run.sh" < /dev/null 2>&1 | ( trap '' IN
 RC_CODEX="${PIPESTATUS[0]}"
 RUNS_AFTER="$(list_runs)"
 RA_RC=$?
+# shellcheck disable=SC2034 # read indirectly by run_dir_of through ${!own}
 OWN_RUN_codex="$(own_run "$RUNS_BEFORE" "$RB_RC" "$RUNS_AFTER" "$RA_RC")" || OWN_RUN_codex=""
 stop_if_signalled
 
