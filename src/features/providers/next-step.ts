@@ -1,6 +1,7 @@
 // The one next step per provider, decided from the status the backend reported. `usable` and `blockers` are the
 // backend's answer (rule 4: no CLI files are read here); this module never recomputes them.
 import type { Blocker, ProviderStatus } from "@/lib/ipc";
+import { PROVIDER_IDS, type ProviderId } from "@/strings/providers";
 
 export type StepKind = "check_again" | "confirm" | "sign_in" | "go_to_lead";
 
@@ -16,9 +17,20 @@ const STEPS: Record<StepKind, NextStep> = {
   go_to_lead: { kind: "go_to_lead", label: "Go to Lead" },
 };
 
+/**
+ * Rule 7, defense in depth: providers that never get a sign-in or confirm step, whatever `auth_modes` says. Names live
+ * only in src/strings/providers.ts (rule 8), so the entry is picked by position; next-step.test.ts pins it.
+ */
+export const NEVER_SIGN_IN: readonly ProviderId[] = [PROVIDER_IDS[4]];
+
+/** True when this provider can only run on an API key (rule 7), by its auth modes or the never-sign-in list. */
+export function keyOnly(status: ProviderStatus): boolean {
+  return NEVER_SIGN_IN.includes(status.provider) || !status.auth_modes.includes("subscription");
+}
+
 /** True when a subscription login may be used for this provider (rule 7: never for key-only tools). */
 export function subscriptionAllowed(status: ProviderStatus): boolean {
-  return status.auth_modes.includes("subscription") && status.killswitch !== "api_key_only";
+  return !keyOnly(status) && status.killswitch !== "api_key_only";
 }
 
 /** The single next step, or null when nothing the user can do here moves it forward. */
@@ -58,4 +70,11 @@ const BLOCKER_SENTENCES: Record<Blocker, string> = {
 export function blockerSentence(blocker: Blocker): string {
   const sentence = (BLOCKER_SENTENCES as Partial<Record<string, string>>)[blocker];
   return sentence ?? "Something blocks this tool.";
+}
+
+/** Blockers worth showing: sign-in and confirm blockers are hidden when no subscription login is on offer. */
+export function visibleBlockers(status: ProviderStatus): Blocker[] {
+  if (subscriptionAllowed(status)) return status.usable.blockers;
+  const hidden: Blocker[] = ["signed_out", "sign_in_unknown", "personal_use_unconfirmed"];
+  return status.usable.blockers.filter((b) => !hidden.includes(b));
 }

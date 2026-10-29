@@ -2,20 +2,11 @@
 import { act, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
-import type { ProviderStatus } from "@/lib/ipc";
 import { createMockIpc, type MockIpc } from "@/lib/ipc/mock";
 import { renderRoute } from "@/test/render";
 import { providerLabel, type ProviderId } from "@/strings/providers";
 
-interface Seedable {
-  providers: Map<ProviderId, ProviderStatus>;
-}
-
-function seed(mock: MockIpc, id: ProviderId, patch: Partial<ProviderStatus>): void {
-  const status = (mock.control.backend as unknown as Seedable).providers.get(id);
-  if (status === undefined) throw new Error("provider missing");
-  Object.assign(status, patch);
-}
+import { seedProvider } from "./test-seed";
 
 const card = (id: ProviderId) =>
   screen.findByRole("group", { name: providerLabel(id) }, { timeout: 10_000 });
@@ -52,7 +43,7 @@ describe("rule 6: failed binary (binary_failed)", () => {
   it("shows a refused login as Blocked by rule 6, stays put, and does not retry", async () => {
     // The screen's copy of the status is stale (it looks fine); the backend refuses.
     const mock = createMockIpc({ scenario: "ready" });
-    seed(mock, "claude", { sign_in: { state: "signed_out" } });
+    seedProvider(mock, "claude", { sign_in: { state: "signed_out" } });
     mock.control.failNext("open_provider_login", {
       kind: "rule_blocked",
       rule: 6,
@@ -73,7 +64,7 @@ describe("rule 6: failed binary (binary_failed)", () => {
 
   it("an unverified (unchecked) binary also gets Check again and no sign-in", async () => {
     const mock = createMockIpc({ scenario: "ready" });
-    seed(mock, "codex", {
+    seedProvider(mock, "codex", {
       binary: { state: "unchecked", checks: [] },
       usable: { lead: false, worker: false, blockers: ["binary_unchecked"] },
     });

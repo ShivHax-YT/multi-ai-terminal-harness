@@ -18,7 +18,7 @@ export default function ProvidersScreen() {
   return (
     <div className="flex flex-col gap-6">
       <p className="max-w-[65ch] text-sm text-muted-foreground">
-        Each tool runs on this Mac. You sign in to each one yourself, in its own terminal. Harness
+        Each tool runs on this Mac. You sign in to each one yourself, in its own terminal. This app
         never sees or stores your password.
       </p>
       <ProvidersBody providers={providers} />

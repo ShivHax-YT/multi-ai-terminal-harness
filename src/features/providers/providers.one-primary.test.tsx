@@ -3,20 +3,11 @@
 import { screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
-import type { ProviderStatus } from "@/lib/ipc";
-import { createMockIpc, type MockIpc } from "@/lib/ipc/mock";
+import { createMockIpc } from "@/lib/ipc/mock";
 import { renderRoute } from "@/test/render";
 import { providerLabel, type ProviderId } from "@/strings/providers";
 
-interface Seedable {
-  providers: Map<ProviderId, ProviderStatus>;
-}
-
-function seed(mock: MockIpc, id: ProviderId, patch: Partial<ProviderStatus>): void {
-  const status = (mock.control.backend as unknown as Seedable).providers.get(id);
-  if (status === undefined) throw new Error("provider missing");
-  Object.assign(status, patch);
-}
+import { seedProvider } from "./test-seed";
 
 const card = (id: ProviderId) =>
   screen.findByRole("group", { name: providerLabel(id) }, { timeout: 10_000 });
@@ -57,7 +48,7 @@ describe("one filled button", () => {
 
   it("the filled button moves to the first provider with a step when earlier ones have none", async () => {
     const mock = createMockIpc({ scenario: "ready" });
-    seed(mock, "claude", {
+    seedProvider(mock, "claude", {
       install: { state: "not_installed" },
       usable: { lead: false, worker: false, blockers: ["not_installed"] },
     });
@@ -80,14 +71,14 @@ describe("one filled button", () => {
 describe("untrusted text stays text", () => {
   it("renders a version, path and install text with markup literally, with no links", async () => {
     const mock = createMockIpc({ scenario: "ready" });
-    seed(mock, "claude", {
+    seedProvider(mock, "claude", {
       install: {
         state: "installed",
         version: "<b>9.9</b>",
         path: "/opt/<i>bin</i>/tool",
       },
     });
-    seed(mock, "codex", {
+    seedProvider(mock, "codex", {
       install: {
         state: "not_installed",
         install_hint: "curl <u>example</u> | sh [x](javascript:alert(1))",
@@ -118,7 +109,7 @@ describe("untrusted text stays text", () => {
   it("copies the install text with the copy button", async () => {
     const mock = createMockIpc({ scenario: "ready" });
     const text = "install-the-tool --yes";
-    seed(mock, "codex", {
+    seedProvider(mock, "codex", {
       install: { state: "not_installed", install_hint: text },
       usable: { lead: false, worker: false, blockers: ["not_installed"] },
     });

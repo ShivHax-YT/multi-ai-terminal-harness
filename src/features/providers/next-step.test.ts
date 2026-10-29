@@ -3,7 +3,14 @@ import { describe, expect, it } from "vitest";
 import providersJson from "@/lib/ipc/fixtures/providers.json";
 import type { Blocker, ProviderStatus } from "@/lib/ipc";
 
-import { blockerSentence, nextStep, primaryProvider, subscriptionAllowed } from "./next-step";
+import {
+  blockerSentence,
+  NEVER_SIGN_IN,
+  nextStep,
+  primaryProvider,
+  subscriptionAllowed,
+  visibleBlockers,
+} from "./next-step";
 
 const base = (providersJson as ProviderStatus[]).find((p) => p.provider === "claude");
 if (base === undefined) throw new Error("fixture missing");
@@ -79,6 +86,51 @@ describe("nextStep", () => {
       usable: unusable(["api_key_missing"]),
     });
     expect(nextStep(switched)).toBeNull();
+  });
+});
+
+describe("rule 7 defense in depth", () => {
+  it("pins the never-sign-in list to the API-key-only provider", () => {
+    expect([...NEVER_SIGN_IN]).toEqual(["gemini"]);
+  });
+
+  it("offers no sign-in or confirm step for that provider whatever auth_modes says", () => {
+    for (const personal of [true, false]) {
+      const s = status({
+        provider: "gemini",
+        auth_modes: ["subscription", "api_key"],
+        sign_in: { state: "signed_out" },
+        personal_use_confirmed: personal,
+        usable: unusable(["signed_out"]),
+      });
+      expect(subscriptionAllowed(s)).toBe(false);
+      expect(nextStep(s)).toBeNull();
+    }
+  });
+});
+
+describe("visibleBlockers", () => {
+  const all: Blocker[] = [
+    "signed_out",
+    "sign_in_unknown",
+    "personal_use_unconfirmed",
+    "api_key_missing",
+  ];
+
+  it("keeps every blocker when a subscription login is on offer", () => {
+    expect(visibleBlockers(status({ usable: unusable(all) }))).toEqual(all);
+  });
+
+  it("drops sign-in and confirm blockers for api_key_only, key-only and the never-sign-in provider", () => {
+    for (const patch of [
+      { killswitch: "api_key_only" as const },
+      { auth_modes: ["api_key" as const] },
+      { provider: "gemini" as const },
+    ]) {
+      expect(visibleBlockers(status({ ...patch, usable: unusable(all) }))).toEqual([
+        "api_key_missing",
+      ]);
+    }
   });
 });
 

@@ -2,20 +2,11 @@
 import { screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
-import type { ProviderStatus } from "@/lib/ipc";
-import { createMockIpc, type MockIpc } from "@/lib/ipc/mock";
+import { createMockIpc } from "@/lib/ipc/mock";
 import { renderRoute } from "@/test/render";
 import { providerLabel, type ProviderId } from "@/strings/providers";
 
-interface Seedable {
-  providers: Map<ProviderId, ProviderStatus>;
-}
-
-function seed(mock: MockIpc, id: ProviderId, patch: Partial<ProviderStatus>): void {
-  const status = (mock.control.backend as unknown as Seedable).providers.get(id);
-  if (status === undefined) throw new Error("provider missing");
-  Object.assign(status, patch);
-}
+import { seedProvider } from "./test-seed";
 
 const card = (id: ProviderId) =>
   screen.findByRole("group", { name: providerLabel(id) }, { timeout: 10_000 });
@@ -36,7 +27,7 @@ describe("rule 12: kill switch (killswitch)", () => {
 
   it("a disabled provider that is also signed out and unverified still offers no action", async () => {
     const mock = createMockIpc({ scenario: "killswitch" });
-    seed(mock, "codex", {
+    seedProvider(mock, "codex", {
       sign_in: { state: "signed_out" },
       personal_use_confirmed: false,
       binary: { state: "unchecked", checks: [] },
@@ -48,7 +39,7 @@ describe("rule 12: kill switch (killswitch)", () => {
 
   it("api_key_only shows 'Subscription use is off. API key only.' and no sign-in", async () => {
     const mock = createMockIpc({ scenario: "ready" });
-    seed(mock, "codex", {
+    seedProvider(mock, "codex", {
       killswitch: "api_key_only",
       sign_in: { state: "signed_out" },
       personal_use_confirmed: false,
@@ -61,5 +52,46 @@ describe("rule 12: kill switch (killswitch)", () => {
       "href",
       "#/settings",
     );
+  });
+
+  it("hides the sign-in and confirm blocker sentences when subscription use is off", async () => {
+    const mock = createMockIpc({ scenario: "ready" });
+    renderRoute("/providers", {
+      mock: {
+        ...mock,
+        client: {
+          ...mock.client,
+          list_providers: async () =>
+            (await mock.client.list_providers()).map((p) =>
+              p.provider === "codex"
+                ? {
+                    ...p,
+                    killswitch: "api_key_only" as const,
+                    sign_in: { state: "signed_out" as const },
+                    personal_use_confirmed: false,
+                    usable: {
+                      lead: false,
+                      worker: false,
+                      blockers: [
+                        "signed_out" as const,
+                        "sign_in_unknown" as const,
+                        "personal_use_unconfirmed" as const,
+                        "api_key_missing" as const,
+                      ],
+                    },
+                  }
+                : p,
+            ),
+        },
+      },
+    });
+    const codex = await card("codex");
+    const list = within(codex).getByRole("list", { name: "What blocks it" });
+    expect(
+      within(list)
+        .getAllByRole("listitem")
+        .map((li) => li.textContent),
+    ).toEqual(["Add an API key in Settings to use this tool."]);
+    expect(within(codex).queryByText(/signed out|sign in in|own personal account/i)).toBeNull();
   });
 });

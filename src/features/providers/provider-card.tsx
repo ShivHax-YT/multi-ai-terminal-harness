@@ -18,7 +18,14 @@ import type { BinaryCheck, ProviderStatus } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
 import { providerLabel } from "@/strings/providers";
 
-import { blockerSentence, nextStep, subscriptionAllowed, type NextStep } from "./next-step";
+import {
+  blockerSentence,
+  keyOnly,
+  nextStep,
+  subscriptionAllowed,
+  visibleBlockers,
+  type NextStep,
+} from "./next-step";
 import { useProviderStep, type IpcStepKind } from "./use-providers";
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
@@ -78,12 +85,13 @@ function BinaryRow({ status }: { status: ProviderStatus }) {
         ? { tone: "danger", label: "Failed verification" }
         : { tone: "warning", label: "Not verified yet" };
   return (
-    <>
-      <Row label="Binary">
-        <StatusChip {...chip} />
-      </Row>
+    <Row label="Binary">
+      <StatusChip {...chip} />
       {binary.state === "failed" && binary.checks.length > 0 && (
-        <ul aria-label="Verification checks" className="flex flex-col gap-1.5">
+        <ul
+          aria-label="Verification checks"
+          className="flex flex-col gap-1.5 self-stretch text-left"
+        >
           {binary.checks.map((check) => {
             const result = CHECK_TONE[check.result];
             return (
@@ -98,12 +106,12 @@ function BinaryRow({ status }: { status: ProviderStatus }) {
           })}
         </ul>
       )}
-    </>
+    </Row>
   );
 }
 
 function SignInRows({ status }: { status: ProviderStatus }) {
-  if (!status.auth_modes.includes("subscription")) {
+  if (keyOnly(status)) {
     // Rule 7: key-only tools have no sign-in control anywhere, only this label.
     return (
       <Row label="Sign-in">
@@ -160,9 +168,11 @@ function StepButton({
   step,
   primary,
   pending,
+  titleId,
   onRun,
 }: {
   step: NextStep;
+  titleId: string;
   primary: boolean;
   pending: boolean;
   onRun: () => void;
@@ -174,6 +184,7 @@ function StepButton({
       className={cn(primary && "min-h-11 px-5")}
       disabled={pending}
       aria-busy={pending}
+      aria-describedby={titleId}
       onClick={onRun}
     >
       {step.label}
@@ -183,6 +194,7 @@ function StepButton({
 
 export function ProviderCard({ status, primary }: { status: ProviderStatus; primary: boolean }) {
   const titleId = useId();
+  const hintId = useId();
   const navigate = useNavigate();
   const step = nextStep(status);
   const mutation = useProviderStep(status);
@@ -192,6 +204,7 @@ export function ProviderCard({ status, primary }: { status: ProviderStatus; prim
   const run = (kind: IpcStepKind) => () => {
     mutation.mutate(kind);
   };
+  const blockers = visibleBlockers(status);
   const showKeyRow = !subscriptionAllowed(status) && status.api_key !== null;
 
   return (
@@ -235,9 +248,9 @@ export function ProviderCard({ status, primary }: { status: ProviderStatus; prim
           <StatusChip tone="neutral" label="Not available yet" className="w-fit" />
         )}
         {available && !installed && <InstallText status={status} />}
-        {status.usable.blockers.length > 0 && (
+        {blockers.length > 0 && (
           <ul aria-label="What blocks it" className="flex flex-col gap-1 text-sm">
-            {status.usable.blockers.map((blocker) => (
+            {blockers.map((blocker) => (
               <li key={blocker} className="text-muted-foreground">
                 {blockerSentence(blocker)}
               </li>
@@ -252,6 +265,7 @@ export function ProviderCard({ status, primary }: { status: ProviderStatus; prim
             step={step}
             primary={primary}
             pending={mutation.isPending}
+            titleId={titleId}
             onRun={run(step.kind)}
           />
         )}
@@ -260,19 +274,32 @@ export function ProviderCard({ status, primary }: { status: ProviderStatus; prim
             step={step}
             primary={primary}
             pending={false}
+            titleId={titleId}
             onRun={() => {
               void navigate(paths.lead());
             }}
           />
         )}
         {step?.kind === "confirm" && status.sign_in.state !== "signed_in" && (
-          <Button type="button" variant="outline" disabled>
-            Sign in in terminal
-          </Button>
+          <>
+            <Button
+              type="button"
+              variant="outline"
+              disabled
+              aria-describedby={`${titleId} ${hintId}`}
+            >
+              Sign in in terminal
+            </Button>
+            <span id={hintId} className="sr-only">
+              Confirm your account first
+            </span>
+          </>
         )}
         {available && !subscriptionAllowed(status) && (
           <Button asChild variant="outline" size="sm">
-            <Link to={paths.settings()}>Open Settings</Link>
+            <Link to={paths.settings()} aria-describedby={titleId}>
+              Open Settings
+            </Link>
           </Button>
         )}
       </CardFooter>
