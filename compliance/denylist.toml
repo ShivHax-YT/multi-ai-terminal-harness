@@ -1,0 +1,29 @@
+# Credential denylist for the file-access layer (hard rule 4). Single source of truth for the Rust code.
+#
+# Embedded with include_str! by src-tauri/crates/harness-core/src/fs_guard/denylist.rs and parsed once at startup.
+# This file is one of the few places in the repo allowed to name provider credential paths and Keychain service names
+# (scripts/ci/compliance-scan.sh allows compliance/). No Rust file may repeat any string below; a test greps for them.
+# Windows credential paths are Phase 5. compliance/denylist.txt is the older list the Phase 0 spike scripts read.
+
+# Directories and files relative to the account's home directory. Each entry, everything under it, and any sibling whose
+# name continues the final segment after a dot (a backup or lock copy of a listed file) is refused. Matching is
+# case-insensitive and happens on canonicalized absolute paths, so symlinks and ".." cannot get around it. Entries are
+# relative, use "/" between segments, and never contain "." or ".." segments.
+home_dirs = [
+  ".claude",
+  ".claude.json",
+  ".codex",
+  ".grok",
+  ".kimi-code",
+  ".kimi",
+  ".gemini",
+]
+
+# macOS Keychain service names owned by the provider CLIs. Data only: the app never queries the Keychain for these.
+# Confirm the names for the other providers on a real install before Phase 3 (never by reading the Keychain from code).
+keychain_services = [
+  "Claude Code-credentials",
+]
+
+# Exceptions. Must stay empty in Phase 1: the loader refuses a non-empty list, and deny always wins over an allow rule.
+allowed_exceptions = []
