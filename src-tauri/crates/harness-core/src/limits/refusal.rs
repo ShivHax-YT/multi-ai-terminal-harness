@@ -16,6 +16,8 @@ pub enum CeilingKind {
     AppBackground,
     /// The app has not reported presence yet, so the user is assumed away.
     PresenceUnknown,
+    /// A dispatch was attempted without a matching open run and session permit.
+    DispatchNotCoupled,
 }
 
 /// A hard-rule refusal. The app maps it to `IpcError { kind: "rule_blocked", rule, message, retry_at }`.

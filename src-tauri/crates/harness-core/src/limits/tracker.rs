@@ -10,8 +10,9 @@
 //! - Call [`ProviderLimits::load`] with the persisted snapshot before the first admission after a start.
 //! - Report presence with [`ProviderLimits::set_presence`] at least every few minutes; until the first report and after
 //!   it goes stale, everything is refused.
-//! - Dispatching one automated prompt must be coupled to all of: a [`SessionPermit`], an active [`RunGuard`], a turn
-//!   from [`ProviderLimits::record_turn`] and [`ProviderLimits::admit_prompt`]. No single check is enough alone.
+//! - Dispatching one automated prompt needs all four, and the types enforce it: [`ProviderLimits::admit_prompt`] and
+//!   [`ProviderLimits::record_turn`] each take the open [`RunGuard`] and the [`SessionPermit`] (same provider, from this
+//!   instance), so a dispatch without a run and a session does not compile. Call both before dispatching.
 //! - While a run is active, poll [`ProviderLimits::must_pause`]; an active run passing the daily budget is otherwise
 //!   only stopped at the next admission.
 
@@ -31,6 +32,8 @@ use std::time::Duration;
 const WINDOW_MINUTES: i64 = 60;
 /// A presence report older than this is treated as the user being away. Not a user setting; it only makes things stricter.
 const PRESENCE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+/// How far the wall clock may differ from the time proven by a saved snapshot before `load` trusts the snapshot instead.
+const CLOCK_TOLERANCE: TimeDelta = TimeDelta::minutes(5);
 
 /// A value against its limit and the ceiling (`Meter` in the IPC contract).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -64,6 +67,18 @@ pub struct RunDay {
     pub seconds: u64,
 }
 
+/// Clock readings taken when a snapshot was written. On load in the same boot they prove how much real time has passed,
+/// so a system date changed in between (to expire the prompt window or roll the day) is detected and ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClockAnchor {
+    /// `Clock::boot_id` when saved. Without a known, equal boot id nothing can be proven.
+    pub boot_id: Option<String>,
+    /// Monotonic reading when saved.
+    pub mono: Duration,
+    /// Trusted UTC time when saved.
+    pub wall: DateTime<Utc>,
+}
+
 /// What the usage store persists (T-112): enough to rebuild every counter after a restart. Sessions and active runs are
 /// not included because their guards die with the process. A crash loses the live stretch of any active run, so the
 /// store should snapshot periodically while a run is active.
@@ -72,6 +87,9 @@ pub struct LimitsSnapshot {
     pub prompts: BTreeMap<ProviderId, Vec<PromptRecord>>,
     pub turns: BTreeMap<String, u32>,
     pub run: BTreeMap<ProviderId, RunDay>,
+    /// Absent in snapshots written before this field existed; `load` then relies on the wall clock alone.
+    #[serde(default)]
+    pub anchor: Option<ClockAnchor>,
 }
 
 /// Enforces the ceilings for subscription providers. Cheap to clone; clones share state.
@@ -99,7 +117,7 @@ struct State {
 #[derive(Clone, Copy)]
 struct PresenceReport {
     presence: Presence,
-    /// Monotonic reading when the app reported it.
+    /// Monotonic reading when the app reported it; the report ages from here.
     at: Duration,
 }
 
@@ -149,7 +167,9 @@ impl ProviderLimits {
     }
 
     /// Records what the app reports about the user, stamped with the monotonic clock. Presence is never inferred here.
-    /// Until the first report, and again when a report is older than five minutes, automation is refused.
+    /// Until the first report, and again when a report is older than five minutes, automation is refused. The reported
+    /// idle time keeps growing with the monotonic time since the report, so a report of 29 idle minutes is 30 a minute
+    /// later even if no new report arrives.
     pub fn set_presence(&self, presence: Presence) {
         let mut state = self.lock();
         let tick = state.tick(&*self.inner.clock);
@@ -184,12 +204,19 @@ impl ProviderLimits {
         })
     }
 
-    /// Admits one automated prompt, or refuses. A refusal records nothing.
+    /// Admits one automated prompt for the provider of `run` and `session`, or refuses. A refusal records nothing.
     ///
-    /// This is only one of the checks a dispatch must pass: the caller must also hold a [`SessionPermit`] and an active
-    /// [`RunGuard`] and reserve a turn with [`record_turn`](Self::record_turn). The caller must persist
+    /// Taking the open [`RunGuard`] and the [`SessionPermit`] makes both a compile-time requirement; they must be for
+    /// the same provider and come from this instance, or the call is refused. This is still only one of the checks of a
+    /// dispatch: the caller must also reserve a turn with [`record_turn`](Self::record_turn). The caller must persist
     /// ([`snapshot`](Self::snapshot)) BEFORE it dispatches the prompt, so a crash after dispatch cannot lose the count.
-    pub fn admit_prompt(&self, provider: ProviderId, task_id: &str) -> Result<(), Refusal> {
+    pub fn admit_prompt(
+        &self,
+        run: &RunGuard,
+        session: &SessionPermit,
+        task_id: &str,
+    ) -> Result<(), Refusal> {
+        let provider = self.coupled_provider(run, session)?;
         let limits = self.inner.limits;
         let mut state = self.lock();
         let tick = state.tick(&*self.inner.clock);
@@ -220,9 +247,17 @@ impl ProviderLimits {
         Ok(())
     }
 
-    /// Counts one turn of `task_id` run on `provider` and returns the new count. Refused at the per-task ceiling and
-    /// whenever [`must_pause`](Self::must_pause) is true for the provider. A refusal counts nothing.
-    pub fn record_turn(&self, provider: ProviderId, task_id: &str) -> Result<u32, Refusal> {
+    /// Counts one turn of `task_id` run on the provider of `run` and `session`, and returns the new count. Like
+    /// [`admit_prompt`](Self::admit_prompt) it needs the open run and the session permit (same provider, this instance).
+    /// Refused at the per-task ceiling and whenever [`must_pause`](Self::must_pause) is true for the provider. A refusal
+    /// counts nothing.
+    pub fn record_turn(
+        &self,
+        run: &RunGuard,
+        session: &SessionPermit,
+        task_id: &str,
+    ) -> Result<u32, Refusal> {
+        let provider = self.coupled_provider(run, session)?;
         let limits = self.inner.limits;
         let mut state = self.lock();
         let tick = state.tick(&*self.inner.clock);
@@ -280,7 +315,7 @@ impl ProviderLimits {
         let prompts = state.prompts.entry(provider).or_default();
         prune(prompts, tick.now);
         let prompts = to_u32(prompts.len());
-        let run_minutes = state.run(provider, tick).used_ms / 60_000;
+        let run_minutes = state.run(provider, tick).used.as_secs() / 60;
         ProviderMeters {
             sessions: Meter {
                 current: sessions,
@@ -323,13 +358,18 @@ impl ProviderLimits {
             }
         }
         out.turns = state.turns.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        out.anchor = Some(ClockAnchor {
+            boot_id: self.inner.clock.boot_id(),
+            mono: tick.mono,
+            wall: tick.now,
+        });
         for (provider, run) in &mut state.runs {
             run.settle(tick);
             out.run.insert(
                 *provider,
                 RunDay {
                     day: run.day,
-                    seconds: run.used_ms.div_ceil(1000),
+                    seconds: run.used.as_secs() + u64::from(run.used.subsec_nanos() > 0),
                 },
             );
         }
@@ -342,7 +382,16 @@ impl ProviderLimits {
     /// empty snapshot therefore never resets anything (rule 2).
     pub fn load(&self, snapshot: &LimitsSnapshot) {
         let mut state = self.lock();
-        let tick = state.tick(&*self.inner.clock);
+        let mut tick = state.tick(&*self.inner.clock);
+        if let Some(expected) = self.proven_now(snapshot, tick) {
+            if (tick.now - expected).abs() > CLOCK_TOLERANCE {
+                // The system date was changed since the snapshot was written: trust the proven time instead.
+                if let Some(timeline) = state.timeline.as_mut() {
+                    timeline.reanchor(expected, tick.mono);
+                }
+                tick = state.tick(&*self.inner.clock);
+            }
+        }
         for (provider, records) in &snapshot.prompts {
             let window = state.prompts.entry(*provider).or_default();
             // Multiset union: identical records at one instant are distinct prompts, so add only the surplus.
@@ -362,12 +411,42 @@ impl ProviderLimits {
         }
         for (provider, saved) in &snapshot.run {
             let run = state.run(*provider, tick);
-            let saved_ms = saved.seconds.saturating_mul(1000);
             if saved.day >= run.day {
                 run.day = saved.day;
-                run.used_ms = run.used_ms.max(saved_ms);
+                run.used = run.used.max(Duration::from_secs(saved.seconds));
             }
         }
+    }
+
+    /// The time a snapshot proves it is now: its saved time plus the real time since, valid only when it was saved in
+    /// this same boot (equal, known boot ids), when the monotonic clock is comparable. Across a reboot, or with an
+    /// unknown boot id, nothing can be proven and this is `None`; the wall clock is used and `load` still never lowers
+    /// a counter. Residual (documented in the handoff): a reboot plus a date change can still expire old entries.
+    fn proven_now(&self, snapshot: &LimitsSnapshot, tick: Tick) -> Option<DateTime<Utc>> {
+        let saved = snapshot.anchor.as_ref()?;
+        let saved_boot = saved.boot_id.as_ref()?;
+        if self.inner.clock.boot_id().as_ref() != Some(saved_boot) || tick.mono < saved.mono {
+            return None;
+        }
+        let real = TimeDelta::from_std(tick.mono - saved.mono).ok()?;
+        saved.wall.checked_add_signed(real)
+    }
+
+    /// The provider shared by `run` and `session`, if both belong to this instance and agree.
+    fn coupled_provider(
+        &self,
+        run: &RunGuard,
+        session: &SessionPermit,
+    ) -> Result<ProviderId, Refusal> {
+        let ours = Arc::ptr_eq(&run.inner, &self.inner) && Arc::ptr_eq(&session.inner, &self.inner);
+        if !ours || run.provider != session.provider {
+            return Err(Refusal::rule1(
+                CeilingKind::DispatchNotCoupled,
+                "A dispatch needs an open run and a session permit for the same provider",
+                None,
+            ));
+        }
+        Ok(run.provider)
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -444,9 +523,9 @@ fn hold_check(
     limits: &EffectiveLimits,
 ) -> Result<(), Refusal> {
     presence_check(state.presence.as_ref(), tick.mono, limits)?;
-    let budget_ms = u64::from(limits.run_minutes_per_day()) * 60_000;
+    let budget = Duration::from_secs(u64::from(limits.run_minutes_per_day()) * 60);
     let run = state.run(provider, tick);
-    if run.used_ms >= budget_ms {
+    if run.used >= budget {
         let retry_at = run
             .day
             .succ_opt()
@@ -489,8 +568,11 @@ fn presence_check(
             None,
         ));
     }
+    // Idle time keeps growing after the report: reported idle plus the monotonic time since it was reported.
     let idle_limit = limits.idle_pause_minutes();
-    if report.presence.idle_minutes >= idle_limit {
+    let idle_now = Duration::from_secs(u64::from(report.presence.idle_minutes) * 60)
+        .saturating_add(mono.saturating_sub(report.at));
+    if idle_now >= Duration::from_secs(u64::from(idle_limit) * 60) {
         return Err(Refusal::rule1(
             CeilingKind::UserIdle,
             format!("Automation pauses after {idle_limit} minutes without the user present"),

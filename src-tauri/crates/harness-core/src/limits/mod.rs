@@ -17,8 +17,8 @@ pub use config::{EffectiveLimits, UserLimits};
 pub use presence::Presence;
 pub use refusal::{CeilingKind, Refusal};
 pub use tracker::{
-    LimitsSnapshot, Meter, PromptRecord, ProviderLimits, ProviderMeters, RunDay, RunGuard,
-    SessionPermit,
+    ClockAnchor, LimitsSnapshot, Meter, PromptRecord, ProviderLimits, ProviderMeters, RunDay,
+    RunGuard, SessionPermit,
 };
 
 #[cfg(test)]

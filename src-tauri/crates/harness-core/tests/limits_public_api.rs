@@ -15,6 +15,17 @@ fn setup() -> (SimClock, ProviderLimits) {
     (clock, limits)
 }
 
+/// One dispatch-style admission with its own run and session, both released right away.
+fn admit(
+    limits: &ProviderLimits,
+    provider: ProviderId,
+    task: &str,
+) -> Result<(), harness_core::limits::Refusal> {
+    let run = limits.run_started(provider)?;
+    let session = limits.acquire_session(provider)?;
+    limits.admit_prompt(&run, &session, task)
+}
+
 /// One minute of simulated time with the app's presence heartbeat.
 fn minute(clock: &SimClock, limits: &ProviderLimits) {
     clock.advance(Duration::from_secs(60));
@@ -32,7 +43,7 @@ fn a_present_user_day_stops_at_the_run_ceiling() {
     for m in 0..(16 * 60) {
         // One prompt every 3 minutes keeps well under 30 per hour.
         if m % 3 == 0 {
-            match limits.admit_prompt(ProviderId::Claude, "task") {
+            match admit(&limits, ProviderId::Claude, "task") {
                 Ok(()) => admitted += 1,
                 Err(r) => {
                     assert_eq!(r.kind, CeilingKind::RunMinutesPerDay);
@@ -53,7 +64,7 @@ fn a_present_user_day_stops_at_the_run_ceiling() {
 #[test]
 fn going_idle_stops_work_and_returning_resumes_it() {
     let (clock, limits) = setup();
-    limits.admit_prompt(ProviderId::Codex, "task").unwrap();
+    admit(&limits, ProviderId::Codex, "task").unwrap();
     limits.set_presence(Presence {
         idle_minutes: 30,
         app_in_background: false,
@@ -63,10 +74,10 @@ fn going_idle_stops_work_and_returning_resumes_it() {
         idle_minutes: 31,
         app_in_background: false,
     });
-    let refused = limits.admit_prompt(ProviderId::Codex, "task").unwrap_err();
+    let refused = admit(&limits, ProviderId::Codex, "task").unwrap_err();
     assert_eq!((refused.rule, refused.kind), (1, CeilingKind::UserIdle));
     limits.set_presence(Presence::default());
-    limits.admit_prompt(ProviderId::Codex, "task").unwrap();
+    admit(&limits, ProviderId::Codex, "task").unwrap();
 }
 
 #[test]
@@ -94,17 +105,17 @@ fn no_public_way_to_exceed_a_ceiling() {
 fn the_user_changing_the_system_date_does_not_open_the_budget() {
     let (clock, limits) = setup();
     for _ in 0..30 {
-        limits.admit_prompt(ProviderId::Claude, "task").unwrap();
+        admit(&limits, ProviderId::Claude, "task").unwrap();
     }
     let run = limits.run_started(ProviderId::Claude).unwrap();
     for _ in 0..(8 * 60) {
         minute(&clock, &limits);
     }
     drop(run);
-    assert!(limits.admit_prompt(ProviderId::Claude, "task").is_err());
+    assert!(admit(&limits, ProviderId::Claude, "task").is_err());
     clock.jump_wall_forward(Duration::from_secs(48 * 3600));
     limits.set_presence(Presence::default());
-    let refused = limits.admit_prompt(ProviderId::Claude, "task").unwrap_err();
+    let refused = admit(&limits, ProviderId::Claude, "task").unwrap_err();
     assert_eq!(refused.kind, CeilingKind::RunMinutesPerDay);
     assert!(limits.run_started(ProviderId::Claude).is_err());
 }

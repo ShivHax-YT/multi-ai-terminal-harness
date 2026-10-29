@@ -39,6 +39,57 @@ impl Clock for SystemClock {
         }
         self.origin.elapsed()
     }
+
+    fn boot_id(&self) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        {
+            boot_session_uuid()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+}
+
+/// `kern.bootsessionuuid`: a random id per boot that setting the system date does not change (unlike `kern.boottime`,
+/// which follows the wall clock).
+#[cfg(target_os = "macos")]
+fn boot_session_uuid() -> Option<String> {
+    let name = c"kern.bootsessionuuid";
+    let mut len: libc::size_t = 0;
+    // SAFETY: a null output buffer with a valid length pointer asks sysctl for the required size.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    // SAFETY: `buf` is writable for `len` bytes and `len` is updated to the bytes written.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+    String::from_utf8(buf).ok().filter(|s| !s.is_empty())
 }
 
 /// `CLOCK_MONOTONIC` on macOS counts sleep time, unlike `Instant`.
@@ -71,6 +122,15 @@ mod tests {
             assert!(next >= last);
             last = next;
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn boot_id_is_known_and_stable_on_macos() {
+        let clock = SystemClock::new();
+        let first = clock.boot_id();
+        assert!(first.is_some());
+        assert_eq!(clock.boot_id(), first);
     }
 
     #[test]

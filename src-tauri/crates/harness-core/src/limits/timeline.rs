@@ -33,6 +33,14 @@ impl Timeline {
         }
     }
 
+    /// Moves the anchor so that trusted time at monotonic reading `mono` is `wall`. Used by `load` when a saved snapshot
+    /// proves the wall clock was changed since it was written.
+    pub(super) fn reanchor(&mut self, wall: DateTime<Utc>, mono: Duration) {
+        self.anchor_wall = wall;
+        self.anchor_mono = mono;
+        self.last_mono = self.last_mono.max(mono);
+    }
+
     /// Reads the monotonic clock and returns trusted time. Never goes backwards.
     pub(super) fn tick(&mut self, clock: &dyn Clock) -> Tick {
         let mono = clock.monotonic().max(self.last_mono);

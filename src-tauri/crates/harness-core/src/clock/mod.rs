@@ -22,6 +22,12 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
     /// Time since an arbitrary fixed origin. Never goes backwards; use it for elapsed-time measurements.
     fn monotonic(&self) -> Duration;
+    /// Identity of the current boot of the machine, if the platform can tell. The monotonic clock restarts from an
+    /// arbitrary origin on a new boot, so two readings are only comparable when this is equal. It must not depend on
+    /// the wall clock. `None` means unknown, which callers treat as "a different boot".
+    fn boot_id(&self) -> Option<String> {
+        None
+    }
 }
 
 impl<C: Clock + ?Sized> Clock for Arc<C> {
@@ -30,6 +36,9 @@ impl<C: Clock + ?Sized> Clock for Arc<C> {
     }
     fn monotonic(&self) -> Duration {
         (**self).monotonic()
+    }
+    fn boot_id(&self) -> Option<String> {
+        (**self).boot_id()
     }
 }
 
@@ -75,6 +84,17 @@ mod tests {
         let dynamic: Arc<dyn Clock> = Arc::new(sim.clone());
         sim.advance(Duration::from_secs(5));
         assert_eq!(dynamic.monotonic(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn sim_clock_boot_id_is_fakeable_and_shared_by_clones() {
+        let clock = SimClock::new(start());
+        let other = clock.clone();
+        let first = clock.boot_id();
+        assert!(first.is_some());
+        assert_eq!(other.boot_id(), first);
+        clock.set_boot_id("another-boot");
+        assert_eq!(other.boot_id().as_deref(), Some("another-boot"));
     }
 
     #[test]

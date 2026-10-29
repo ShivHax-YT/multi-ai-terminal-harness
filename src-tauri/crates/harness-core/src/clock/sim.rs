@@ -5,12 +5,13 @@ use chrono::{DateTime, TimeDelta, Utc};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Timeline {
     /// Real elapsed time: drives both readings.
     elapsed: Duration,
     /// How far the wall clock has been moved away from real time (the user changing the system date).
     wall_shift: TimeDelta,
+    boot_id: String,
 }
 
 /// Deterministic clock for tests and the 24-hour simulation. Clones share one timeline.
@@ -24,7 +25,11 @@ impl SimClock {
     pub fn new(start: DateTime<Utc>) -> Self {
         Self {
             start,
-            timeline: Arc::new(Mutex::new(Timeline::default())),
+            timeline: Arc::new(Mutex::new(Timeline {
+                elapsed: Duration::ZERO,
+                wall_shift: TimeDelta::zero(),
+                boot_id: "sim-boot-1".to_owned(),
+            })),
         }
     }
 
@@ -48,6 +53,12 @@ impl SimClock {
         t.wall_shift = t.wall_shift.checked_sub(&by).unwrap_or(t.wall_shift);
     }
 
+    /// Simulates a reboot: the machine gets a new boot identity. (A real reboot also restarts the monotonic clock;
+    /// readings across different boot ids are never compared, so the simulation keeps one timeline.)
+    pub fn set_boot_id(&self, id: &str) {
+        self.lock().boot_id = id.to_owned();
+    }
+
     fn lock(&self) -> MutexGuard<'_, Timeline> {
         self.timeline.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -63,5 +74,9 @@ impl Clock for SimClock {
 
     fn monotonic(&self) -> Duration {
         self.lock().elapsed
+    }
+
+    fn boot_id(&self) -> Option<String> {
+        Some(self.lock().boot_id.clone())
     }
 }
