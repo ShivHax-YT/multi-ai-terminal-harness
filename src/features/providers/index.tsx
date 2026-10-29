@@ -8,6 +8,7 @@ import { EmptyState, ErrorAlert, LoadingSkeleton } from "@/components/common";
 import { Button } from "@/components/ui/button";
 import { toIpcRejection } from "@/lib/ipc";
 
+import { STAGGERED_CARDS } from "./motion-budget";
 import { primaryProvider } from "./next-step";
 import { ProviderCard } from "./provider-card";
 import { useProviders } from "./use-providers";
@@ -68,15 +69,25 @@ function ProvidersBody({ providers }: { providers: ReturnType<typeof useProvider
           className="py-8"
         />
       )}
-      <Stagger className="grid grid-cols-1 gap-4 min-[900px]:grid-cols-2 min-[1280px]:grid-cols-3 [&>*]:h-full">
-        {list.map((status) => (
+      <div className="grid grid-cols-1 gap-4 min-[900px]:grid-cols-2 min-[1280px]:grid-cols-3">
+        {/* Only the first cards stagger, so the whole entrance stays within the 300 ms budget; the rest are static. */}
+        <Stagger className="contents">
+          {list.slice(0, STAGGERED_CARDS).map((status) => (
+            <ProviderCard
+              key={status.provider}
+              status={status}
+              primary={status.provider === primary}
+            />
+          ))}
+        </Stagger>
+        {list.slice(STAGGERED_CARDS).map((status) => (
           <ProviderCard
             key={status.provider}
             status={status}
             primary={status.provider === primary}
           />
         ))}
-      </Stagger>
+      </div>
     </>
   );
 }
