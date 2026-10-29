@@ -1631,6 +1631,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "getrandom 0.4.3",
+ "harness-core",
  "hex",
  "libc",
  "rusqlite",

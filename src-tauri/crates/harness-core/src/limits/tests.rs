@@ -2,19 +2,25 @@
 
 use super::*;
 use crate::clock::{Clock, SimClock};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-
-const MIN: u64 = 60;
 
 fn noon() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 29, 12, 0, 0).unwrap()
 }
 
+fn present() -> Presence {
+    Presence::default()
+}
+
+/// Limits over a simulated clock, with the app having just reported that the user is present.
 fn setup_at(start: DateTime<Utc>) -> (SimClock, ProviderLimits) {
     let clock = SimClock::new(start);
     let limits = ProviderLimits::new(Arc::new(clock.clone()));
+    limits.set_presence(present());
     (clock, limits)
 }
 
@@ -22,22 +28,32 @@ fn setup() -> (SimClock, ProviderLimits) {
     setup_at(noon())
 }
 
-fn mins(clock: &SimClock, n: u64) {
-    clock.advance(Duration::from_secs(n * MIN));
+/// Advances real time by `n` minutes while the app keeps reporting a present user every four minutes.
+fn mins(clock: &SimClock, limits: &ProviderLimits, n: u64) {
+    let mut left = n;
+    while left > 0 {
+        let step = left.min(4);
+        clock.advance(Duration::from_secs(step * 60));
+        limits.set_presence(present());
+        left -= step;
+    }
 }
 
 fn refusal<T: std::fmt::Debug>(r: Result<T, Refusal>) -> Refusal {
     r.expect_err("expected a refusal")
 }
 
+const CLAUDE: ProviderId = ProviderId::Claude;
+const CODEX: ProviderId = ProviderId::Codex;
+
 // ---- sessions ---------------------------------------------------------------------------------------------------
 
 #[test]
 fn third_session_refused() {
     let (_clock, limits) = setup();
-    let a = limits.acquire_session(ProviderId::Claude).unwrap();
-    let b = limits.acquire_session(ProviderId::Claude).unwrap();
-    let refused = refusal(limits.acquire_session(ProviderId::Claude));
+    let a = limits.acquire_session(CLAUDE).unwrap();
+    let b = limits.acquire_session(CLAUDE).unwrap();
+    let refused = refusal(limits.acquire_session(CLAUDE));
     assert_eq!(refused.rule, 1);
     assert_eq!(refused.kind, CeilingKind::ConcurrentSessions);
     assert!(refused.retry_at.is_none());
@@ -47,32 +63,104 @@ fn third_session_refused() {
 #[test]
 fn dropping_a_permit_frees_the_slot() {
     let (_clock, limits) = setup();
-    let a = limits.acquire_session(ProviderId::Codex).unwrap();
-    let _b = limits.acquire_session(ProviderId::Codex).unwrap();
-    assert!(limits.acquire_session(ProviderId::Codex).is_err());
+    let a = limits.acquire_session(CODEX).unwrap();
+    let _b = limits.acquire_session(CODEX).unwrap();
+    assert!(limits.acquire_session(CODEX).is_err());
     drop(a);
-    let _c = limits.acquire_session(ProviderId::Codex).unwrap();
-    assert!(limits.acquire_session(ProviderId::Codex).is_err());
+    let _c = limits.acquire_session(CODEX).unwrap();
+    assert!(limits.acquire_session(CODEX).is_err());
 }
 
 #[test]
 fn session_slots_are_per_provider() {
     let (_clock, limits) = setup();
-    let _a = limits.acquire_session(ProviderId::Claude).unwrap();
-    let _b = limits.acquire_session(ProviderId::Claude).unwrap();
-    let c = limits.acquire_session(ProviderId::Codex).unwrap();
-    assert_eq!(c.provider(), ProviderId::Codex);
+    let _a = limits.acquire_session(CLAUDE).unwrap();
+    let _b = limits.acquire_session(CLAUDE).unwrap();
+    let c = limits.acquire_session(CODEX).unwrap();
+    assert_eq!(c.provider(), CODEX);
 }
 
 #[test]
 fn permit_outlives_the_limits_handle_it_came_from() {
     let (_clock, limits) = setup();
-    let permit = limits.acquire_session(ProviderId::Claude).unwrap();
+    let permit = limits.acquire_session(CLAUDE).unwrap();
     let other = limits.clone();
     drop(limits);
-    assert_eq!(other.meters(ProviderId::Claude).sessions.current, 1);
+    assert_eq!(other.meters(CLAUDE).sessions.current, 1);
     drop(permit);
-    assert_eq!(other.meters(ProviderId::Claude).sessions.current, 0);
+    assert_eq!(other.meters(CLAUDE).sessions.current, 0);
+}
+
+#[test]
+fn permit_is_released_when_a_thread_panics_holding_it() {
+    let (_clock, limits) = setup();
+    let _other = limits.acquire_session(CLAUDE).unwrap();
+    let permit = limits.acquire_session(CLAUDE).unwrap();
+    assert!(limits.acquire_session(CLAUDE).is_err());
+    let worker = std::thread::spawn(move || {
+        let _held = permit;
+        panic!("worker died while holding a session permit");
+    });
+    assert!(worker.join().is_err());
+    assert_eq!(limits.meters(CLAUDE).sessions.current, 1);
+    let _again = limits.acquire_session(CLAUDE).unwrap();
+}
+
+#[test]
+fn permit_is_released_when_a_caught_panic_unwinds_through_it() {
+    let (_clock, limits) = setup();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let _a = limits.acquire_session(CODEX).unwrap();
+        let _b = limits.acquire_session(CODEX).unwrap();
+        panic!("scope failed");
+    }));
+    assert!(result.is_err());
+    assert_eq!(limits.meters(CODEX).sessions.current, 0);
+    let _a = limits.acquire_session(CODEX).unwrap();
+    let _b = limits.acquire_session(CODEX).unwrap();
+}
+
+/// A clock that panics on demand, to poison the state lock from inside a limits call.
+struct PanickyClock {
+    inner: SimClock,
+    explode: Arc<AtomicBool>,
+}
+
+impl Clock for PanickyClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.inner.now()
+    }
+    fn monotonic(&self) -> Duration {
+        assert!(
+            !self.explode.load(Ordering::SeqCst),
+            "clock failed on purpose"
+        );
+        self.inner.monotonic()
+    }
+}
+
+#[test]
+fn permit_and_run_guard_release_even_if_the_state_lock_is_poisoned() {
+    let explode = Arc::new(AtomicBool::new(false));
+    let clock = PanickyClock {
+        inner: SimClock::new(noon()),
+        explode: Arc::clone(&explode),
+    };
+    let limits = ProviderLimits::new(Arc::new(clock));
+    limits.set_presence(present());
+    let permit = limits.acquire_session(CLAUDE).unwrap();
+    let guard = limits.run_started(CLAUDE).unwrap();
+
+    // A panic inside a limits call poisons the lock while it is held.
+    explode.store(true, Ordering::SeqCst);
+    let result = catch_unwind(AssertUnwindSafe(|| limits.admit_prompt(CLAUDE, "t1")));
+    assert!(result.is_err());
+    explode.store(false, Ordering::SeqCst);
+
+    drop(permit);
+    drop(guard);
+    assert_eq!(limits.meters(CLAUDE).sessions.current, 0);
+    let _again = limits.acquire_session(CLAUDE).unwrap();
 }
 
 // ---- prompts per hour -------------------------------------------------------------------------------------------
@@ -83,12 +171,12 @@ fn thirty_first_prompt_refused_within_hour() {
     let first = clock.now();
     for i in 0..30 {
         limits
-            .admit_prompt(ProviderId::Claude, "t1")
+            .admit_prompt(CLAUDE, "t1")
             .unwrap_or_else(|e| panic!("prompt {i} refused: {e}"));
-        mins(&clock, 1);
+        mins(&clock, &limits, 1);
     }
     // 30 minutes in, the window holds 30.
-    let refused = refusal(limits.admit_prompt(ProviderId::Claude, "t1"));
+    let refused = refusal(limits.admit_prompt(CLAUDE, "t1"));
     assert_eq!(refused.rule, 1);
     assert_eq!(refused.kind, CeilingKind::PromptsPerHour);
     assert_eq!(
@@ -101,49 +189,46 @@ fn thirty_first_prompt_refused_within_hour() {
 fn refused_prompt_is_not_recorded() {
     let (clock, limits) = setup();
     for _ in 0..30 {
-        limits.admit_prompt(ProviderId::Claude, "t1").unwrap();
+        limits.admit_prompt(CLAUDE, "t1").unwrap();
     }
     for _ in 0..10 {
-        assert!(limits.admit_prompt(ProviderId::Claude, "t1").is_err());
+        assert!(limits.admit_prompt(CLAUDE, "t1").is_err());
     }
-    assert_eq!(
-        limits.meters(ProviderId::Claude).prompts_last_hour.current,
-        30
-    );
+    assert_eq!(limits.meters(CLAUDE).prompts_last_hour.current, 30);
     // Once the original 30 age out, a full 30 are admitted again, so the refusals left nothing behind.
-    mins(&clock, 60);
+    mins(&clock, &limits, 60);
     for _ in 0..30 {
-        limits.admit_prompt(ProviderId::Claude, "t1").unwrap();
+        limits.admit_prompt(CLAUDE, "t1").unwrap();
     }
-    assert!(limits.admit_prompt(ProviderId::Claude, "t1").is_err());
+    assert!(limits.admit_prompt(CLAUDE, "t1").is_err());
 }
 
 #[test]
 fn prompt_window_slides() {
     let (clock, limits) = setup();
-    limits.admit_prompt(ProviderId::Claude, "t1").unwrap();
-    mins(&clock, 30);
+    limits.admit_prompt(CLAUDE, "t1").unwrap();
+    mins(&clock, &limits, 30);
     for _ in 0..29 {
-        limits.admit_prompt(ProviderId::Claude, "t1").unwrap();
+        limits.admit_prompt(CLAUDE, "t1").unwrap();
     }
-    assert!(limits.admit_prompt(ProviderId::Claude, "t1").is_err());
+    assert!(limits.admit_prompt(CLAUDE, "t1").is_err());
     // 59m59s after the first prompt it still counts; at exactly 60 minutes it has left the window.
-    mins(&clock, 29);
+    mins(&clock, &limits, 29);
     clock.advance(Duration::from_secs(59));
-    assert!(limits.admit_prompt(ProviderId::Claude, "t1").is_err());
+    assert!(limits.admit_prompt(CLAUDE, "t1").is_err());
     clock.advance(Duration::from_secs(1));
-    limits.admit_prompt(ProviderId::Claude, "t1").unwrap();
-    assert!(limits.admit_prompt(ProviderId::Claude, "t1").is_err());
+    limits.admit_prompt(CLAUDE, "t1").unwrap();
+    assert!(limits.admit_prompt(CLAUDE, "t1").is_err());
 }
 
 #[test]
 fn prompt_windows_are_per_provider() {
     let (_clock, limits) = setup();
     for _ in 0..30 {
-        limits.admit_prompt(ProviderId::Claude, "t1").unwrap();
+        limits.admit_prompt(CLAUDE, "t1").unwrap();
     }
-    assert!(limits.admit_prompt(ProviderId::Claude, "t1").is_err());
-    limits.admit_prompt(ProviderId::Codex, "t2").unwrap();
+    assert!(limits.admit_prompt(CLAUDE, "t1").is_err());
+    limits.admit_prompt(CODEX, "t2").unwrap();
 }
 
 // ---- turns per task ---------------------------------------------------------------------------------------------
@@ -152,9 +237,9 @@ fn prompt_windows_are_per_provider() {
 fn forty_first_turn_refused() {
     let (_clock, limits) = setup();
     for n in 1..=40 {
-        assert_eq!(limits.record_turn("task-a").unwrap(), n);
+        assert_eq!(limits.record_turn(CLAUDE, "task-a").unwrap(), n);
     }
-    let refused = refusal(limits.record_turn("task-a"));
+    let refused = refusal(limits.record_turn(CLAUDE, "task-a"));
     assert_eq!(refused.rule, 1);
     assert_eq!(refused.kind, CeilingKind::TurnsPerTask);
     assert!(refused.retry_at.is_none());
@@ -169,23 +254,49 @@ fn forty_first_turn_refused() {
 fn turns_are_counted_per_task_id() {
     let (_clock, limits) = setup();
     for _ in 0..40 {
-        limits.record_turn("task-a").unwrap();
+        limits.record_turn(CLAUDE, "task-a").unwrap();
     }
-    assert!(limits.record_turn("task-a").is_err());
-    assert_eq!(limits.record_turn("task-b").unwrap(), 1);
+    assert!(limits.record_turn(CLAUDE, "task-a").is_err());
+    assert_eq!(limits.record_turn(CLAUDE, "task-b").unwrap(), 1);
 }
 
 #[test]
 fn turns_survive_sessions_and_permits() {
     let (_clock, limits) = setup();
     {
-        let _permit = limits.acquire_session(ProviderId::Claude).unwrap();
+        let _permit = limits.acquire_session(CLAUDE).unwrap();
         for _ in 0..40 {
-            limits.record_turn("task-a").unwrap();
+            limits.record_turn(CLAUDE, "task-a").unwrap();
         }
     }
-    let _new_session = limits.acquire_session(ProviderId::Claude).unwrap();
-    assert!(limits.record_turn("task-a").is_err());
+    let _new_session = limits.acquire_session(CLAUDE).unwrap();
+    assert!(limits.record_turn(CLAUDE, "task-a").is_err());
+}
+
+#[test]
+fn record_turn_refused_when_must_pause_and_counts_nothing() {
+    let (_clock, limits) = setup();
+    limits.set_presence(Presence {
+        idle_minutes: 30,
+        app_in_background: false,
+    });
+    assert!(limits.must_pause(CLAUDE));
+    let refused = refusal(limits.record_turn(CLAUDE, "task-a"));
+    assert_eq!(refused.kind, CeilingKind::UserIdle);
+    assert_eq!(limits.task_turns("task-a").current, 0);
+    limits.set_presence(present());
+    assert_eq!(limits.record_turn(CLAUDE, "task-a").unwrap(), 1);
+}
+
+#[test]
+fn record_turn_refused_once_the_run_budget_is_used() {
+    let (clock, limits) = setup();
+    let _run = limits.run_started(CLAUDE).unwrap();
+    mins(&clock, &limits, 480);
+    let refused = refusal(limits.record_turn(CLAUDE, "task-a"));
+    assert_eq!(refused.kind, CeilingKind::RunMinutesPerDay);
+    // Another provider's budget is separate.
+    assert_eq!(limits.record_turn(CODEX, "task-b").unwrap(), 1);
 }
 
 // ---- run minutes per day ----------------------------------------------------------------------------------------
@@ -193,110 +304,241 @@ fn turns_survive_sessions_and_permits() {
 #[test]
 fn run_minutes_capped_at_480() {
     let (clock, limits) = setup();
-    limits.run_started(ProviderId::Claude).unwrap();
-    mins(&clock, 479);
-    limits.admit_prompt(ProviderId::Claude, "t1").unwrap();
-    assert_eq!(
-        limits.meters(ProviderId::Claude).run_minutes_today.current,
-        479
-    );
-    mins(&clock, 1);
-    let refused = refusal(limits.admit_prompt(ProviderId::Claude, "t1"));
+    let run = limits.run_started(CLAUDE).unwrap();
+    mins(&clock, &limits, 479);
+    limits.admit_prompt(CLAUDE, "t1").unwrap();
+    assert_eq!(limits.meters(CLAUDE).run_minutes_today.current, 479);
+    mins(&clock, &limits, 1);
+    let refused = refusal(limits.admit_prompt(CLAUDE, "t1"));
     assert_eq!(refused.rule, 1);
     assert_eq!(refused.kind, CeilingKind::RunMinutesPerDay);
     let midnight = Utc.with_ymd_and_hms(2026, 10, 30, 0, 0, 0).unwrap();
     assert_eq!(refused.retry_at, Some(midnight));
 
-    limits.run_stopped(ProviderId::Claude);
-    let again = refusal(limits.run_started(ProviderId::Claude));
+    drop(run);
+    let again = refusal(limits.run_started(CLAUDE));
     assert_eq!(again.kind, CeilingKind::RunMinutesPerDay);
     // The cap is per provider.
-    limits.run_started(ProviderId::Codex).unwrap();
+    let _other = limits.run_started(CODEX).unwrap();
 }
 
 #[test]
 fn run_minutes_accumulate_across_runs() {
     let (clock, limits) = setup();
     for _ in 0..4 {
-        limits.run_started(ProviderId::Codex).unwrap();
-        mins(&clock, 100);
-        limits.run_stopped(ProviderId::Codex);
-        mins(&clock, 10); // idle time between runs does not count
+        let run = limits.run_started(CODEX).unwrap();
+        mins(&clock, &limits, 100);
+        drop(run);
+        mins(&clock, &limits, 10); // time between runs does not count
     }
-    assert_eq!(
-        limits.meters(ProviderId::Codex).run_minutes_today.current,
-        400
-    );
-    limits.run_started(ProviderId::Codex).unwrap();
-    mins(&clock, 80);
-    assert!(limits.admit_prompt(ProviderId::Codex, "t1").is_err());
+    assert_eq!(limits.meters(CODEX).run_minutes_today.current, 400);
+    let _run = limits.run_started(CODEX).unwrap();
+    mins(&clock, &limits, 80);
+    assert!(limits.admit_prompt(CODEX, "t1").is_err());
 }
 
 #[test]
 fn run_counter_resets_at_utc_midnight_only() {
     let (clock, limits) = setup_at(Utc.with_ymd_and_hms(2026, 10, 29, 14, 0, 0).unwrap());
-    limits.run_started(ProviderId::Claude).unwrap();
-    mins(&clock, 480);
-    limits.run_stopped(ProviderId::Claude);
-    assert!(limits.run_started(ProviderId::Claude).is_err());
-    mins(&clock, 60 + 59); // 23:59 UTC
-    assert!(limits.run_started(ProviderId::Claude).is_err());
-    mins(&clock, 1); // 00:00 UTC
-    limits.run_started(ProviderId::Claude).unwrap();
-    assert_eq!(
-        limits.meters(ProviderId::Claude).run_minutes_today.current,
-        0
-    );
+    let run = limits.run_started(CLAUDE).unwrap();
+    mins(&clock, &limits, 480);
+    drop(run);
+    assert!(limits.run_started(CLAUDE).is_err());
+    mins(&clock, &limits, 60 + 59); // 23:59 UTC
+    assert!(limits.run_started(CLAUDE).is_err());
+    mins(&clock, &limits, 1); // 00:00 UTC
+    let _run = limits.run_started(CLAUDE).unwrap();
+    assert_eq!(limits.meters(CLAUDE).run_minutes_today.current, 0);
 }
 
 #[test]
 fn midnight_reset_does_not_reset_other_counters() {
     let (clock, limits) = setup_at(Utc.with_ymd_and_hms(2026, 10, 29, 23, 30, 0).unwrap());
     for _ in 0..40 {
-        limits.record_turn("task-a").unwrap();
+        limits.record_turn(CLAUDE, "task-a").unwrap();
     }
-    let _a = limits.acquire_session(ProviderId::Claude).unwrap();
-    let _b = limits.acquire_session(ProviderId::Claude).unwrap();
-    mins(&clock, 31); // past midnight, window still holds nothing, turns and sessions must stay
-    assert!(limits.record_turn("task-a").is_err());
-    assert!(limits.acquire_session(ProviderId::Claude).is_err());
+    let _a = limits.acquire_session(CLAUDE).unwrap();
+    let _b = limits.acquire_session(CLAUDE).unwrap();
+    mins(&clock, &limits, 31); // past midnight: turns and sessions must stay
+    assert!(limits.record_turn(CLAUDE, "task-a").is_err());
+    assert!(limits.acquire_session(CLAUDE).is_err());
 }
 
 #[test]
 fn a_run_spanning_midnight_only_counts_the_new_day() {
     let (clock, limits) = setup_at(Utc.with_ymd_and_hms(2026, 10, 29, 23, 0, 0).unwrap());
-    limits.run_started(ProviderId::Claude).unwrap();
-    mins(&clock, 90); // 00:30 next day
+    let run = limits.run_started(CLAUDE).unwrap();
+    mins(&clock, &limits, 90); // 00:30 next day
+    assert_eq!(limits.meters(CLAUDE).run_minutes_today.current, 30);
+    drop(run);
+    assert_eq!(limits.meters(CLAUDE).run_minutes_today.current, 30);
+}
+
+#[test]
+fn overlapping_runs_count_per_run() {
+    let (clock, limits) = setup();
+    let a = limits.run_started(CLAUDE).unwrap();
+    let b = limits.run_started(CLAUDE).unwrap();
+    mins(&clock, &limits, 10);
+    drop(a);
+    drop(b);
+    assert_eq!(limits.meters(CLAUDE).run_minutes_today.current, 20);
+    mins(&clock, &limits, 10);
     assert_eq!(
-        limits.meters(ProviderId::Claude).run_minutes_today.current,
-        30
-    );
-    limits.run_stopped(ProviderId::Claude);
-    assert_eq!(
-        limits.meters(ProviderId::Claude).run_minutes_today.current,
-        30
+        limits.meters(CLAUDE).run_minutes_today.current,
+        20,
+        "no run is open, so nothing accrues"
     );
 }
 
 #[test]
-fn overlapping_runs_count_wall_clock_once() {
+fn two_concurrent_runs_hit_the_cap_at_four_wall_hours() {
     let (clock, limits) = setup();
-    limits.run_started(ProviderId::Claude).unwrap();
-    limits.run_started(ProviderId::Claude).unwrap();
-    mins(&clock, 10);
-    limits.run_stopped(ProviderId::Claude);
-    mins(&clock, 10);
-    limits.run_stopped(ProviderId::Claude);
+    let _a = limits.run_started(CLAUDE).unwrap();
+    let _b = limits.run_started(CLAUDE).unwrap();
+    mins(&clock, &limits, 4 * 60 - 1);
+    limits.admit_prompt(CLAUDE, "t1").unwrap();
+    assert!(!limits.must_pause(CLAUDE));
+    mins(&clock, &limits, 1);
+    let refused = refusal(limits.admit_prompt(CLAUDE, "t1"));
+    assert_eq!(refused.kind, CeilingKind::RunMinutesPerDay);
+    assert_eq!(limits.meters(CLAUDE).run_minutes_today.current, 480);
+}
+
+#[test]
+fn dropping_a_run_guard_ends_the_run_even_on_panic() {
+    let (clock, limits) = setup();
+    let run = limits.run_started(CLAUDE).unwrap();
+    let worker = std::thread::spawn(move || {
+        let _held = run;
+        panic!("worker died mid-run");
+    });
+    assert!(worker.join().is_err());
+    let before = limits.meters(CLAUDE).run_minutes_today.current;
+    mins(&clock, &limits, 30);
+    assert_eq!(limits.meters(CLAUDE).run_minutes_today.current, before);
+}
+
+#[test]
+fn runs_accrue_in_milliseconds_so_short_runs_add_up() {
+    let (clock, limits) = setup();
+    for _ in 0..100 {
+        let run = limits.run_started(CLAUDE).unwrap();
+        clock.advance(Duration::from_millis(300));
+        drop(run);
+    }
+    let seconds = limits.snapshot().run[&CLAUDE].seconds;
+    assert_eq!(seconds, 30, "100 runs of 300 ms are 30 s");
+}
+
+#[test]
+fn a_backward_wall_clock_jump_never_reduces_run_time() {
+    let (clock, limits) = setup();
+    let _run = limits.run_started(CLAUDE).unwrap();
+    mins(&clock, &limits, 60);
+    clock.jump_wall_back(Duration::from_secs(3 * 3600));
+    assert_eq!(limits.meters(CLAUDE).run_minutes_today.current, 60);
+    mins(&clock, &limits, 60);
+    assert_eq!(limits.meters(CLAUDE).run_minutes_today.current, 120);
+}
+
+#[test]
+fn a_backward_wall_clock_jump_cannot_roll_a_day_back_and_reopen_the_budget() {
+    let (clock, limits) = setup_at(Utc.with_ymd_and_hms(2026, 10, 29, 8, 0, 0).unwrap());
+    let run = limits.run_started(CLAUDE).unwrap();
+    mins(&clock, &limits, 480);
+    drop(run);
+    clock.jump_wall_back(Duration::from_secs(24 * 3600));
+    limits.set_presence(present());
+    assert!(limits.run_started(CLAUDE).is_err());
+}
+
+#[test]
+fn a_forward_wall_clock_jump_does_not_roll_the_day() {
+    let (clock, limits) = setup();
+    let run = limits.run_started(CLAUDE).unwrap();
+    mins(&clock, &limits, 480);
+    drop(run);
+    assert!(limits.run_started(CLAUDE).is_err());
+    // The user sets the system date to tomorrow; no real time passes.
+    clock.jump_wall_forward(Duration::from_secs(24 * 3600));
+    limits.set_presence(present());
+    let refused = refusal(limits.run_started(CLAUDE));
+    assert_eq!(refused.kind, CeilingKind::RunMinutesPerDay);
+    assert_eq!(limits.meters(CLAUDE).run_minutes_today.current, 480);
+    // Real time still rolls the day: 20:00 plus four hours is the next UTC day.
+    mins(&clock, &limits, 4 * 60);
+    let _run = limits.run_started(CLAUDE).unwrap();
+}
+
+#[test]
+fn a_forward_wall_clock_jump_does_not_expire_prompts() {
+    let (clock, limits) = setup();
+    for _ in 0..30 {
+        limits.admit_prompt(CLAUDE, "t1").unwrap();
+    }
+    clock.jump_wall_forward(Duration::from_secs(2 * 3600));
+    limits.set_presence(present());
+    let refused = refusal(limits.admit_prompt(CLAUDE, "t1"));
+    assert_eq!(refused.kind, CeilingKind::PromptsPerHour);
+    assert_eq!(limits.meters(CLAUDE).prompts_last_hour.current, 30);
+    // Real time still ages them out.
+    mins(&clock, &limits, 60);
+    limits.admit_prompt(CLAUDE, "t1").unwrap();
+}
+
+#[test]
+fn a_backward_wall_clock_jump_does_not_keep_prompts_longer_than_real_time() {
+    let (clock, limits) = setup();
+    for _ in 0..30 {
+        limits.admit_prompt(CLAUDE, "t1").unwrap();
+    }
+    clock.jump_wall_back(Duration::from_secs(5 * 3600));
+    mins(&clock, &limits, 60);
+    limits.admit_prompt(CLAUDE, "t1").unwrap();
+}
+
+// ---- pause poll -------------------------------------------------------------------------------------------------
+
+#[test]
+fn must_pause_is_false_for_a_present_user_with_budget_left() {
+    let (_clock, limits) = setup();
+    assert!(!limits.must_pause(CLAUDE));
+    assert!(limits.pause_reason(CLAUDE).is_none());
+}
+
+#[test]
+fn must_pause_turns_true_when_an_active_run_passes_the_budget() {
+    let (clock, limits) = setup();
+    let _run = limits.run_started(CLAUDE).unwrap();
+    mins(&clock, &limits, 479);
+    assert!(!limits.must_pause(CLAUDE));
+    mins(&clock, &limits, 1);
+    // No admission was attempted: the poll alone reports it.
+    assert!(limits.must_pause(CLAUDE));
+    let reason = limits.pause_reason(CLAUDE).unwrap();
     assert_eq!(
-        limits.meters(ProviderId::Claude).run_minutes_today.current,
-        20
+        (reason.rule, reason.kind),
+        (1, CeilingKind::RunMinutesPerDay)
     );
-    limits.run_stopped(ProviderId::Claude); // extra stop is harmless
-    mins(&clock, 10);
-    assert_eq!(
-        limits.meters(ProviderId::Claude).run_minutes_today.current,
-        20
-    );
+    assert!(!limits.must_pause(CODEX));
+}
+
+#[test]
+fn must_pause_follows_presence() {
+    let (_clock, limits) = setup();
+    limits.set_presence(Presence {
+        idle_minutes: 30,
+        app_in_background: false,
+    });
+    assert!(limits.must_pause(CLAUDE));
+    limits.set_presence(Presence {
+        idle_minutes: 0,
+        app_in_background: true,
+    });
+    assert!(limits.must_pause(CLAUDE));
+    limits.set_presence(present());
+    assert!(!limits.must_pause(CLAUDE));
 }
 
 // ---- presence ---------------------------------------------------------------------------------------------------
@@ -308,21 +550,21 @@ fn idle_30_blocks_prompts() {
         idle_minutes: 29,
         app_in_background: false,
     });
-    limits.admit_prompt(ProviderId::Claude, "t1").unwrap();
+    limits.admit_prompt(CLAUDE, "t1").unwrap();
     limits.set_presence(Presence {
         idle_minutes: 30,
         app_in_background: false,
     });
-    let refused = refusal(limits.admit_prompt(ProviderId::Claude, "t1"));
+    let refused = refusal(limits.admit_prompt(CLAUDE, "t1"));
     assert_eq!(refused.rule, 1);
     assert_eq!(refused.kind, CeilingKind::UserIdle);
     assert!(refused.message.contains("30"));
-    let refused = refusal(limits.run_started(ProviderId::Claude));
+    let refused = refusal(limits.run_started(CLAUDE));
     assert_eq!(refused.kind, CeilingKind::UserIdle);
     // The user comes back.
-    limits.set_presence(Presence::default());
-    limits.admit_prompt(ProviderId::Claude, "t1").unwrap();
-    limits.run_started(ProviderId::Claude).unwrap();
+    limits.set_presence(present());
+    limits.admit_prompt(CLAUDE, "t1").unwrap();
+    let _run = limits.run_started(CLAUDE).unwrap();
 }
 
 #[test]
@@ -332,9 +574,9 @@ fn background_app_blocks_prompts_and_runs() {
         idle_minutes: 0,
         app_in_background: true,
     });
-    let refused = refusal(limits.admit_prompt(ProviderId::Codex, "t1"));
+    let refused = refusal(limits.admit_prompt(CODEX, "t1"));
     assert_eq!(refused.kind, CeilingKind::AppBackground);
-    let refused = refusal(limits.run_started(ProviderId::Codex));
+    let refused = refusal(limits.run_started(CODEX));
     assert_eq!(refused.kind, CeilingKind::AppBackground);
 }
 
@@ -346,13 +588,57 @@ fn presence_refusal_records_nothing() {
         app_in_background: false,
     });
     for _ in 0..50 {
-        assert!(limits.admit_prompt(ProviderId::Claude, "t1").is_err());
+        assert!(limits.admit_prompt(CLAUDE, "t1").is_err());
     }
-    limits.set_presence(Presence::default());
+    limits.set_presence(present());
+    assert_eq!(limits.meters(CLAUDE).prompts_last_hour.current, 0);
+}
+
+#[test]
+fn nothing_runs_before_the_first_presence_report() {
+    let clock = SimClock::new(noon());
+    let limits = ProviderLimits::new(Arc::new(clock.clone()));
+    assert_eq!(limits.presence(), None);
     assert_eq!(
-        limits.meters(ProviderId::Claude).prompts_last_hour.current,
-        0
+        refusal(limits.admit_prompt(CLAUDE, "t1")).kind,
+        CeilingKind::PresenceUnknown
     );
+    assert_eq!(
+        refusal(limits.run_started(CLAUDE)).kind,
+        CeilingKind::PresenceUnknown
+    );
+    assert_eq!(
+        refusal(limits.record_turn(CLAUDE, "t1")).kind,
+        CeilingKind::PresenceUnknown
+    );
+    assert!(limits.must_pause(CLAUDE));
+    limits.set_presence(present());
+    assert_eq!(limits.presence(), Some(present()));
+    limits.admit_prompt(CLAUDE, "t1").unwrap();
+    assert!(!limits.must_pause(CLAUDE));
+}
+
+#[test]
+fn a_presence_report_older_than_five_minutes_counts_as_idle() {
+    let (clock, limits) = setup();
+    clock.advance(Duration::from_secs(4 * 60 + 59));
+    limits.admit_prompt(CLAUDE, "t1").unwrap();
+    clock.advance(Duration::from_secs(1));
+    let refused = refusal(limits.admit_prompt(CLAUDE, "t1"));
+    assert_eq!((refused.rule, refused.kind), (1, CeilingKind::UserIdle));
+    assert!(limits.must_pause(CLAUDE));
+    assert!(limits.run_started(CLAUDE).is_err());
+    // A new report from the app restores it.
+    limits.set_presence(present());
+    limits.admit_prompt(CLAUDE, "t1").unwrap();
+}
+
+#[test]
+fn a_wall_clock_jump_does_not_refresh_a_stale_presence_report() {
+    let (clock, limits) = setup();
+    clock.advance(Duration::from_secs(10 * 60));
+    clock.jump_wall_back(Duration::from_secs(3600));
+    assert!(limits.must_pause(CLAUDE));
 }
 
 // ---- user limits never loosen -----------------------------------------------------------------------------------
@@ -373,20 +659,21 @@ fn user_limit_cannot_loosen() {
 
     let clock = SimClock::new(noon());
     let limits = ProviderLimits::with_user_limits(Arc::new(clock.clone()), &loose);
-    let m = limits.meters(ProviderId::Claude);
+    limits.set_presence(present());
+    let m = limits.meters(CLAUDE);
     assert_eq!(m.sessions.limit, 2);
     assert_eq!(m.prompts_last_hour.limit, 30);
     assert_eq!(m.run_minutes_today.limit, 480);
     assert_eq!(limits.task_turns("t").limit, 40);
     for _ in 0..30 {
-        limits.admit_prompt(ProviderId::Claude, "t1").unwrap();
+        limits.admit_prompt(CLAUDE, "t1").unwrap();
     }
-    assert!(limits.admit_prompt(ProviderId::Claude, "t1").is_err());
+    assert!(limits.admit_prompt(CLAUDE, "t1").is_err());
     limits.set_presence(Presence {
         idle_minutes: 30,
         app_in_background: false,
     });
-    assert!(limits.admit_prompt(ProviderId::Codex, "t1").is_err());
+    assert!(limits.admit_prompt(CODEX, "t1").is_err());
 }
 
 #[test]
@@ -400,26 +687,27 @@ fn stricter_user_limits_apply() {
     };
     let clock = SimClock::new(noon());
     let limits = ProviderLimits::with_user_limits(Arc::new(clock.clone()), &strict);
-    let _a = limits.acquire_session(ProviderId::Claude).unwrap();
-    let refused = refusal(limits.acquire_session(ProviderId::Claude));
+    limits.set_presence(present());
+    let _a = limits.acquire_session(CLAUDE).unwrap();
+    let refused = refusal(limits.acquire_session(CLAUDE));
     assert_eq!(refused.kind, CeilingKind::ConcurrentSessions);
     for _ in 0..3 {
-        limits.admit_prompt(ProviderId::Claude, "t1").unwrap();
+        limits.admit_prompt(CLAUDE, "t1").unwrap();
     }
-    assert!(limits.admit_prompt(ProviderId::Claude, "t1").is_err());
+    assert!(limits.admit_prompt(CLAUDE, "t1").is_err());
     for _ in 0..5 {
-        limits.record_turn("t1").unwrap();
+        limits.record_turn(CLAUDE, "t1").unwrap();
     }
-    assert!(limits.record_turn("t1").is_err());
+    assert!(limits.record_turn(CLAUDE, "t1").is_err());
     limits.set_presence(Presence {
         idle_minutes: 10,
         app_in_background: false,
     });
     assert_eq!(
-        refusal(limits.run_started(ProviderId::Codex)).kind,
+        refusal(limits.run_started(CODEX)).kind,
         CeilingKind::UserIdle
     );
-    assert_eq!(limits.meters(ProviderId::Codex).run_minutes_today.limit, 60);
+    assert_eq!(limits.meters(CODEX).run_minutes_today.limit, 60);
 }
 
 #[test]
@@ -465,109 +753,144 @@ fn ceilings_come_from_the_compliance_constants() {
 fn snapshot_round_trips_through_json_and_load() {
     let (clock, limits) = setup();
     for _ in 0..7 {
-        limits.admit_prompt(ProviderId::Claude, "t1").unwrap();
+        limits.admit_prompt(CLAUDE, "t1").unwrap();
     }
     for _ in 0..12 {
-        limits.record_turn("t1").unwrap();
+        limits.record_turn(CLAUDE, "t1").unwrap();
     }
-    limits.run_started(ProviderId::Codex).unwrap();
-    mins(&clock, 45);
-    limits.run_stopped(ProviderId::Codex);
+    let run = limits.run_started(CODEX).unwrap();
+    mins(&clock, &limits, 45);
+    drop(run);
 
     let json = serde_json::to_string(&limits.snapshot()).unwrap();
     let restored_snapshot: LimitsSnapshot = serde_json::from_str(&json).unwrap();
 
     // A fresh instance (an app restart) loads it and sees the same counters.
     let fresh = ProviderLimits::new(Arc::new(clock.clone()));
+    fresh.set_presence(present());
     fresh.load(&restored_snapshot);
-    assert_eq!(
-        fresh.meters(ProviderId::Claude).prompts_last_hour.current,
-        7
-    );
+    assert_eq!(fresh.meters(CLAUDE).prompts_last_hour.current, 7);
     assert_eq!(fresh.task_turns("t1").current, 12);
-    assert_eq!(
-        fresh.meters(ProviderId::Codex).run_minutes_today.current,
-        45
-    );
+    assert_eq!(fresh.meters(CODEX).run_minutes_today.current, 45);
     assert_eq!(fresh.snapshot(), limits.snapshot());
+}
+
+#[test]
+fn snapshot_includes_the_live_stretch_of_an_active_run() {
+    let (clock, limits) = setup();
+    let _run = limits.run_started(CLAUDE).unwrap();
+    mins(&clock, &limits, 20);
+    assert_eq!(limits.snapshot().run[&CLAUDE].seconds, 20 * 60);
 }
 
 #[test]
 fn loaded_prompts_still_age_out_and_count_against_the_cap() {
     let (clock, limits) = setup();
     for _ in 0..30 {
-        limits.admit_prompt(ProviderId::Claude, "t1").unwrap();
+        limits.admit_prompt(CLAUDE, "t1").unwrap();
     }
     let snap = limits.snapshot();
     let fresh = ProviderLimits::new(Arc::new(clock.clone()));
+    fresh.set_presence(present());
     fresh.load(&snap);
-    assert!(fresh.admit_prompt(ProviderId::Claude, "t1").is_err());
-    mins(&clock, 60);
-    fresh.admit_prompt(ProviderId::Claude, "t1").unwrap();
+    assert!(fresh.admit_prompt(CLAUDE, "t1").is_err());
+    mins(&clock, &fresh, 60);
+    fresh.admit_prompt(CLAUDE, "t1").unwrap();
 }
 
 #[test]
 fn load_never_lowers_a_counter() {
     let (_clock, limits) = setup();
     for _ in 0..10 {
-        limits.record_turn("t1").unwrap();
+        limits.record_turn(CLAUDE, "t1").unwrap();
     }
     for _ in 0..5 {
-        limits.admit_prompt(ProviderId::Claude, "t1").unwrap();
+        limits.admit_prompt(CLAUDE, "t1").unwrap();
     }
     let stale = LimitsSnapshot::default();
     limits.load(&stale);
     assert_eq!(limits.task_turns("t1").current, 10);
-    assert_eq!(
-        limits.meters(ProviderId::Claude).prompts_last_hour.current,
-        5
-    );
+    assert_eq!(limits.meters(CLAUDE).prompts_last_hour.current, 5);
 
     // Loading the same snapshot twice does not double count.
     let snap = limits.snapshot();
     limits.load(&snap);
     limits.load(&snap);
-    assert_eq!(
-        limits.meters(ProviderId::Claude).prompts_last_hour.current,
-        5
-    );
+    assert_eq!(limits.meters(CLAUDE).prompts_last_hour.current, 5);
     assert_eq!(limits.task_turns("t1").current, 10);
+}
+
+fn saved_run(day: NaiveDate, minutes: u64) -> LimitsSnapshot {
+    let mut snap = LimitsSnapshot::default();
+    snap.run.insert(
+        CLAUDE,
+        RunDay {
+            day,
+            seconds: minutes * 60,
+        },
+    );
+    snap
 }
 
 #[test]
 fn load_ignores_run_minutes_from_a_past_day() {
     let (clock, limits) = setup();
-    let mut snap = LimitsSnapshot::default();
-    snap.run.insert(
-        ProviderId::Claude,
-        RunDay {
-            day: clock.now().date_naive() - chrono::Days::new(1),
-            seconds: 480 * 60,
-        },
-    );
-    limits.load(&snap);
-    limits.run_started(ProviderId::Claude).unwrap();
+    let yesterday = clock.now().date_naive() - chrono::Days::new(1);
+    limits.load(&saved_run(yesterday, 480));
+    let _run = limits.run_started(CLAUDE).unwrap();
 }
 
 #[test]
 fn load_applies_run_minutes_for_today() {
     let (clock, limits) = setup();
-    let mut snap = LimitsSnapshot::default();
-    snap.run.insert(
-        ProviderId::Claude,
-        RunDay {
-            day: clock.now().date_naive(),
-            seconds: 480 * 60,
-        },
-    );
-    limits.load(&snap);
+    limits.load(&saved_run(clock.now().date_naive(), 480));
     assert_eq!(
-        refusal(limits.run_started(ProviderId::Claude)).kind,
+        refusal(limits.run_started(CLAUDE)).kind,
         CeilingKind::RunMinutesPerDay
     );
 }
 
+#[test]
+fn load_with_future_saved_day_keeps_counter() {
+    let (clock, limits) = setup();
+    let today = clock.now().date_naive();
+    let tomorrow = today + chrono::Days::new(1);
+    // The saved counter is dated later than the current day (the system date moved back).
+    limits.load(&saved_run(tomorrow, 400));
+    assert_eq!(limits.meters(CLAUDE).run_minutes_today.current, 400);
+    assert_eq!(limits.snapshot().run[&CLAUDE].day, tomorrow);
+    let run = limits.run_started(CLAUDE).unwrap();
+    mins(&clock, &limits, 80);
+    drop(run);
+    assert_eq!(
+        refusal(limits.run_started(CLAUDE)).kind,
+        CeilingKind::RunMinutesPerDay
+    );
+    // Still held a day later: it is released only when real time reaches the end of that later day.
+    mins(&clock, &limits, 24 * 60);
+    assert!(limits.run_started(CLAUDE).is_err());
+    mins(&clock, &limits, 10 * 60 + 40);
+    let _run = limits.run_started(CLAUDE).unwrap();
+}
+
+#[test]
+fn load_keeps_the_higher_usage_when_the_current_day_is_earlier() {
+    let (clock, limits) = setup();
+    let run = limits.run_started(CLAUDE).unwrap();
+    mins(&clock, &limits, 300);
+    drop(run);
+    let tomorrow = clock.now().date_naive() + chrono::Days::new(1);
+    limits.load(&saved_run(tomorrow, 100));
+    assert_eq!(limits.meters(CLAUDE).run_minutes_today.current, 300);
+}
+
 // ---- provider ids and refusals ----------------------------------------------------------------------------------
+
+#[test]
+fn provider_id_lives_in_the_crate_provider_module() {
+    let same: crate::provider::ProviderId = ProviderId::Gemini;
+    assert_eq!(same, crate::provider::ProviderId::Gemini);
+}
 
 #[test]
 fn provider_ids_match_the_contract() {
@@ -586,9 +909,9 @@ fn provider_ids_match_the_contract() {
 #[test]
 fn refusal_serializes_for_the_ipc_mapping() {
     let (_clock, limits) = setup();
-    let _a = limits.acquire_session(ProviderId::Claude).unwrap();
-    let _b = limits.acquire_session(ProviderId::Claude).unwrap();
-    let refused = refusal(limits.acquire_session(ProviderId::Claude));
+    let _a = limits.acquire_session(CLAUDE).unwrap();
+    let _b = limits.acquire_session(CLAUDE).unwrap();
+    let refused = refusal(limits.acquire_session(CLAUDE));
     let v = serde_json::to_value(&refused).unwrap();
     assert_eq!(v["rule"], 1);
     assert_eq!(v["kind"], "concurrent_sessions");
@@ -640,11 +963,12 @@ fn no_direct_os_clock_reads_outside_the_system_clock() {
         ["SystemTime", "::now"].concat().to_lowercase(),
         ["Utc", "::now"].concat().to_lowercase(),
         ["Local", "::now"].concat().to_lowercase(),
+        ["clock_get", "time"].concat(),
     ];
     for dir in ["limits", "events", "clock"] {
         for (name, source) in module_sources(dir) {
-            if dir == "clock" && (name == "system.rs" || name == "mod.rs") {
-                continue; // the real clock, and its test that compares against it
+            if dir == "clock" && name == "system.rs" {
+                continue; // the real clock, the one place that reads the OS
             }
             for needle in &needles {
                 assert!(
@@ -653,6 +977,21 @@ fn no_direct_os_clock_reads_outside_the_system_clock() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn the_wall_clock_is_read_only_to_anchor_the_timeline() {
+    // Every other file in limits/ must not call `.now()` on a clock at all.
+    for (name, source) in module_sources("limits") {
+        if name == "timeline.rs" || name == "tests.rs" {
+            continue;
+        }
+        let call = [".no", "w()"].concat();
+        assert!(
+            !source.contains(call.as_str()),
+            "limits/{name} reads the wall clock; only timeline.rs may, once, to anchor"
+        );
     }
 }
 

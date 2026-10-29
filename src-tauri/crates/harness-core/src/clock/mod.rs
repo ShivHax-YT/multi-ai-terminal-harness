@@ -78,12 +78,16 @@ mod tests {
     }
 
     #[test]
-    fn system_clock_is_monotonic_and_close_to_utc() {
-        let clock = SystemClock::new();
-        let a = clock.monotonic();
-        let b = clock.monotonic();
-        assert!(b >= a);
-        let drift = (clock.now() - Utc::now()).num_seconds().abs();
-        assert!(drift < 5);
+    fn wall_jumps_move_now_but_not_monotonic() {
+        let clock = SimClock::new(start());
+        clock.advance(Duration::from_secs(60));
+        clock.jump_wall_forward(Duration::from_secs(3600));
+        assert_eq!(clock.now(), start() + chrono::Duration::seconds(3660));
+        assert_eq!(clock.monotonic(), Duration::from_secs(60));
+        clock.jump_wall_back(Duration::from_secs(7200));
+        assert_eq!(clock.now(), start() + chrono::Duration::seconds(-3540));
+        assert_eq!(clock.monotonic(), Duration::from_secs(60));
+        clock.advance(Duration::from_secs(10));
+        assert_eq!(clock.now(), start() + chrono::Duration::seconds(-3530));
     }
 }

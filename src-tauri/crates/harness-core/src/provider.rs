@@ -1,11 +1,13 @@
-//! Provider ids as the IPC contract spells them.
+//! Provider ids as the IPC contract spells them (`ProviderId` in `docs/tasks/T-101-ipc-contract.md`).
+//!
+//! The one definition for the crate: usage, pacing, adapters and limits all key on this enum.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
 /// A provider id (`ProviderId` in the IPC contract). Counters are keyed by provider only: there is no account, profile or
-/// session key anywhere in this module (rule 2).
+/// session key (rule 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderId {

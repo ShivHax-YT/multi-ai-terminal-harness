@@ -7,16 +7,18 @@
 
 mod config;
 mod presence;
-mod provider;
 mod refusal;
+mod runclock;
+mod timeline;
 mod tracker;
 
+pub use crate::provider::{ProviderId, UnknownProvider};
 pub use config::{EffectiveLimits, UserLimits};
 pub use presence::Presence;
-pub use provider::{ProviderId, UnknownProvider};
 pub use refusal::{CeilingKind, Refusal};
 pub use tracker::{
-    LimitsSnapshot, Meter, PromptRecord, ProviderLimits, ProviderMeters, RunDay, SessionPermit,
+    LimitsSnapshot, Meter, PromptRecord, ProviderLimits, ProviderMeters, RunDay, RunGuard,
+    SessionPermit,
 };
 
 #[cfg(test)]
