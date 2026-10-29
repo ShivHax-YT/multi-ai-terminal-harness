@@ -32,8 +32,6 @@ use std::time::Duration;
 const WINDOW_MINUTES: i64 = 60;
 /// A presence report older than this is treated as the user being away. Not a user setting; it only makes things stricter.
 const PRESENCE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
-/// How far the wall clock may differ from the time proven by a saved snapshot before `load` trusts the snapshot instead.
-const CLOCK_TOLERANCE: TimeDelta = TimeDelta::minutes(5);
 
 /// A value against its limit and the ceiling (`Meter` in the IPC contract).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -384,13 +382,12 @@ impl ProviderLimits {
         let mut state = self.lock();
         let mut tick = state.tick(&*self.inner.clock);
         if let Some(expected) = self.proven_now(snapshot, tick) {
-            if (tick.now - expected).abs() > CLOCK_TOLERANCE {
-                // The system date was changed since the snapshot was written: trust the proven time instead.
-                if let Some(timeline) = state.timeline.as_mut() {
-                    timeline.reanchor(expected, tick.mono);
-                }
-                tick = state.tick(&*self.inner.clock);
+            // Same boot: the snapshot proves the time, so the wall clock is not consulted at all. There is no
+            // tolerance: any slack accepted here could be accumulated by repeated small date changes and restarts.
+            if let Some(timeline) = state.timeline.as_mut() {
+                timeline.reanchor(expected, tick.mono);
             }
+            tick = state.tick(&*self.inner.clock);
         }
         for (provider, records) in &snapshot.prompts {
             let window = state.prompts.entry(*provider).or_default();

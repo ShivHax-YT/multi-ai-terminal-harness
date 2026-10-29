@@ -1077,14 +1077,58 @@ fn an_unknown_boot_id_proves_nothing() {
 }
 
 #[test]
-fn small_wall_clock_differences_are_not_treated_as_a_jump() {
-    let (clock, limits) = setup();
-    admit(&limits, CLAUDE, "t1").unwrap();
+fn a_small_forward_date_change_at_the_day_boundary_does_not_reset_the_budget() {
+    // 15:58 plus the 480 minute budget: the budget is used up at 23:58.
+    let (clock, limits) = setup_at(Utc.with_ymd_and_hms(2026, 10, 29, 15, 58, 0).unwrap());
+    let run = limits.run_started(CLAUDE).unwrap();
+    mins(&clock, &limits, 480);
+    drop(run);
+    assert_eq!(
+        clock.now(),
+        Utc.with_ymd_and_hms(2026, 10, 29, 23, 58, 0).unwrap()
+    );
+    assert!(limits.run_started(CLAUDE).is_err());
     let saved = limits.snapshot();
-    clock.jump_wall_forward(Duration::from_secs(120));
+    drop(limits);
+
+    // Three minutes forward would cross midnight if the wall clock were trusted.
+    clock.jump_wall_forward(Duration::from_secs(3 * 60));
     let restarted = restart(&clock, &saved);
-    // Within the tolerance the wall clock is kept, and the prompt is still in the window.
-    assert_eq!(restarted.meters(CLAUDE).prompts_last_hour.current, 1);
+    assert_eq!(
+        refusal(restarted.run_started(CLAUDE)).kind,
+        CeilingKind::RunMinutesPerDay
+    );
+    assert_eq!(restarted.meters(CLAUDE).run_minutes_today.current, 480);
+    // Real time still rolls the day at midnight, two minutes later.
+    mins(&clock, &restarted, 2);
+    let _run = restarted.run_started(CLAUDE).unwrap();
+}
+
+#[test]
+fn repeated_small_date_advances_across_restarts_never_expire_prompts_early() {
+    let (clock, limits) = setup();
+    for _ in 0..30 {
+        admit(&limits, CLAUDE, "t1").unwrap();
+    }
+    let mut current = limits;
+    // Fifteen cycles of: user sets the date 4 minutes forward, the app restarts, snapshots. Wall-clock slack accepted at
+    // load would add up to 60 minutes; real time elapsed is only the 15 minutes of heartbeats below.
+    for _ in 0..15 {
+        let saved = current.snapshot();
+        drop(current);
+        clock.jump_wall_forward(Duration::from_secs(4 * 60));
+        current = restart(&clock, &saved);
+        mins(&clock, &current, 1);
+    }
+    // 15 real minutes in: the original 30 prompts are all still in the window.
+    assert_eq!(current.meters(CLAUDE).prompts_last_hour.current, 30);
+    assert_eq!(
+        refusal(admit(&current, CLAUDE, "t1")).kind,
+        CeilingKind::PromptsPerHour
+    );
+    // They leave only after a real hour.
+    mins(&clock, &current, 45);
+    admit(&current, CLAUDE, "t1").unwrap();
 }
 
 #[test]
