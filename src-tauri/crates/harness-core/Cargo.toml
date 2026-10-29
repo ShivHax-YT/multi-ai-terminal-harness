@@ -10,3 +10,24 @@ publish.workspace = true
 # Rule 3: this crate never depends on the terminal crate. scripts/ci/check-crate-boundary.sh checks the resolved graph
 # (normal, build and dev edges) and the compliance scan checks every file under this directory.
 [dependencies]
+base64 = "0.23.1"
+chrono = { version = "0.4.45", default-features = false, features = ["serde", "clock", "std"] }
+ed25519-dalek = "3.0.0"
+futures = "0.3.34"
+getrandom = "0.4.3"
+hex = "0.4.3"
+libc = "0.2.191"
+rusqlite = { version = "0.41.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["process", "io-util", "time", "rt", "rt-multi-thread", "macros", "sync"] }
+toml = "1.1.8"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[features]
+# Exposes SimClock outside tests so the 24-hour simulated-clock test (T-125) can reuse it (T-111).
+sim = []

@@ -11,6 +11,7 @@ import {
   Meter,
   meterLevel,
   ProviderName,
+  StatusChip,
   UntrustedText,
 } from "./index";
 
@@ -99,5 +100,17 @@ describe("other composites", () => {
     );
     expect(screen.getByRole("heading", { name: "No plans yet" })).toBeInTheDocument();
     expect(screen.getByRole("status", { name: "Loading plans" })).toBeInTheDocument();
+  });
+});
+
+describe("StatusChip", () => {
+  it("shows the label as text and an icon for every tone", () => {
+    for (const tone of ["success", "warning", "danger", "info", "neutral"] as const) {
+      const { container, unmount } = render(<StatusChip tone={tone} label={`State ${tone}`} />);
+      expect(screen.getByText(`State ${tone}`)).toBeInTheDocument();
+      expect(container.querySelector("svg")).not.toBeNull();
+      expect(container.querySelector(`[data-tone="${tone}"]`)).not.toBeNull();
+      unmount();
+    }
   });
 });

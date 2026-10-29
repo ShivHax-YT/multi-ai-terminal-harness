@@ -5,4 +5,5 @@ export { ErrorAlert, errorTitle, type ErrorAlertProps } from "./error-alert";
 export { LoadingSkeleton } from "./loading-skeleton";
 export { Meter, meterLevel, type MeterLevel, type MeterProps } from "./meter";
 export { ProviderName } from "./provider-name";
+export { StatusChip, type StatusChipProps, type StatusTone } from "./status-chip";
 export { UntrustedText, type UntrustedTextProps } from "./untrusted-text";
