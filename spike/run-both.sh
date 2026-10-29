@@ -327,7 +327,7 @@ changed_files() {
 
 # build_row <cli> <run.sh exit status> <hello yes|no> <changed files, one per line> <normalized.jsonl> [flags]: print one JSON row.
 # PASS = run.sh exit 0, exactly one session_started, exactly one result with is_error false and numeric tokens, 0 rate_limited,
-# hello.txt exact. `unknown` > 0 never fails a run (needs_mapping is set). Reasons are fixed strings, never stream text.
+# 0 fatal error events, hello.txt exact. `unknown` > 0 never fails a run (needs_mapping is set). Reasons are fixed strings, never stream text.
 # flags (space separated words, all optional): cfg = the scratch repo config changed, wt = the worktree path was refused, norm = the
 # normalizer failed, row = the row could not be built. Each one forces FAIL with its own fixed reason.
 build_row() {
@@ -344,11 +344,13 @@ build_row() {
     | ($r.tokens // {}) as $t
     | ($ss[0].session_id // "") as $sid
     | (cnt("rate_limited")) as $rl
+    | ([.[] | select(.type == "error" and .fatal == true)] | length) as $fe
     | ($rc == 0) as $c_exit
     | (($ss | length) == 1) as $c_sess
     | (($rs | length) == 1 and $r.is_error == false and $r.tokens_known == true
        and ($t.input | num) and ($t.output | num)) as $c_res
     | ($rl == 0) as $c_rl
+    | ($fe == 0) as $c_fe
     | ($hello == "yes") as $c_hello
     | ($flags | split(" ")) as $fl
     | (($fl | index("cfg")) == null) as $c_cfg
@@ -368,11 +370,12 @@ build_row() {
         needs_mapping: (cnt("unknown") > 0),
         changed: ($changed | split("\n") | map(select(length > 0))),
         hello_ok: $c_hello,
-        verdict: (if $c_exit and $c_sess and $c_res and $c_rl and $c_hello and $c_cfg and $c_wt and $c_norm and $c_row then "PASS" else "FAIL" end),
+        verdict: (if $c_exit and $c_sess and $c_res and $c_rl and $c_fe and $c_hello and $c_cfg and $c_wt and $c_norm and $c_row then "PASS" else "FAIL" end),
         reasons: (if $c_row == false then ["row could not be built"] else [ (if $c_exit then empty else "run.sh did not exit 0" end),
                     (if $c_sess then empty else "not exactly one session_started" end),
                     (if $c_res then empty else "not exactly one successful result with numeric tokens" end),
                     (if $c_rl then empty else "rate_limited seen" end),
+                    (if $c_fe then empty else "fatal error seen" end),
                     (if $c_hello then empty else "hello.txt missing or not exact" end),
                     (if $c_cfg then empty else "scratch repo config changed" end),
                     (if $c_wt then empty else "worktree path refused" end),

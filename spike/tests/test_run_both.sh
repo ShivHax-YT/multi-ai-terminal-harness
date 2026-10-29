@@ -329,6 +329,39 @@ expect "hostile session id: four characters, escapes replaced" "$R" '(.session |
 # result with tokens_known false is not "numeric tokens"
 R="$(row codex 0 yes "" "$EXP/codex-failure.jsonl")"
 expect "tokens_known false is not numeric tokens" "$R" '.verdict == "FAIL"'
+# normalizer-to-verdict regression: a synthetic Codex stream with a fatal error fails build_row, while ordinary nonfatal warnings pass
+cat > "$TMP/codex-raw-fatal.jsonl" <<'EOF'
+{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}
+{"type":"turn.started"}
+{"type":"error","message":"synthetic: sandbox could not start"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"DONE"}}
+{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0}}
+EOF
+"$JQ" -c -n -R -f "$SPIKE/normalize/codex.jq" < "$TMP/codex-raw-fatal.jsonl" > "$TMP/codex-norm-fatal.jsonl"
+check "codex.jq normalizes a bare top-level error to error{fatal:true} with 0 rate_limited" \
+  "$JQ" -s -e '([.[] | select(.type == "error" and .fatal == true)] | length) == 1 and ([.[] | select(.type == "rate_limited")] | length) == 0' "$TMP/codex-norm-fatal.jsonl"
+R="$(row codex 0 yes "hello.txt" "$TMP/codex-norm-fatal.jsonl")"
+expect "normalizer-to-verdict: a fatal error in an otherwise successful Codex stream is FAIL" "$R" '.verdict == "FAIL" and .reasons == ["fatal error seen"] and .rate_limited == 0'
+cat > "$TMP/codex-raw-warn.jsonl" <<'EOF'
+{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"err_1","type":"error","message":"synthetic: config key is deprecated"}}
+{"type":"item.completed","item":{"id":"err_1","type":"error","message":"synthetic: config key is deprecated"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"DONE"}}
+{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0}}
+EOF
+"$JQ" -c -n -R -f "$SPIKE/normalize/codex.jq" < "$TMP/codex-raw-warn.jsonl" > "$TMP/codex-norm-warn.jsonl"
+R="$(row codex 0 yes "hello.txt" "$TMP/codex-norm-warn.jsonl")"
+expect "normalizer-to-verdict: an ordinary nonfatal Codex item warning in a successful stream is PASS" "$R" '.verdict == "PASS" and .warnings == 1 and .reasons == []'
+cat > "$TMP/claude-raw-nonfatal-err.jsonl" <<'EOF'
+{"type":"system","subtype":"init","session_id":"11111111-1111-1111-1111-111111111111"}
+{"type":"system","subtype":"api_retry","attempt":1,"max_retries":3,"error_status":529,"error":"overloaded"}
+{"type":"assistant","error":"overloaded","message":{"content":[{"type":"text","text":"DONE"}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
+EOF
+"$JQ" -c -n -R -f "$SPIKE/normalize/claude.jq" < "$TMP/claude-raw-nonfatal-err.jsonl" > "$TMP/claude-norm-nonfatal-err.jsonl"
+R="$(row claude 0 yes "hello.txt" "$TMP/claude-norm-nonfatal-err.jsonl")"
+expect "normalizer-to-verdict: a nonfatal error{fatal:false} and warning in a successful Claude stream is PASS" "$R" '.verdict == "PASS" and .warnings == 1 and .reasons == []'
 # the flags force FAIL with a fixed reason each, even on a stream that is otherwise a PASS
 R="$(build_row claude 0 yes "" "$EXP/claude-sample.jsonl" cfg)"
 expect "flag cfg: FAIL with the fixed reason scratch repo config changed" "$R" '.verdict == "FAIL" and .reasons == ["scratch repo config changed"]'
@@ -494,8 +527,11 @@ mk_wt() { # mk_wt -> WREPO and WWT: a scratch repo with the worktree claude-1, e
 }
 MARKF="$TMP/marker"
 printf '#!/bin/bash\necho ran > "%s"\ncat\n' "$MARKF" > "$TMP/mark.sh"
+# A process filter uses Git's long-running protocol; the ordinary cat fixture would deadlock its handshake.
+# Exiting immediately still proves Git started the driver, without waiting on its input.
+printf '#!/bin/bash\necho ran > "%s"\nexit 1\n' "$MARKF" > "$TMP/mark-process.sh"
 printf '#!/bin/bash\necho ran > "%s"\nprintf "\\0"\n' "$MARKF" > "$TMP/fsm.sh"
-chmod +x "$TMP/mark.sh" "$TMP/fsm.sh"
+chmod +x "$TMP/mark.sh" "$TMP/mark-process.sh" "$TMP/fsm.sh"
 CANARY_CFG="$TMP/canary.cfg"
 printf '%s\n' "$CANARY" > "$CANARY_CFG"
 
@@ -609,6 +645,8 @@ hostile "extensions.worktreeConfig" extensions.worktreeConfig true
 
 # filter drivers: a same-size change to a tracked file whose .gitattributes sets filter=x makes git run the driver to compare
 filter_fixture() { # filter_fixture <key>
+  local driver="$TMP/mark.sh"
+  [ "$1" = filter.x.process ] && driver="$TMP/mark-process.sh"
   mk_wt
   printf 'aaaa\n' > "$WWT/f.txt"
   touch -t 202001010000 "$WWT/f.txt" # an old mtime: the later rewrite is always stat-dirty, never within the same timestamp tick
@@ -617,7 +655,7 @@ filter_fixture() { # filter_fixture <key>
   tg -C "$WWT" commit -q -m f
   printf 'bbbb\n' > "$WWT/f.txt"
   rm -f "$MARKF"
-  tg config --file "$WREPO/.git/config" "$1" "$TMP/mark.sh"
+  tg config --file "$WREPO/.git/config" "$1" "$driver"
 }
 filter_fixture filter.x.clean
 "$GIT_BIN" -C "$WWT" status --porcelain > /dev/null 2>&1
@@ -2088,6 +2126,21 @@ expect "O8d: the claude row is FAIL with exactly the fixed reason" "$HJ" '.rows[
 expect "O8d: changed files show the fixed not-listed text, the codex row is unaffected" "$HJ" '.rows[0].changed == ["(not listed: repo config changed)"] and .rows[1].verdict == "PASS"'
 eq "O8d: the canary text is never printed or stored" "0" "$(cat "$SB/out" "$SB/err" "$(root_of)/run-both.json" | grep -c "$CANARY")"
 check "O8d: the CLI-home file itself is intact" test "$(cat "$SB/home/$DENY_NAME/canary.txt")" = "$CANARY"
+
+# O9. normalizer-to-verdict whole flow: a synthetic Codex stream with a fatal error fails the run even when exit is 0, hello.txt is exact,
+# and turn.completed has numeric tokens; an ordinary nonfatal Codex item warning passes
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "FAKE_CODEX_RAW=$TMP/codex-raw-fatal.jsonl" --)"
+JO="$(cat "$(root_of)/run-both.json" 2>/dev/null)"
+eq "O9: a Codex fatal error in an otherwise passing run: exit 1" "1" "$rc"
+expect "O9: claude PASS, codex FAIL with reason fatal error seen" "$JO" '.rows[0].verdict == "PASS" and .rows[1].verdict == "FAIL" and .rows[1].reasons == ["fatal error seen"] and .rows[1].hello_ok == true'
+has "O9: the table shows the fatal error FAIL note" "$(cat "$SB/out")" 'note: codex FAIL: fatal error seen'
+lacks "O9: no PASS summary line when codex had a fatal error" "$(cat "$SB/out")" 'run-both: PASS'
+mk_fast
+rc="$(run_sb "$SB/$FASTP" "FAKE_CODEX_RAW=$TMP/codex-raw-warn.jsonl" --)"
+JO="$(cat "$(root_of)/run-both.json" 2>/dev/null)"
+eq "O9 control: an ordinary nonfatal Codex warning in a successful run: exit 0" "0" "$rc"
+expect "O9 control: both rows PASS and codex warnings is 1" "$JO" '.rows[0].verdict == "PASS" and .rows[1].verdict == "PASS" and .rows[1].warnings == 1 and .rows[1].reasons == []'
 
 # ---- the live gate in the real library is still intact (the sandbox override is only in the sandbox copy) -----------------------
 check "the real lib/common.sh was not changed by the sandbox override" test "$(grep -c 'spike_require_live() { :; }' "$SPIKE/lib/common.sh")" = "0"
