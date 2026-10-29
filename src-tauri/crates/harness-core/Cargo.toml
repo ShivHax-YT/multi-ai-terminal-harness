@@ -27,6 +27,8 @@ toml = "1.1.8"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Lead exception (T-111 round 2): lets tests in this crate use SimClock without passing --features sim.
+harness-core = { path = ".", features = ["sim"] }
 
 [features]
 # Exposes SimClock outside tests so the 24-hour simulated-clock test (T-125) can reuse it (T-111).

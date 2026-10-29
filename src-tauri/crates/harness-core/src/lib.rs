@@ -18,6 +18,7 @@ pub mod limits;
 pub mod pacing;
 pub mod plan;
 pub mod process;
+pub mod provider;
 pub mod review;
 pub mod scheduler;
 pub mod session;
