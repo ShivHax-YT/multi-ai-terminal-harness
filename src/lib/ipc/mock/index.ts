@@ -30,6 +30,7 @@ export interface MockControl {
 }
 
 export interface MockIpc {
+  mode: "mock";
   client: IpcClient;
   approval: ApprovalPort;
   ptyInput: PtyInputPort;
@@ -62,6 +63,7 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
     sentinel: MOCK_SENTINEL,
   };
   return {
+    mode: "mock",
     client: backend.client,
     approval: backend.approval,
     ptyInput: backend.ptyInput,

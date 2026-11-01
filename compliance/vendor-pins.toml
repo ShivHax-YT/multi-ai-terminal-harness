@@ -1,0 +1,23 @@
+# Compiled trust policy, not user configuration. No trust-on-first-use pins.
+# Apple certifies the Developer ID organization; require that chain, the legal
+# vendor identity and the specific CLI identifier. Both installed native CLIs
+# use hardened runtime. Never accept a shell/npm interpreter shim on this lane.
+# Anthropic's published platform signer: https://code.claude.com/docs/en/setup#platform-code-signatures
+# OpenAI's published team: https://github.com/openai/codex/blob/main/codex-rs/cli/src/desktop_app/mac.rs
+# Release hashes additionally restrict this experimental auth lane to the two
+# reviewed installed arm64 images. They supplement vendor trust; they do not
+# establish full-file integrity. New CLI releases need a reviewed pin update.
+
+[[vendor]]
+provider = "claude"
+team = "Q6L2SF6YDW"
+identifier = "com.anthropic.claude-code"
+release_cdhash = "62f3298fb35e54f02451657e7bfbcd0b795657c7"
+install_hint = "Install the native CLI using the instructions at https://code.claude.com/docs/en/setup"
+
+[[vendor]]
+provider = "codex"
+team = "2DC432GLL2"
+identifier = "codex"
+release_cdhash = "5f410845b5189c21ca0aa20c2ef91293e3145b13"
+install_hint = "Install the official native CLI using the instructions at https://developers.openai.com/codex/cli"

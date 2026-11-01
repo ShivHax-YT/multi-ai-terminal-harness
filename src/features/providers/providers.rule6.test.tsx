@@ -20,7 +20,7 @@ describe("rule 6: failed binary (binary_failed)", () => {
     const codex = await card("codex");
     expect(within(codex).getByText("Failed verification")).toBeInTheDocument();
     expect(
-      within(codex).getByText("The tool failed verification, so automation is off (rule 6)."),
+      within(codex).getByText("The CLI did not pass verification. Task execution is disabled."),
     ).toBeInTheDocument();
     // The check details come from the host: shown as text.
     const checks = within(codex).getByRole("list", { name: "Verification checks" });
@@ -51,7 +51,7 @@ describe("rule 6: failed binary (binary_failed)", () => {
     });
     const { user } = renderRoute("/providers", { mock });
     const claude = await card("claude");
-    await user.click(within(claude).getByRole("button", { name: "Sign in in terminal" }));
+    await user.click(within(claude).getByRole("button", { name: "Sign in using Terminal" }));
     const alert = await within(claude).findByRole("alert");
     expect(alert).toHaveTextContent("Blocked by rule 6");
     expect(alert).toHaveTextContent("The CLI failed verification; sign-in is refused.");

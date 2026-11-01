@@ -8,7 +8,12 @@ pub mod commands;
 /// Starts the app.
 pub fn run() {
     tauri::Builder::default()
+        .manage(harness_core::plan::simulation::Simulation::default())
         .invoke_handler(tauri::generate_handler![
+            commands::sim_snapshot,
+            commands::sim_submit,
+            commands::sim_approve_plan,
+            commands::sim_run,
             commands::get_app_info,
             commands::list_providers,
             commands::refresh_provider_status,

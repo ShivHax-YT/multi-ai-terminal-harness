@@ -1,7 +1,7 @@
 //! IPC command stubs for contract v1 (docs/tasks/T-101-ipc-contract.md).
 //!
-//! Reads return the UI fixtures (`src/lib/ipc/fixtures/*.json`) so the Tauri build renders the same empty and ready
-//! states as the dev mock; `get_limits` is built from the compiled ceilings in `harness_core`. Mutations return
+//! Most reads return UI fixtures (`src/lib/ipc/fixtures/*.json`); provider status refuses until real checks exist, and
+//! `get_limits` is built from the compiled ceilings in `harness_core`. Mutations return
 //! `not_implemented` until their brief lands. Two refusals are permanent properties of the stubs:
 //! - `approve_plan` never mints an approval (rule 9: only the scheduler-verified UI click path will);
 //! - `pty_write` always refuses with rule 3 (no session has take-over on, because no session exists).
@@ -13,8 +13,8 @@ use harness_core::compliance::ceilings::{
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
+use std::sync::{Arc, OnceLock};
 
-const PROVIDERS_JSON: &str = include_str!("../../src/lib/ipc/fixtures/providers.json");
 const USAGE_JSON: &str = include_str!("../../src/lib/ipc/fixtures/usage.json");
 const SETTINGS_JSON: &str = include_str!("../../src/lib/ipc/fixtures/settings.json");
 const KILLSWITCH_JSON: &str = include_str!("../../src/lib/ipc/fixtures/killswitch.json");
@@ -120,7 +120,11 @@ fn unused<T>(_args: T) {}
 pub fn get_app_info(app: tauri::AppHandle) -> IpcResult<AppInfo> {
     let info = app.package_info();
     Ok(AppInfo {
-        name: info.name.clone(),
+        name: app
+            .config()
+            .product_name
+            .clone()
+            .unwrap_or_else(|| info.name.clone()),
         version: info.version.to_string(),
         identifier: app.config().identifier.clone(),
     })
@@ -128,21 +132,34 @@ pub fn get_app_info(app: tauri::AppHandle) -> IpcResult<AppInfo> {
 
 // ---- providers --------------------------------------------------------------------------------------------------
 
-#[tauri::command(rename_all = "snake_case")]
-pub fn list_providers() -> IpcResult<Value> {
-    fixture(PROVIDERS_JSON)
+fn provider_registry() -> Arc<harness_core::status::ProviderRegistry> {
+    static REGISTRY: OnceLock<Arc<harness_core::status::ProviderRegistry>> = OnceLock::new();
+    REGISTRY
+        .get_or_init(|| Arc::new(harness_core::status::ProviderRegistry::default()))
+        .clone()
+}
+
+fn provider_id(provider: &str) -> IpcResult<harness_core::provider::ProviderId> {
+    provider
+        .parse()
+        .map_err(|_| IpcError::new(IpcErrorKind::InvalidInput, "Unknown provider"))
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn refresh_provider_status(provider: String) -> IpcResult<Value> {
-    let all = fixture(PROVIDERS_JSON)?;
-    all.as_array()
-        .and_then(|list| {
-            list.iter()
-                .find(|p| p.get("provider").and_then(Value::as_str) == Some(provider.as_str()))
-        })
-        .cloned()
-        .ok_or_else(|| IpcError::not_found("provider"))
+pub async fn list_providers() -> IpcResult<Value> {
+    let registry = provider_registry();
+    tauri::async_runtime::spawn_blocking(move || Ok(json!(registry.list())))
+        .await
+        .map_err(|_| IpcError::internal("Provider check could not complete"))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn refresh_provider_status(provider: String) -> IpcResult<Value> {
+    let provider = provider_id(&provider)?;
+    let registry = provider_registry();
+    tauri::async_runtime::spawn_blocking(move || Ok(registry.refresh(provider)))
+        .await
+        .map_err(|_| IpcError::internal("Provider check could not complete"))?
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -152,9 +169,16 @@ pub fn open_provider_login(provider: String) -> IpcResult<SessionRef> {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn confirm_personal_use(provider: String) -> IpcResult<Value> {
-    unused(provider);
-    Err(IpcError::not_implemented("confirm_personal_use"))
+pub async fn confirm_personal_use(provider: String) -> IpcResult<Value> {
+    let provider = provider_id(&provider)?;
+    let registry = provider_registry();
+    tauri::async_runtime::spawn_blocking(move || {
+        registry
+            .confirm(provider)
+            .map_err(|e| IpcError::rule_blocked(5, e))
+    })
+    .await
+    .map_err(|_| IpcError::internal("Account confirmation could not complete"))?
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -357,6 +381,52 @@ pub fn get_killswitch_status() -> IpcResult<Value> {
     fixture(KILLSWITCH_JSON)
 }
 
+// ---- sample workflow: no provider automation ---------------------------------------------------------------
+#[tauri::command(rename_all = "snake_case")]
+pub fn sim_snapshot(
+    state: tauri::State<'_, harness_core::plan::simulation::Simulation>,
+) -> IpcResult<Value> {
+    let plans = state.snapshot().map_err(IpcError::internal)?;
+    Ok(
+        json!({ "runtime": "native", "projects": [{ "id": "sample", "name": "Harness sample project" }], "plans": plans }),
+    )
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn sim_submit(
+    state: tauri::State<'_, harness_core::plan::simulation::Simulation>,
+    project_id: String,
+    task: String,
+) -> IpcResult<harness_core::plan::simulation::SimPlan> {
+    state
+        .submit(&project_id, &task)
+        .map_err(|e| IpcError::new(IpcErrorKind::InvalidInput, e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn sim_approve_plan(
+    state: tauri::State<'_, harness_core::plan::simulation::Simulation>,
+    plan_id: String,
+    plan_hash: String,
+) -> IpcResult<Value> {
+    state
+        .approve(&plan_id, &plan_hash)
+        .map(|token| json!({ "token": token }))
+        .map_err(|e| IpcError::rule_blocked(9, e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn sim_run(
+    state: tauri::State<'_, harness_core::plan::simulation::Simulation>,
+    plan_id: String,
+    plan_hash: String,
+    token: String,
+) -> IpcResult<harness_core::plan::simulation::SimPlan> {
+    state
+        .run(&plan_id, &plan_hash, &token)
+        .map_err(|e| IpcError::rule_blocked(9, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,7 +500,6 @@ mod tests {
     fn mutations_are_not_implemented() {
         let ni = IpcErrorKind::NotImplemented;
         assert_eq!(open_provider_login(s("x")).unwrap_err().kind, ni);
-        assert_eq!(confirm_personal_use(s("x")).unwrap_err().kind, ni);
         assert_eq!(update_spend_caps(s("x"), json!({})).unwrap_err().kind, ni);
         assert_eq!(remove_api_key(s("x")).unwrap_err().kind, ni);
         assert_eq!(start_lead_request(s("x"), s("t")).unwrap_err().kind, ni);
@@ -448,19 +517,22 @@ mod tests {
     }
 
     #[test]
-    fn reads_return_fixtures() {
-        let providers = list_providers().expect("providers");
-        let list = providers.as_array().expect("array");
-        assert_eq!(list.len(), 6);
-        let first = list[0]["provider"].as_str().expect("id").to_owned();
+    fn provider_status_validates_identifiers_without_querying_any_cli() {
         assert_eq!(
-            refresh_provider_status(first.clone()).expect("found")["provider"],
-            first
+            provider_id("claude").unwrap(),
+            harness_core::provider::ProviderId::Claude
         );
         assert_eq!(
-            refresh_provider_status(s("nope")).unwrap_err().kind,
-            IpcErrorKind::NotFound
+            provider_id("claude; command").unwrap_err().kind,
+            IpcErrorKind::InvalidInput
         );
+        let source = include_str!("commands.rs");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(!production.contains("fixtures/providers.json"));
+    }
+
+    #[test]
+    fn other_reads_return_fixtures() {
         assert!(get_usage().expect("usage")["providers"].is_array());
         assert!(get_killswitch_status().expect("ks")["adapters"].is_array());
         assert_eq!(list_lead_requests().expect("lead"), json!([]));

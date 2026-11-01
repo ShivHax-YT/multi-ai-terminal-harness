@@ -20,6 +20,7 @@ import { providerLabel } from "@/strings/providers";
 
 import {
   blockerSentence,
+  executionUnavailable,
   keyOnly,
   nextStep,
   subscriptionAllowed,
@@ -30,9 +31,9 @@ import { useProviderStep, type IpcStepKind } from "./use-providers";
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div className="flex items-start justify-between gap-3">
-      <dt className="text-sm text-muted-foreground">{label}</dt>
-      <dd className="flex min-w-0 flex-col items-end gap-1 text-right">{children}</dd>
+    <div className="flex min-w-0 items-start justify-between gap-3">
+      <dt className="shrink-0 text-sm text-muted-foreground">{label}</dt>
+      <dd className="flex min-w-0 flex-1 flex-col items-end gap-1 text-right">{children}</dd>
     </div>
   );
 }
@@ -54,7 +55,7 @@ function usableLabel(status: ProviderStatus): { tone: StatusTone; label: string 
   if (lead && worker) return { tone: "success", label: "Usable as lead and worker" };
   if (lead) return { tone: "success", label: "Usable as lead" };
   if (worker) return { tone: "success", label: "Usable as worker" };
-  return { tone: "neutral", label: "Not usable yet" };
+  return { tone: "neutral", label: "Tasks unavailable" };
 }
 
 function InstallRows({ status }: { status: ProviderStatus }) {
@@ -69,9 +70,6 @@ function InstallRows({ status }: { status: ProviderStatus }) {
       {installed && install.version !== undefined && (
         <UntrustedText text={install.version} mono className="text-muted-foreground" />
       )}
-      {installed && install.path !== undefined && (
-        <UntrustedText text={install.path} mono className="text-muted-foreground" />
-      )}
     </Row>
   );
 }
@@ -80,12 +78,15 @@ function BinaryRow({ status }: { status: ProviderStatus }) {
   const { binary } = status;
   const chip: { tone: StatusTone; label: string } =
     binary.state === "verified"
-      ? { tone: "success", label: "Verified" }
+      ? {
+          tone: "success",
+          label: binary.verification_scope === "kernel_identity" ? "Identity checked" : "Verified",
+        }
       : binary.state === "failed"
         ? { tone: "danger", label: "Failed verification" }
         : { tone: "warning", label: "Not verified yet" };
   return (
-    <Row label="Binary">
+    <Row label="Verification">
       <StatusChip {...chip} />
       {binary.state === "failed" && binary.checks.length > 0 && (
         <ul
@@ -137,15 +138,79 @@ function SignInRows({ status }: { status: ProviderStatus }) {
     <>
       <Row label="Sign-in">
         <StatusChip {...chip} />
+        {state === "unknown" && status.sign_in.detail !== undefined && (
+          <UntrustedText
+            text={status.sign_in.detail}
+            className="max-w-[32ch] text-sm text-muted-foreground"
+          />
+        )}
       </Row>
       <Row label="Personal use">
         {status.personal_use_confirmed ? (
           <StatusChip tone="success" label="Confirmed as your account" />
+        ) : executionUnavailable(status) ? (
+          <StatusChip tone="neutral" label="Required before tasks" />
         ) : (
           <StatusChip tone="warning" label="Not confirmed yet" />
         )}
       </Row>
+      {status.sign_in.login_command !== undefined && status.binary.state === "verified" && (
+        <Row label="CLI sign-in">
+          <div className="flex flex-col gap-2 rounded-md border p-3 text-sm">
+            <p>
+              Run this command in Terminal, finish any browser prompts, then choose Check again.
+            </p>
+            <UntrustedText
+              text={status.sign_in.login_command}
+              mono
+              block
+              className="max-w-full text-left break-all"
+            />
+            <CopyButton value={status.sign_in.login_command} label="Copy login command" />
+          </div>
+        </Row>
+      )}
     </>
+  );
+}
+
+function TechnicalDetails({ status }: { status: ProviderStatus }) {
+  const blockers = visibleBlockers(status);
+  if (
+    status.install.path === undefined &&
+    status.sign_in.detail === undefined &&
+    status.binary.verification_scope !== "kernel_identity" &&
+    !executionUnavailable(status)
+  )
+    return null;
+  return (
+    <details className="min-w-0 border-t pt-3 text-sm text-muted-foreground">
+      <summary className="cursor-pointer text-foreground select-none">Technical details</summary>
+      <div className="mt-3 flex min-w-0 flex-col gap-3 text-left">
+        {status.install.path !== undefined && (
+          <div className="min-w-0 space-y-1">
+            <p>Install location</p>
+            <UntrustedText text={status.install.path} mono block className="max-w-full break-all" />
+          </div>
+        )}
+        {status.binary.verification_scope === "kernel_identity" && (
+          <p>
+            macOS checked the CLI identity. Full-file integrity is still unverified, so this is not
+            clearance to run tasks.
+          </p>
+        )}
+        {status.sign_in.detail !== undefined && status.sign_in.state !== "unknown" && (
+          <UntrustedText text={status.sign_in.detail} block />
+        )}
+        {executionUnavailable(status) && blockers.length > 0 && (
+          <ul aria-label="Execution requirements" className="flex flex-col gap-1">
+            {blockers.map((blocker) => (
+              <li key={blocker}>{blockerSentence(blocker)}</li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </details>
   );
 }
 
@@ -204,7 +269,17 @@ export function ProviderCard({ status, primary }: { status: ProviderStatus; prim
   const run = (kind: IpcStepKind) => () => {
     mutation.mutate(kind);
   };
-  const blockers = visibleBlockers(status);
+  const appBlocked = executionUnavailable(status);
+  const blockers = visibleBlockers(status).filter(
+    (blocker) =>
+      !appBlocked ||
+      ![
+        "execution_boundary_unavailable",
+        "runtime_controls_unavailable",
+        "provider_policy_unverified",
+        "personal_use_unconfirmed",
+      ].includes(blocker),
+  );
   const showKeyRow = !subscriptionAllowed(status) && status.api_key !== null;
 
   return (
@@ -212,7 +287,7 @@ export function ProviderCard({ status, primary }: { status: ProviderStatus; prim
       role="group"
       aria-labelledby={titleId}
       data-provider={status.provider}
-      className="h-full gap-4"
+      className="h-full min-w-0 gap-4"
     >
       <CardHeader>
         <CardTitle>
@@ -224,7 +299,7 @@ export function ProviderCard({ status, primary }: { status: ProviderStatus; prim
           <StatusChip {...usable} />
         </div>
       </CardHeader>
-      <CardContent className="flex flex-1 flex-col gap-3">
+      <CardContent className="flex min-w-0 flex-1 flex-col gap-4">
         {status.killswitch === "disabled" && (
           <StatusChip tone="danger" label="Turned off by remote config" />
         )}
@@ -257,6 +332,7 @@ export function ProviderCard({ status, primary }: { status: ProviderStatus; prim
             ))}
           </ul>
         )}
+        {available && installed && <TechnicalDetails status={status} />}
         {mutation.isError && <ErrorAlert error={mutation.error} />}
       </CardContent>
       <CardFooter className="flex flex-wrap items-center gap-2">
@@ -288,7 +364,7 @@ export function ProviderCard({ status, primary }: { status: ProviderStatus; prim
               disabled
               aria-describedby={`${titleId} ${hintId}`}
             >
-              Sign in in terminal
+              Sign in using Terminal
             </Button>
             <span id={hintId} className="sr-only">
               Confirm your account first

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sim-submit"
+description = "Enables the sim_submit command without any pre-configured scope."
+commands.allow = ["sim_submit"]
+
+[[permission]]
+identifier = "deny-sim-submit"
+description = "Denies the sim_submit command without any pre-configured scope."
+commands.deny = ["sim_submit"]

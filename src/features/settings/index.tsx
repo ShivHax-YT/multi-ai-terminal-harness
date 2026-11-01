@@ -8,7 +8,7 @@ export default function SettingsScreen() {
     <EmptyState
       icon={Settings}
       title="Settings"
-      description="Theme, stricter limits, API keys with spend caps, and kill-switch status. This screen arrives with T-109."
+      description="Saved limits, API keys and provider policy settings are not available in this build. You can change the theme from the menu above."
     />
   );
 }

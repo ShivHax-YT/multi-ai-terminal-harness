@@ -59,7 +59,7 @@ describe("nextStep", () => {
     });
     expect(nextStep(signedOut)?.label).toBe("Confirm it is my account");
     expect(nextStep({ ...signedOut, personal_use_confirmed: true })?.label).toBe(
-      "Sign in in terminal",
+      "Sign in using Terminal",
     );
   });
 
@@ -158,6 +158,9 @@ describe("blockerSentence", () => {
     api_key_missing: true,
     killswitch_disabled: true,
     provider_paused: true,
+    execution_boundary_unavailable: true,
+    runtime_controls_unavailable: true,
+    provider_policy_unverified: true,
   };
 
   it("maps every blocker to one plain sentence", () => {

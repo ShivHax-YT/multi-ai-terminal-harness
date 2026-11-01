@@ -48,7 +48,7 @@ describe("empty", () => {
   it("says nothing is ready yet when no provider is usable (fresh)", async () => {
     renderRoute("/providers", { mock: "fresh" });
     expect(
-      await screen.findByRole("heading", { name: "Nothing is ready yet" }),
+      await screen.findByRole("heading", { name: "No tools can run tasks yet" }),
     ).toBeInTheDocument();
     // The cards are still there: they say what blocks each provider.
     const claude = await card("claude");
@@ -60,7 +60,7 @@ describe("empty", () => {
   it("does not show the empty state when a provider is usable (ready)", async () => {
     renderRoute("/providers", { mock: "ready" });
     await card("claude");
-    expect(screen.queryByText("Nothing is ready yet")).not.toBeInTheDocument();
+    expect(screen.queryByText("No tools can run tasks yet")).not.toBeInTheDocument();
   });
 });
 

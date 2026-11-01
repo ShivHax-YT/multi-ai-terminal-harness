@@ -23,6 +23,9 @@ async function call<T>(command: CommandName, args?: Record<string, unknown>): Pr
 
 function createClient(): IpcClient {
   return {
+    sim_snapshot: () => call("sim_snapshot"),
+    sim_submit: (args) => call("sim_submit", { ...args }),
+    sim_run: (args) => call("sim_run", { ...args }),
     get_app_info: () => call("get_app_info"),
 
     list_providers: () => call("list_providers"),
@@ -72,7 +75,10 @@ function createClient(): IpcClient {
 
 /** Rule 9: handed out only through ./approval (useApproval). */
 function createApproval(): ApprovalPort {
-  return { approve_plan: (args) => call("approve_plan", { ...args }) };
+  return {
+    approve_plan: (args) => call("approve_plan", { ...args }),
+    sim_approve_plan: (args) => call("sim_approve_plan", { ...args }),
+  };
 }
 
 /** Rule 3: handed out only through ./pty-input (usePtyInput). */
@@ -81,5 +87,10 @@ function createPtyInput(): PtyInputPort {
 }
 
 export function createTauriIpc(): IpcBundle {
-  return { client: createClient(), approval: createApproval(), ptyInput: createPtyInput() };
+  return {
+    mode: "native",
+    client: createClient(),
+    approval: createApproval(),
+    ptyInput: createPtyInput(),
+  };
 }

@@ -40,7 +40,7 @@ describe("description lists", () => {
     const checks = within(codex).getByRole("list", { name: "Verification checks" });
     expect(checks.parentElement?.tagName).toBe("DD");
     expect(checks.closest("dl")).not.toBeNull();
-    expect(checks.parentElement?.previousElementSibling?.textContent).toBe("Binary");
+    expect(checks.parentElement?.previousElementSibling?.textContent).toBe("Verification");
   });
 });
 
@@ -73,7 +73,7 @@ describe("same-named buttons are told apart", () => {
     });
     renderRoute("/providers", { mock });
     const claude = await card("claude");
-    const signIn = within(claude).getByRole("button", { name: "Sign in in terminal" });
+    const signIn = within(claude).getByRole("button", { name: "Sign in using Terminal" });
     expect(signIn).toBeDisabled();
     expect(signIn).toHaveAccessibleDescription(
       `${providerLabel("claude")} Confirm your account first`,

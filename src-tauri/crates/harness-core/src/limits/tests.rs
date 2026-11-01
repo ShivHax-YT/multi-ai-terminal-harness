@@ -1245,15 +1245,18 @@ fn refusal_serializes_for_the_ipc_mapping() {
 // ---- structural guards ------------------------------------------------------------------------------------------
 
 fn module_sources(dir: &str) -> Vec<(String, String)> {
+    use crate::fs_guard::{FileGuard, NullSink, RootKind};
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src")
         .join(dir);
+    let guard = FileGuard::new(std::path::Path::new("/"), std::sync::Arc::new(NullSink)).unwrap();
+    guard.register_root(RootKind::Repo, &root).unwrap();
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&root).unwrap() {
-        let path = entry.unwrap().path();
+    for entry in guard.read_dir(&root).unwrap() {
+        let path = entry.path();
         if path.extension().is_some_and(|e| e == "rs") {
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            out.push((name, std::fs::read_to_string(&path).unwrap().to_lowercase()));
+            let name = entry.file_name().to_string_lossy().into_owned();
+            out.push((name, guard.read_to_string(path).unwrap().to_lowercase()));
         }
     }
     assert!(!out.is_empty());

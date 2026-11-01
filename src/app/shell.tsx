@@ -21,6 +21,8 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar";
 
+import { useIpcMode } from "@/lib/ipc";
+
 import { CommandPalette } from "./command-palette";
 import { ABOUT_ITEM, NAV_ITEMS, modKeyLabel, navItemFor, type NavItem } from "./nav";
 import { ThemeMenu } from "./theme-menu";
@@ -44,6 +46,7 @@ function NavEntry({ item, active, mod }: { item: NavItem; active: boolean; mod: 
 }
 
 export function Shell() {
+  const ipcMode = useIpcMode();
   const location = useLocation();
   const navigate = useNavigate();
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -126,6 +129,18 @@ export function Shell() {
             <ThemeMenu />
           </div>
         </header>
+        {ipcMode === "mock" && (
+          <div role="note" className="border-b bg-muted px-6 py-3 text-sm">
+            Browser demo · Provider installation, verification, sign-in and usage are fixture data.
+            No provider has been checked. No files or worktrees are created here.
+          </div>
+        )}
+        {ipcMode === "native" && (
+          <div role="note" className="border-b bg-muted px-6 py-3 text-sm">
+            Native app · Provider checks are live. Project execution and live usage tracking are
+            unavailable in this build.
+          </div>
+        )}
         <main className="mx-auto w-full max-w-[1200px] flex-1 p-6">
           <Suspense fallback={<LoadingSkeleton label="Loading screen" />}>
             <Outlet />

@@ -8,7 +8,7 @@ export default function SessionsScreen() {
     <EmptyState
       icon={SquareTerminal}
       title="Sessions"
-      description="Worker and sign-in sessions, their state, and the view-only terminal. This screen arrives with T-105."
+      description="Worker sessions and terminal viewing are not available in this build. CLI sign-in happens in your own Terminal."
     />
   );
 }

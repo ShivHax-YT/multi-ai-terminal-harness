@@ -51,3 +51,7 @@ export function useIpcEvent<E extends IpcEventName>(
     };
   }, [client, event]);
 }
+
+export function useIpcMode(): "native" | "mock" {
+  return useIpcBundle().mode ?? "native";
+}

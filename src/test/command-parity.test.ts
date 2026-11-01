@@ -32,14 +32,16 @@ function capabilityCommands(): { core: string[]; commands: string[] } {
 function commandFns(): string[] {
   const src = readRepo("src-tauri/src/commands.rs");
   return [
-    ...src.matchAll(/#\[tauri::command\(rename_all = "snake_case"\)\]\s*pub fn ([a-z_]+)/g),
+    ...src.matchAll(
+      /#\[tauri::command\(rename_all = "snake_case"\)\]\s*pub (?:async )?fn ([a-z_]+)/g,
+    ),
   ].map((m) => m[1] ?? "");
 }
 
 describe("command parity", () => {
-  it("the contract lists 33 unique commands", () => {
+  it("the contract lists 37 unique commands", () => {
     expect(new Set(COMMANDS).size).toBe(COMMANDS.length);
-    expect(COMMANDS.length).toBe(33);
+    expect(COMMANDS.length).toBe(37);
   });
 
   it("contract = generate_handler! = build.rs = capability = commands.rs", () => {

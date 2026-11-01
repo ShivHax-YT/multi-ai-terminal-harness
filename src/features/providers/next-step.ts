@@ -13,7 +13,7 @@ export interface NextStep {
 const STEPS: Record<StepKind, NextStep> = {
   check_again: { kind: "check_again", label: "Check again" },
   confirm: { kind: "confirm", label: "Confirm it is my account" },
-  sign_in: { kind: "sign_in", label: "Sign in in terminal" },
+  sign_in: { kind: "sign_in", label: "Sign in using Terminal" },
   go_to_lead: { kind: "go_to_lead", label: "Go to Lead" },
 };
 
@@ -41,9 +41,17 @@ export function nextStep(status: ProviderStatus): NextStep | null {
   if (status.usable.lead || status.usable.worker) return STEPS.go_to_lead;
   if (status.binary.state !== "verified") return STEPS.check_again; // rule 6: never a sign-in
   if (!subscriptionAllowed(status)) return null; // rule 7: no login path for key-only tools
+  // A confirmation cannot make this build runnable. Keep refresh available and
+  // ask for personal-use confirmation only when execution can actually proceed.
+  if (executionUnavailable(status)) return STEPS.check_again;
   if (!status.personal_use_confirmed) return STEPS.confirm; // rule 5
+  if (status.sign_in.login_command !== undefined) return STEPS.check_again;
   if (status.sign_in.state !== "signed_in") return STEPS.sign_in;
   return null;
+}
+
+export function executionUnavailable(status: ProviderStatus): boolean {
+  return status.usable.blockers.includes("execution_boundary_unavailable");
 }
 
 /** The first provider, in list order, whose next step is the screen's one filled button. */
@@ -56,14 +64,19 @@ export function primaryProvider(
 const BLOCKER_SENTENCES: Record<Blocker, string> = {
   adapter_unavailable: "Support for this tool is not available yet.",
   not_installed: "The tool is not installed on this Mac.",
-  binary_failed: "The tool failed verification, so automation is off (rule 6).",
+  binary_failed: "The CLI did not pass verification. Task execution is disabled.",
   binary_unchecked: "The tool has not been verified yet.",
-  signed_out: "You are signed out. Sign in in the tool's own terminal.",
+  signed_out: "Sign in through the CLI to connect your account.",
   sign_in_unknown: "The sign-in state is unknown. Check again or sign in in the terminal.",
-  personal_use_unconfirmed: "Confirm that this is your own personal account (rule 5).",
+  personal_use_unconfirmed: "Confirm that this is your own personal account before running tasks.",
   api_key_missing: "Add an API key in Settings to use this tool.",
-  killswitch_disabled: "A signed remote config turned this tool off (rule 12).",
+  killswitch_disabled: "The provider policy has disabled this tool.",
   provider_paused: "Paused after repeated rate limits. Resume it from Usage.",
+  execution_boundary_unavailable:
+    "Project execution is blocked because filesystem isolation is not ready.",
+  runtime_controls_unavailable:
+    "Usage, presence and restart controls are not connected to execution.",
+  provider_policy_unverified: "The provider policy has not been verified for this build.",
 };
 
 /** One plain sentence per blocker. A value this build does not know falls back to a generic sentence. */

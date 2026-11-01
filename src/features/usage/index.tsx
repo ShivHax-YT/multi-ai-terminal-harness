@@ -8,7 +8,7 @@ export default function UsageScreen() {
     <EmptyState
       icon={Gauge}
       title="Usage"
-      description="Usage against the compiled ceilings, pacing and spend. This screen arrives with T-108."
+      description="Live usage tracking is not available in this build. No automated workers can run."
     />
   );
 }

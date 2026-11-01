@@ -36,6 +36,10 @@
     "allow-get-limits",
     "allow-get-settings",
     "allow-update-settings",
-    "allow-get-killswitch-status"
+    "allow-get-killswitch-status",
+    "allow-sim-snapshot",
+    "allow-sim-submit",
+    "allow-sim-approve-plan",
+    "allow-sim-run"
   ]
 }

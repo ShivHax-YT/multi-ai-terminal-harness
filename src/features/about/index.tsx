@@ -39,8 +39,8 @@ export default function AboutScreen() {
         </h2>
         <p data-testid="not-affiliated">{notAffiliatedStatement()}</p>
         <p className="text-sm text-muted-foreground">
-          Harness runs the command-line tools you install yourself, on this computer only. It never
-          sees or stores your passwords or sign-in tokens.
+          Harness checks the command-line tools installed on this computer. Each tool handles its
+          own sign-in. This build cannot run AI tasks or workers.
         </p>
       </section>
     </div>

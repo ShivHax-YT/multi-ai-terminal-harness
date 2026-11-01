@@ -77,7 +77,7 @@ describe("one IPC door", () => {
   it("production client selection never loads the mock outside the dev branch", () => {
     const index = readRepo("src/lib/ipc/index.ts");
     expect(index).toMatch(
-      /if \(import\.meta\.env\.DEV && import\.meta\.env\.VITE_HARNESS_IPC !== "tauri"\) \{\s*const \{ createDevMockIpc \} = await import\("\.\/mock"\);/,
+      /if \(import\.meta\.env\.DEV && !isTauri\(\) && import\.meta\.env\.VITE_HARNESS_IPC !== "tauri"\) \{\s*const \{ createDevMockIpc \} = await import\("\.\/mock"\);/,
     );
     expect(index).not.toMatch(/^import[^\n]*\.\/mock/m);
     const nonIpc = sources.filter((f) => !f.startsWith("src/lib/ipc/"));

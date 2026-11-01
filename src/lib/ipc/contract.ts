@@ -156,9 +156,12 @@ export type Blocker =
   | "personal_use_unconfirmed"
   | "api_key_missing"
   | "killswitch_disabled"
-  | "provider_paused";
+  | "provider_paused"
+  | "execution_boundary_unavailable"
+  | "runtime_controls_unavailable"
+  | "provider_policy_unverified";
 
-export type KillSwitchState = "enabled" | "disabled" | "api_key_only";
+export type KillSwitchState = "enabled" | "disabled" | "api_key_only" | "unknown";
 
 export interface BinaryCheck {
   kind: "codesign" | "checksum" | "install_source";
@@ -180,11 +183,19 @@ export interface ProviderStatus {
   /** Rule 6. */
   binary: {
     state: "verified" | "failed" | "unchecked";
+    /** Kernel image identity does not establish full-file integrity. */
+    verification_scope?: "kernel_identity" | "full_integrity";
     checked_at?: string;
     checks: BinaryCheck[];
   };
   /** From the CLI's documented status output only (rule 4). */
-  sign_in: { state: "signed_in" | "signed_out" | "unknown"; checked_at?: string };
+  sign_in: {
+    state: "signed_in" | "signed_out" | "unknown";
+    checked_at?: string;
+    detail?: string;
+    /** Human runs the official login in Terminal; the app never types it. */
+    login_command?: string;
+  };
   /** Rule 5. */
   personal_use_confirmed: boolean;
   /** null = no api_key mode; the key itself is never returned. */
@@ -418,10 +429,37 @@ export interface KillSwitchStatus {
   adapters: { provider: ProviderId; state: KillSwitchState; reason?: string }[];
 }
 
+// The sample workflow is explicitly simulated. Native runs use real Git worktrees; browser runs use memory only.
+export interface SimResult {
+  isolation: "git_worktree" | "browser_memory";
+  worktree: string;
+  output: string;
+  diff: string;
+  source_unchanged: boolean;
+}
+export interface SimPlan {
+  id: string;
+  project_id: string;
+  task: string;
+  hash: string;
+  status: "pending" | "approved" | "running" | "completed" | "failed";
+  result: SimResult | null;
+  error: string | null;
+}
+export interface SimSnapshot {
+  runtime: "native" | "browser";
+  projects: { id: string; name: string }[];
+  plans: SimPlan[];
+}
+
 // ---- commands -----------------------------------------------------------------------------------------------------
 
 /** Every command, in contract order. Must equal lib.rs generate_handler!, build.rs and the capability (parity test). */
 export const COMMANDS = [
+  "sim_snapshot",
+  "sim_submit",
+  "sim_approve_plan",
+  "sim_run",
   "get_app_info",
   "list_providers",
   "refresh_provider_status",
@@ -460,7 +498,7 @@ export const COMMANDS = [
 export type CommandName = (typeof COMMANDS)[number];
 
 /** Commands reachable only through a port module (rule 9: ApprovalPort; rule 3: PtyInputPort). */
-export type PortCommandName = "approve_plan" | "pty_write";
+export type PortCommandName = "approve_plan" | "sim_approve_plan" | "pty_write";
 
 export interface ProviderArgs {
   provider: ProviderId;
@@ -477,6 +515,10 @@ export interface TaskArgs {
 
 /** The general client (`useIpc()`). It has no generic invoke and no approve_plan or pty_write. */
 export interface IpcClient {
+  sim_snapshot(): Promise<SimSnapshot>;
+  sim_submit(args: { project_id: string; task: string }): Promise<SimPlan>;
+  sim_run(args: { plan_id: string; plan_hash: string; token: string }): Promise<SimPlan>;
+
   get_app_info(): Promise<AppInfo>;
 
   list_providers(): Promise<ProviderStatus[]>;
@@ -528,6 +570,8 @@ export interface IpcClient {
 
 /** Rule 9: the only way to approve a plan. Importable only from src/features/plan/**. */
 export interface ApprovalPort {
+  sim_approve_plan(args: { plan_id: string; plan_hash: string }): Promise<{ token: string }>;
+
   approve_plan(args: { plan_id: string; plan_hash: string }): Promise<PlanView>;
 }
 
@@ -539,6 +583,7 @@ export interface PtyInputPort {
 
 /** What a transport (Tauri or the dev mock) provides. Ports are handed out only by their own modules. */
 export interface IpcBundle {
+  mode?: "native" | "mock";
   client: IpcClient;
   approval: ApprovalPort;
   ptyInput: PtyInputPort;

@@ -30,7 +30,7 @@ describe("rule 5: confirm before sign-in", () => {
     const { user } = renderRoute("/providers", { mock });
     const claude = await card("claude");
     expect(within(claude).getByRole("button", { name: "Confirm it is my account" })).toBeEnabled();
-    const signIn = within(claude).getByRole("button", { name: "Sign in in terminal" });
+    const signIn = within(claude).getByRole("button", { name: "Sign in using Terminal" });
     expect(signIn).toBeDisabled();
     await user.click(signIn);
     expect(loginCalls(mock)).toHaveLength(0);
@@ -41,7 +41,7 @@ describe("rule 5: confirm before sign-in", () => {
     const { user } = renderRoute("/providers", { mock });
     const claude = await card("claude");
     await user.click(within(claude).getByRole("button", { name: "Confirm it is my account" }));
-    const signIn = await within(claude).findByRole("button", { name: "Sign in in terminal" });
+    const signIn = await within(claude).findByRole("button", { name: "Sign in using Terminal" });
     await waitFor(() => {
       expect(signIn).toBeEnabled();
     });
@@ -67,7 +67,7 @@ describe("rule 5: confirm before sign-in", () => {
     const claude = await card("claude");
     await user.click(within(claude).getByRole("button", { name: "Confirm it is my account" }));
     expect(await within(claude).findByRole("alert")).toHaveTextContent("Could not save.");
-    expect(within(claude).getByRole("button", { name: "Sign in in terminal" })).toBeDisabled();
+    expect(within(claude).getByRole("button", { name: "Sign in using Terminal" })).toBeDisabled();
     expect(loginCalls(mock)).toHaveLength(0);
   });
 

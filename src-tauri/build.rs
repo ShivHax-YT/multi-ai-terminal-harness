@@ -3,6 +3,10 @@
 // src/test/command-parity.test.ts checks that this list, lib.rs `generate_handler!`, the capability and the TS
 // contract (src/lib/ipc/contract.ts) name the same commands.
 const COMMANDS: &[&str] = &[
+    "sim_snapshot",
+    "sim_submit",
+    "sim_approve_plan",
+    "sim_run",
     "get_app_info",
     "list_providers",
     "refresh_provider_status",

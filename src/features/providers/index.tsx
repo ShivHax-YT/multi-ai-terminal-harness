@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { toIpcRejection } from "@/lib/ipc";
 
 import { STAGGERED_CARDS } from "./motion-budget";
-import { primaryProvider } from "./next-step";
+import { executionUnavailable, primaryProvider } from "./next-step";
 import { ProviderCard } from "./provider-card";
 import { useProviders } from "./use-providers";
 
@@ -19,8 +19,8 @@ export default function ProvidersScreen() {
   return (
     <div className="flex flex-col gap-6">
       <p className="max-w-[65ch] text-sm text-muted-foreground">
-        Each tool runs on this Mac. You sign in to each one yourself, in its own terminal. This app
-        never sees or stores your password.
+        Check your installed tools and sign-in status. Each CLI keeps its own passwords and sign-in
+        tokens.
       </p>
       <ProvidersBody providers={providers} />
     </div>
@@ -57,17 +57,28 @@ function ProvidersBody({ providers }: { providers: ReturnType<typeof useProvider
 
   const list = providers.data;
   const nothingUsable = list.every((s) => !s.usable.lead && !s.usable.worker);
+  const executionBlocked = nothingUsable && list.some(executionUnavailable);
   const primary = primaryProvider(list);
 
   return (
     <>
-      {nothingUsable && (
-        <EmptyState
-          icon={PlugZap}
-          title="Nothing is ready yet"
-          description="No tool is usable yet. Each card below shows what blocks it and the one next step."
-          className="py-8"
-        />
+      {executionBlocked ? (
+        <div role="status" className="space-y-1 rounded-md border bg-muted/40 px-4 py-3 text-sm">
+          <p className="font-medium">Sign-in works. Task execution is still being built.</p>
+          <p className="text-muted-foreground">
+            The app cannot safely create isolated worktrees yet. Account confirmation will not
+            enable tasks.
+          </p>
+        </div>
+      ) : (
+        nothingUsable && (
+          <EmptyState
+            icon={PlugZap}
+            title="No tools can run tasks yet"
+            description="Sign-in status and task readiness are separate. Each card explains what prevents task execution."
+            className="py-8"
+          />
+        )
       )}
       <div className="grid grid-cols-1 gap-4 min-[900px]:grid-cols-2 min-[1280px]:grid-cols-3">
         {/* Only the first cards stagger, so the whole entrance stays within the 300 ms budget; the rest are static. */}

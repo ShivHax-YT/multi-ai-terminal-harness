@@ -44,6 +44,7 @@ import reviewInjectionJson from "../fixtures/review-injection.json";
 import reviewJson from "../fixtures/review.json";
 import settingsJson from "../fixtures/settings.json";
 import usageJson from "../fixtures/usage.json";
+import { BrowserSimulation } from "./simulation";
 import { checkPlan, planEstimates, planHash } from "./plan";
 
 export const MOCK_SCENARIOS = [
@@ -663,7 +664,13 @@ export class MockBackend {
 
   // ---- commands --------------------------------------------------------------------------------------------------
 
+  private readonly simulation = new BrowserSimulation();
+
   readonly client: IpcClient = {
+    sim_snapshot: () => Promise.resolve(this.simulation.snapshot()),
+    sim_submit: ({ project_id, task }) => this.simulation.submit(project_id, task),
+    sim_run: ({ plan_id, plan_hash, token }) =>
+      Promise.resolve(this.simulation.run(plan_id, plan_hash, token)),
     get_app_info: () =>
       this.run("get_app_info", undefined, () => ({
         name: "Harness",
@@ -1083,6 +1090,8 @@ export class MockBackend {
   };
 
   readonly approval: ApprovalPort = {
+    sim_approve_plan: ({ plan_id, plan_hash }) =>
+      Promise.resolve(this.simulation.approve(plan_id, plan_hash)),
     approve_plan: (args) =>
       this.run("approve_plan", args, async () => {
         const record = this.planRecord(args.plan_id);
