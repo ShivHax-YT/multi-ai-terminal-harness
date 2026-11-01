@@ -289,8 +289,13 @@ pub async fn start_terminal(
     let provider = provider_id(&provider)?;
     let registry = provider_registry();
     tauri::async_runtime::spawn_blocking(move || {
-        harness_core::status::human_terminal_check(provider)
-            .map_err(|message| IpcError::new(IpcErrorKind::InvalidInput, message))?;
+        if !harness_core::status::human_terminal_supported(provider) {
+            return Err(IpcError::new(
+                IpcErrorKind::InvalidInput,
+                "This provider has no supported terminal yet.",
+            ));
+        }
+        // The folder is checked before confirmation so a bad path is not hidden, and before any launch.
         let folder = harness_core::status::human_terminal_folder(std::path::Path::new(&folder))
             .map_err(|message| IpcError::new(IpcErrorKind::InvalidInput, message))?;
         if confirm_personal_use {
@@ -302,6 +307,8 @@ pub async fn start_terminal(
                 "Confirm that this is your own personal account first.",
             ));
         }
+        harness_core::status::human_terminal_check(provider)
+            .map_err(|message| IpcError::new(IpcErrorKind::InvalidInput, message))?;
         let name = provider.as_str();
         let title = folder
             .file_name()
@@ -583,11 +590,33 @@ mod tests {
 
     #[test]
     fn a_terminal_needs_the_personal_use_confirmation_and_a_supported_provider() {
+        let folder = std::env::temp_dir();
+        assert!(
+            harness_core::status::human_terminal_folder(&folder).is_ok(),
+            "the confirmation check has to run against a folder that would be accepted"
+        );
+        let folder_text = folder.to_string_lossy().into_owned();
         let run = |p: &str, confirm| {
-            tauri::async_runtime::block_on(start_terminal(s(p), s("/tmp"), confirm)).unwrap_err()
+            tauri::async_runtime::block_on(start_terminal(s(p), s(&folder_text), confirm))
+                .unwrap_err()
         };
         assert_eq!(run("not-a-provider", true).kind, IpcErrorKind::InvalidInput);
-        assert_eq!(run("gemini", true).kind, IpcErrorKind::InvalidInput);
+        for provider in ["gemini", "grok", "kimi", "glm"] {
+            assert_eq!(
+                run(provider, true).kind,
+                IpcErrorKind::InvalidInput,
+                "{provider}"
+            );
+        }
+        let before = list_sessions().expect("sessions");
+        let claude = run("claude", false);
+        assert_eq!(claude.kind, IpcErrorKind::RuleBlocked);
+        assert_eq!(claude.rule, Some(5));
+        let codex = run("codex", false);
+        assert_eq!(codex.kind, IpcErrorKind::RuleBlocked);
+        assert_eq!(codex.rule, Some(5));
+        // Confirmation is refused before discover or launch, so no CLI and no session is started.
+        assert_eq!(list_sessions().expect("sessions"), before);
     }
 
     #[test]

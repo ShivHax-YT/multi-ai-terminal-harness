@@ -14,7 +14,15 @@ function setup(takeover = true) {
     onRefused,
     isUserEvent: () => true,
   });
-  const key = () => element.dispatchEvent(new KeyboardEvent("keydown", { key: "a" }));
+  // xterm emits a key's data during the event, after the capture listener and before dispatch ends.
+  const key = (data = "a") => {
+    const deliver = () => {
+      gate.onData(data);
+    };
+    element.addEventListener("keydown", deliver, true);
+    element.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+    element.removeEventListener("keydown", deliver, true);
+  };
   return { element, gate, write, onRefused, state, key };
 }
 
@@ -45,10 +53,10 @@ describe("input gate", () => {
     expect(write).not.toHaveBeenCalled();
   });
 
-  it("a key does not authorize data in a later turn", async () => {
-    const { gate, write, key } = setup();
-    key();
-    await flush();
+  it("a key does not authorize data after dispatch ends", async () => {
+    const { element, gate, write } = setup();
+    element.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+    gate.onData("a");
     gate.onData("\u001b[12;1R");
     await flush();
     expect(write).not.toHaveBeenCalled();
@@ -82,16 +90,22 @@ describe("input gate", () => {
   });
 
   it("keeps typed order while an earlier write is in flight", async () => {
-    const { gate, write, key } = setup();
+    const { element, gate, write } = setup();
     const seen: string[] = [];
     write.mockImplementation((...args: unknown[]) => {
       seen.push(args[0] as string);
       return new Promise<void>((resolve) => setTimeout(resolve, 1));
     });
-    key();
-    gate.onData("a");
-    gate.onData("b");
-    gate.onData("c");
+    element.addEventListener(
+      "keydown",
+      () => {
+        gate.onData("a");
+        gate.onData("b");
+        gate.onData("c");
+      },
+      true,
+    );
+    element.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(seen).toEqual(["a", "b", "c"]);
   });
@@ -103,6 +117,134 @@ describe("input gate", () => {
     gate.onData("a");
     await flush();
     expect(write).not.toHaveBeenCalled();
+  });
+
+  it("keeps text xterm sends on the timer after compositionend", async () => {
+    const { element, write, onRefused, state, gate: earlier } = setup();
+    earlier.dispose();
+    // Registered before the gate, like xterm's own listener: its setTimeout(0) is queued during the
+    // event, after the gate's capture-phase outer timer and before the nested clear.
+    let gate: ReturnType<typeof createInputGate>;
+    element.addEventListener("compositionend", () => {
+      setTimeout(() => {
+        gate.onData("é");
+      }, 0);
+    });
+    gate = createInputGate(element, {
+      write,
+      takeoverOn: () => state.takeover,
+      onRefused,
+      isUserEvent: () => true,
+    });
+    element.dispatchEvent(new KeyboardEvent("keydown", { key: "Dead", bubbles: true }));
+    element.dispatchEvent(new CompositionEvent("compositionend", { data: "é", bubbles: true }));
+    await flush();
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledWith("é");
+    await flush();
+    gate.onData("x");
+    expect(write).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a dead-key character and drops a query reply in the same turn", async () => {
+    const { element, gate, write } = setup();
+    element.addEventListener(
+      "compositionend",
+      () => {
+        setTimeout(() => {
+          gate.onData("\u001b[12;1R");
+          gate.onData("é");
+        }, 0);
+      },
+      true,
+    );
+    element.dispatchEvent(new KeyboardEvent("keydown", { key: "Dead", bubbles: true }));
+    element.dispatchEvent(new CompositionEvent("compositionend", { data: "é", bubbles: true }));
+    await flush();
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledWith("é");
+  });
+
+  it("drops cursor, device-attribute, and focus replies while a key is dispatching", async () => {
+    const { element, gate, write } = setup();
+    element.addEventListener(
+      "keydown",
+      () => {
+        gate.onData("\u001b[12;1R");
+        gate.onData("\u001b[?1;2c");
+        gate.onData("\u001b[I");
+        gate.onData("\u001b[O");
+        gate.onData("a");
+      },
+      true,
+    );
+    element.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+    await flush();
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledWith("a");
+  });
+
+  it("sends a unicode paste in order", async () => {
+    const { element, gate, write } = setup();
+    const seen: string[] = [];
+    write.mockImplementation((...args: unknown[]) => {
+      seen.push(args[0] as string);
+      return Promise.resolve();
+    });
+    element.addEventListener(
+      "paste",
+      () => {
+        gate.onData("你");
+        gate.onData("好");
+      },
+      true,
+    );
+    element.dispatchEvent(new Event("paste", { bubbles: true }));
+    await flush();
+    expect(seen).toEqual(["你", "好"]);
+  });
+
+  it("does not write or refuse a queued chunk after take-over is turned off", async () => {
+    const { element, gate, write, onRefused, state } = setup();
+    write.mockImplementation((...args: unknown[]) => {
+      if (args[0] === "a") state.takeover = false;
+      return Promise.resolve();
+    });
+    element.addEventListener(
+      "keydown",
+      () => {
+        gate.onData("a");
+        gate.onData("b");
+      },
+      true,
+    );
+    element.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+    await flush();
+    await flush();
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledWith("a");
+    expect(onRefused).not.toHaveBeenCalled();
+  });
+
+  it("drops a queued chunk after dispose", async () => {
+    const { element, gate, write, onRefused } = setup();
+    write.mockImplementation(() => {
+      gate.dispose();
+      return Promise.resolve();
+    });
+    element.addEventListener(
+      "keydown",
+      () => {
+        gate.onData("a");
+        gate.onData("b");
+      },
+      true,
+    );
+    element.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+    await flush();
+    await flush();
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(onRefused).not.toHaveBeenCalled();
   });
 });
 

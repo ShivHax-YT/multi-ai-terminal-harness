@@ -3,7 +3,7 @@
 // from this screen, and worker automation stays unavailable (see the Providers screen).
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, FolderOpen, SquareTerminal } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 
 import { paths } from "@/app/paths";
@@ -32,6 +32,7 @@ import { Label } from "@/components/ui/label";
 import { useIpc, useIpcEvent, type SessionState, type SessionView } from "@/lib/ipc";
 import { MVP_PROVIDER_IDS, providerLabel, type ProviderId } from "@/strings/providers";
 
+import { applySessionSnapshot, isLiveSession } from "./session-state";
 import { SessionTerminal } from "./terminal";
 
 const SESSIONS_KEY = ["sessions"] as const;
@@ -39,7 +40,7 @@ const PROVIDERS_KEY = ["providers"] as const;
 const FOLDER_STORAGE_KEY = "harness.terminal.folder";
 
 function isLive(state: SessionState): boolean {
-  return state.kind === "spawning" || state.kind === "running" || state.kind === "idle";
+  return isLiveSession(state);
 }
 
 function stateChip(state: SessionState): { tone: StatusTone; label: string } {
@@ -58,6 +59,8 @@ function stateChip(state: SessionState): { tone: StatusTone; label: string } {
         : { tone: "danger", label: `Exited with code ${String(state.code)}` };
     case "killed":
       return { tone: "danger", label: "Stopped" };
+    case "stopping":
+      return { tone: "warning", label: "Stopping" };
   }
 }
 
@@ -68,10 +71,7 @@ function useSessions() {
   useIpcEvent("session_changed", (session) => {
     queryClient.setQueryData<SessionView[]>(SESSIONS_KEY, (old) => {
       if (old === undefined) return old;
-      const known = old.some((s) => s.session_id === session.session_id);
-      return known
-        ? old.map((s) => (s.session_id === session.session_id ? session : s))
-        : [...old, session];
+      return applySessionSnapshot(old, session);
     });
   });
   return useQuery({
@@ -271,9 +271,12 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const queryClient = useQueryClient();
   const sessions = useSessions();
   const [stopping, setStopping] = useState(false);
+  useEffect(() => {
+    setStopping(false);
+  }, [sessionId]);
   const put = (next: SessionView) => {
     queryClient.setQueryData<SessionView[]>(SESSIONS_KEY, (old) =>
-      old?.map((s) => (s.session_id === next.session_id ? next : s)),
+      old === undefined ? old : applySessionSnapshot(old, next),
     );
   };
   const stop = useMutation({
@@ -405,5 +408,9 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
 
 export default function SessionsScreen() {
   const { sessionId } = useParams();
-  return sessionId === undefined ? <SessionList /> : <SessionDetail sessionId={sessionId} />;
+  return sessionId === undefined ? (
+    <SessionList />
+  ) : (
+    <SessionDetail key={sessionId} sessionId={sessionId} />
+  );
 }

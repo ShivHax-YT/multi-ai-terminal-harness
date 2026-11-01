@@ -88,8 +88,9 @@ impl ProviderRegistry {
             .contains(&provider)
     }
 
-    /// The human confirmed in the terminal dialog that this is their own account (rule 5). This enables nothing else:
-    /// every other readiness blocker stays in place for tasks.
+    /// The human confirmed in the terminal dialog that this is their own account (rule 5).
+    /// This is the in-memory mark only. It does not check that the CLI is verified; `confirm` keeps that check.
+    /// It never clears task blockers or makes a provider usable for automated work.
     pub fn note_personal_use(&self, provider: ProviderId) {
         self.confirmed
             .lock()
@@ -197,21 +198,9 @@ impl ProviderRegistry {
             .unwrap_or_else(|e| e.into_inner())
             .contains(&provider);
         status["personal_use_confirmed"] = json!(confirmed);
-        let mut blockers = vec![
-            "execution_boundary_unavailable",
-            "runtime_controls_unavailable",
-            "provider_policy_unverified",
-        ];
-        if state == "signed_out" {
-            blockers.push("signed_out");
-        }
-        if state == "unknown" {
-            blockers.push("sign_in_unknown");
-        }
-        if !confirmed {
-            blockers.push("personal_use_unconfirmed");
-        }
-        status["usable"]["blockers"] = json!(blockers);
+        // Lead and worker stay false. An unreviewed vendor release is an explicit task blocker, separate from the
+        // human terminal, which may still open that signed CLI.
+        set_task_usability(&mut status, release_reviewed, state, confirmed);
         status
     }
 
@@ -243,8 +232,64 @@ fn codesign_detail(release_reviewed: bool) -> &'static str {
     }
 }
 
-fn supported(provider: ProviderId) -> bool {
+/// Human terminals are open only for providers this build can launch with a compiled vendor pin.
+/// Grok, Kimi, Gemini and GLM stay closed: this tree has no pin for the first three, Gemini has no
+/// app-managed key launch, and GLM has no base-URL setting here.
+pub fn human_terminal_supported(provider: ProviderId) -> bool {
     matches!(provider, ProviderId::Claude | ProviderId::Codex)
+}
+
+fn supported(provider: ProviderId) -> bool {
+    human_terminal_supported(provider)
+}
+
+/// Automated workers are not part of this build. `tasks_enabled` still refuses `release_unreviewed` on its own,
+/// so deleting the placeholder blockers cannot make an unreviewed release runnable.
+const WORKERS_ENABLED: bool = false;
+
+/// Writes the automated-task gate. A vendor-signed release that this build has not reviewed gets its own blocker,
+/// separate from the human terminal.
+fn set_task_usability(status: &mut Value, release_reviewed: bool, sign_in: &str, confirmed: bool) {
+    let blockers = automated_task_blockers(release_reviewed, sign_in, confirmed);
+    let allowed = tasks_enabled(&blockers);
+    status["usable"] = json!({
+        "lead": allowed,
+        "worker": allowed,
+        "blockers": blockers,
+    });
+}
+
+fn tasks_enabled(blockers: &[&str]) -> bool {
+    WORKERS_ENABLED
+        && blockers
+            .iter()
+            .all(|blocker| *blocker != "release_unreviewed")
+}
+
+/// Blockers for automated tasks. `lead` and `worker` are never turned on by this list.
+fn automated_task_blockers(
+    release_reviewed: bool,
+    sign_in: &str,
+    confirmed: bool,
+) -> Vec<&'static str> {
+    let mut blockers = vec![
+        "execution_boundary_unavailable",
+        "runtime_controls_unavailable",
+        "provider_policy_unverified",
+    ];
+    if !release_reviewed {
+        blockers.push("release_unreviewed");
+    }
+    if sign_in == "signed_out" {
+        blockers.push("signed_out");
+    }
+    if sign_in == "unknown" {
+        blockers.push("sign_in_unknown");
+    }
+    if !confirmed {
+        blockers.push("personal_use_unconfirmed");
+    }
+    blockers
 }
 
 fn probe_failure(status: &mut Value, error: &ProbeError) {
@@ -480,9 +525,61 @@ mod tests {
         assert!(!registry.personal_use_confirmed(ProviderId::Claude));
         registry.note_personal_use(ProviderId::Claude);
         assert!(registry.personal_use_confirmed(ProviderId::Claude));
-        let status = registry.refresh(ProviderId::Gemini);
-        assert_eq!(status["usable"]["worker"], false);
+        // Supported provider, signed in, no confirmation: tasks stay blocked on that fact.
+        let mut status = unavailable(ProviderId::Claude);
+        set_task_usability(&mut status, true, "signed_in", false);
         assert_eq!(status["usable"]["lead"], false);
+        assert_eq!(status["usable"]["worker"], false);
+        let blockers = status["usable"]["blockers"].as_array().unwrap();
+        assert!(blockers
+            .iter()
+            .any(|blocker| blocker == "personal_use_unconfirmed"));
+        assert!(blockers
+            .iter()
+            .any(|blocker| blocker == "execution_boundary_unavailable"));
+        set_task_usability(&mut status, true, "signed_in", true);
+        assert_eq!(status["usable"]["lead"], false);
+        assert_eq!(status["usable"]["worker"], false);
+        let confirmed = status["usable"]["blockers"].as_array().unwrap();
+        assert!(!confirmed
+            .iter()
+            .any(|blocker| blocker == "personal_use_unconfirmed"));
+        assert!(confirmed
+            .iter()
+            .any(|blocker| blocker == "execution_boundary_unavailable"));
+        let gemini = registry.refresh(ProviderId::Gemini);
+        assert_eq!(gemini["usable"]["worker"], false);
+        assert_eq!(gemini["usable"]["lead"], false);
+    }
+
+    #[test]
+    fn an_unreviewed_release_blocks_automated_tasks_and_not_the_terminal_gate() {
+        let mut status = unavailable(ProviderId::Codex);
+        status["usable"]["lead"] = json!(true);
+        status["usable"]["worker"] = json!(true);
+        set_task_usability(&mut status, false, "signed_in", true);
+        assert_eq!(status["usable"]["lead"], false);
+        assert_eq!(status["usable"]["worker"], false);
+        let blockers = status["usable"]["blockers"].as_array().unwrap();
+        assert!(blockers
+            .iter()
+            .any(|blocker| blocker == "release_unreviewed"));
+        assert!(!blockers
+            .iter()
+            .any(|blocker| blocker == "personal_use_unconfirmed"));
+        // The placeholder blockers are not what keeps tasks off for this release.
+        assert!(!tasks_enabled(&["release_unreviewed"]));
+        assert!(!tasks_enabled(&[]));
+        assert!(human_terminal_supported(ProviderId::Claude));
+        assert!(human_terminal_supported(ProviderId::Codex));
+        for provider in [
+            ProviderId::Grok,
+            ProviderId::Kimi,
+            ProviderId::Gemini,
+            ProviderId::Glm,
+        ] {
+            assert!(!human_terminal_supported(provider), "{provider}");
+        }
     }
 
     #[test]

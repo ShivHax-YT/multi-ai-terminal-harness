@@ -77,6 +77,8 @@ const BLOCKER_SENTENCES: Record<Blocker, string> = {
   runtime_controls_unavailable:
     "Usage, presence and restart controls are not connected to execution.",
   provider_policy_unverified: "The provider policy has not been verified for this build.",
+  release_unreviewed:
+    "This vendor-signed release has not been reviewed for tasks. A human terminal can still open.",
 };
 
 /** One plain sentence per blocker. A value this build does not know falls back to a generic sentence. */

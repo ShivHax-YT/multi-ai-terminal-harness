@@ -55,6 +55,11 @@ pub fn run() {
             commands::update_settings,
             commands::get_killswitch_status,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Harness");
+        .build(tauri::generate_context!())
+        .expect("error while running Harness")
+        .run(|_app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                terminals::Terminals::shared().shutdown();
+            }
+        });
 }

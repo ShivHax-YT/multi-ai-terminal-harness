@@ -159,7 +159,8 @@ export type Blocker =
   | "provider_paused"
   | "execution_boundary_unavailable"
   | "runtime_controls_unavailable"
-  | "provider_policy_unverified";
+  | "provider_policy_unverified"
+  | "release_unreviewed";
 
 export type KillSwitchState = "enabled" | "disabled" | "api_key_only" | "unknown";
 
@@ -271,7 +272,9 @@ export type SessionState =
   | { kind: "idle" }
   | { kind: "rate_limited"; retry_at: string; attempt: number; consecutive_limit_errors: number }
   | { kind: "exited"; code?: number; signal?: string }
-  | { kind: "killed" };
+  | { kind: "killed" }
+  /** Stop was asked. The process still holds the provider's session slot. */
+  | { kind: "stopping" };
 
 export type PauseReason =
   | "user"
@@ -300,6 +303,8 @@ export interface SessionView {
   started_at: string;
   /** Login and interactive sessions start with takeover = true (the backend sets it). */
   takeover: boolean;
+  /** Monotonic per session. A snapshot with a lower revision is stale and must be ignored. */
+  revision?: number;
 }
 
 /** Raw PTY bytes, base64. Untrusted: render only inside the terminal view. */

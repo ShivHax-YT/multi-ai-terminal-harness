@@ -10,6 +10,7 @@ import { ErrorAlert } from "@/components/common";
 import { useIpc, type TerminalChunk } from "@/lib/ipc";
 import { usePtyInput } from "@/lib/ipc/pty-input";
 
+import { createAttachGeneration } from "./attach-generation";
 import { createInputGate } from "./input-gate";
 
 export interface SessionTerminalProps {
@@ -78,16 +79,31 @@ export function SessionTerminal({ sessionId, kind, takeover }: SessionTerminalPr
     let unlisten: (() => void) | undefined;
     let lastSeq: number | null = null;
     const pending: TerminalChunk[] = [];
+    const attaches = createAttachGeneration();
+    let attachAgain = false;
 
     const attach = async () => {
-      lastSeq = null;
-      const attached = await client.attach_terminal({ session_id: sessionId });
-      if (disposed) return;
-      term.reset();
-      term.write(decode(attached.scrollback_b64));
-      lastSeq = attached.seq;
-      setConnecting(false);
-      for (const chunk of pending.splice(0)) receive(chunk);
+      const ticket = attaches.begin();
+      if (ticket === null) {
+        attachAgain = true;
+        return;
+      }
+      try {
+        const attached = await client.attach_terminal({ session_id: sessionId });
+        // A slower or older snapshot must not reset the view over bytes already shown.
+        if (disposed || !attaches.shouldApply(ticket, attached.seq, lastSeq)) return;
+        term.reset();
+        term.write(decode(attached.scrollback_b64));
+        lastSeq = attached.seq;
+        setConnecting(false);
+        for (const chunk of pending.splice(0)) receive(chunk);
+      } finally {
+        attaches.finish();
+        if (attachAgain && !disposed) {
+          attachAgain = false;
+          void attach().catch(setError);
+        }
+      }
     };
 
     const receive = (chunk: TerminalChunk) => {

@@ -161,6 +161,7 @@ describe("blockerSentence", () => {
     execution_boundary_unavailable: true,
     runtime_controls_unavailable: true,
     provider_policy_unverified: true,
+    release_unreviewed: true,
   };
 
   it("maps every blocker to one plain sentence", () => {
