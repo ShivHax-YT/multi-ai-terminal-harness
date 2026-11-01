@@ -127,7 +127,8 @@ describe("input gate", () => {
     const held: { gate: ReturnType<typeof createInputGate> | null } = { gate: null };
     element.addEventListener("compositionend", () => {
       setTimeout(() => {
-        held.gate?.onData("é");
+        held.gate?.onData("日");
+        held.gate?.onData("本");
         held.gate?.onData("\u001b[?12;1R");
         held.gate?.onData("\u001b[0n");
         held.gate?.onData("\u001b[12;1R");
@@ -142,17 +143,25 @@ describe("input gate", () => {
     held.gate = gate;
     element.dispatchEvent(new KeyboardEvent("keydown", { key: "Dead", bubbles: true }));
     element.dispatchEvent(new CompositionEvent("compositionend", { data: "é", bubbles: true }));
+    element.dispatchEvent(
+      new InputEvent("beforeinput", {
+        bubbles: true,
+        inputType: "insertCompositionText",
+        data: "é",
+      }),
+    );
     element.dispatchEvent(new InputEvent("input", { bubbles: true, data: "é" }));
     element.dispatchEvent(
       new InputEvent("input", { bubbles: true, inputType: "insertFromComposition", data: "é" }),
     );
     element.dispatchEvent(new KeyboardEvent("keypress", { key: "é", bubbles: true }));
     await flush();
-    expect(write).toHaveBeenCalledTimes(1);
-    expect(write).toHaveBeenCalledWith("é");
+    expect(write).toHaveBeenNthCalledWith(1, "日");
+    expect(write).toHaveBeenNthCalledWith(2, "本");
+    expect(write).toHaveBeenCalledTimes(2);
     await flush();
     gate.onData("x");
-    expect(write).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledTimes(2);
   });
 
   it("keeps text when input follows keyCode 229 before xterm's timer", async () => {
@@ -174,7 +183,15 @@ describe("input gate", () => {
     const key = new KeyboardEvent("keydown", { key: "Unidentified", bubbles: true });
     Object.defineProperty(key, "keyCode", { get: () => 229 });
     element.dispatchEvent(key);
+    element.dispatchEvent(
+      new InputEvent("beforeinput", {
+        bubbles: true,
+        inputType: "insertCompositionText",
+        data: "日",
+      }),
+    );
     element.dispatchEvent(new InputEvent("input", { bubbles: true, data: "日" }));
+    element.dispatchEvent(new KeyboardEvent("keypress", { key: "日", bubbles: true }));
     await flush();
     expect(write).toHaveBeenCalledTimes(1);
     expect(write).toHaveBeenCalledWith("日");
