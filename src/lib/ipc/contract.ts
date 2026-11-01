@@ -185,6 +185,8 @@ export interface ProviderStatus {
     state: "verified" | "failed" | "unchecked";
     /** Kernel image identity does not establish full-file integrity. */
     verification_scope?: "kernel_identity" | "full_integrity";
+    /** False: an official release newer than the one reviewed for this build. Work must never dispatch to it. */
+    release_reviewed?: boolean;
     checked_at?: string;
     checks: BinaryCheck[];
   };
@@ -283,7 +285,8 @@ export type PauseReason =
 
 export interface SessionView {
   session_id: string;
-  kind: "worker" | "login";
+  /** "interactive": a CLI the human started and drives. Input comes only from the terminal view. */
+  kind: "worker" | "login" | "interactive";
   provider: ProviderId;
   task_id?: string;
   plan_id?: string;
@@ -295,7 +298,7 @@ export interface SessionView {
   paused: { reason: PauseReason; until?: string } | null;
   turns: { current: number; limit: number };
   started_at: string;
-  /** Login sessions start with takeover = true (the backend sets it). */
+  /** Login and interactive sessions start with takeover = true (the backend sets it). */
   takeover: boolean;
 }
 
@@ -309,6 +312,8 @@ export interface TerminalChunk {
 export interface TerminalAttach {
   cols: number;
   rows: number;
+  /** The `seq` of the newest chunk in the scrollback; later chunks arrive as terminal_output events. */
+  seq: number;
   scrollback_b64: string;
 }
 
@@ -480,6 +485,8 @@ export const COMMANDS = [
   "pause_session",
   "resume_session",
   "kill_session",
+  "start_terminal",
+  "choose_terminal_folder",
   "set_takeover",
   "resume_provider",
   "attach_terminal",
@@ -546,6 +553,14 @@ export interface IpcClient {
   pause_session(args: SessionArgs): Promise<SessionView>;
   resume_session(args: SessionArgs): Promise<SessionView>;
   kill_session(args: SessionArgs): Promise<SessionView>;
+  /** A human click only. Rule 5: refused unless personal use is confirmed, here or earlier. */
+  start_terminal(args: {
+    provider: ProviderId;
+    folder: string;
+    confirm_personal_use: boolean;
+  }): Promise<SessionView>;
+  /** The native folder panel; null when the human cancels. */
+  choose_terminal_folder(): Promise<string | null>;
   set_takeover(args: { session_id: string; enabled: boolean }): Promise<SessionView>;
   resume_provider(args: ProviderArgs): Promise<void>;
   attach_terminal(args: SessionArgs): Promise<TerminalAttach>;

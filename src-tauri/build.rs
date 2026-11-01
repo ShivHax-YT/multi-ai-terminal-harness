@@ -27,6 +27,8 @@ const COMMANDS: &[&str] = &[
     "pause_session",
     "resume_session",
     "kill_session",
+    "start_terminal",
+    "choose_terminal_folder",
     "set_takeover",
     "resume_provider",
     "attach_terminal",
@@ -43,6 +45,10 @@ const COMMANDS: &[&str] = &[
 ];
 
 fn main() {
+    // Test binaries target an older macOS, where the Swift runtime is found by rpath.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+    }
     tauri_build::try_build(
         tauri_build::Attributes::new()
             .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS)),

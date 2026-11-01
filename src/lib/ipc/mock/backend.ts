@@ -959,6 +959,47 @@ export class MockBackend {
         return s;
       }),
 
+    start_terminal: (args) =>
+      this.run("start_terminal", args, () => {
+        const status = this.provider(args.provider);
+        if (!status.adapter_available) return invalid("This provider has no terminal yet.");
+        if (typeof args.folder !== "string" || !args.folder.startsWith("/"))
+          return invalid("Enter the full path of a folder.");
+        if (args.confirm_personal_use) status.personal_use_confirmed = true;
+        if (!status.personal_use_confirmed)
+          return ruleBlocked(5, "Confirm that this is your own personal account first.");
+        const open = [...this.sessions.values()].filter(
+          (s) => s.provider === status.provider && isLive(s),
+        );
+        if (open.length >= this.limits.rules.concurrent_sessions.ceiling)
+          return ruleBlocked(1, "This provider already has its maximum of terminals open.");
+        this.idSeq += 1;
+        const session: SessionView = {
+          session_id: `t-${String(this.idSeq)}`,
+          kind: "interactive",
+          provider: status.provider,
+          title: args.folder.split("/").pop() ?? "/",
+          worktree: args.folder,
+          state: { kind: "running" },
+          paused: null,
+          turns: { current: 0, limit: 0 },
+          started_at: this.nowIso(),
+          takeover: true,
+        };
+        this.sessions.set(session.session_id, session);
+        this.terminals.set(session.session_id, {
+          cols: 100,
+          rows: 30,
+          seq: 0,
+          bytes: new Uint8Array(),
+        });
+        this.emit("session_changed", session);
+        return session;
+      }),
+
+    choose_terminal_folder: () =>
+      this.run("choose_terminal_folder", undefined, () => "/Users/you/project"),
+
     set_takeover: (args) =>
       this.run("set_takeover", args, () => {
         const s = this.session(args.session_id);
@@ -997,7 +1038,12 @@ export class MockBackend {
       this.run("attach_terminal", args, (): TerminalAttach => {
         const s = this.session(args.session_id);
         const term = this.terminals.get(s.session_id) ?? notFound("terminal");
-        return { cols: term.cols, rows: term.rows, scrollback_b64: bytesToBase64(term.bytes) };
+        return {
+          cols: term.cols,
+          rows: term.rows,
+          seq: term.seq,
+          scrollback_b64: bytesToBase64(term.bytes),
+        };
       }),
 
     resize_terminal: (args) =>

@@ -137,8 +137,8 @@ export function Shell() {
         )}
         {ipcMode === "native" && (
           <div role="note" className="border-b bg-muted px-6 py-3 text-sm">
-            Native app · Provider checks are live. Project execution and live usage tracking are
-            unavailable in this build.
+            Native app · Provider checks and terminals are live. Automated tasks and live usage
+            tracking are unavailable in this build.
           </div>
         )}
         <main className="mx-auto w-full max-w-[1200px] flex-1 p-6">

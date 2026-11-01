@@ -66,8 +66,8 @@ function ProvidersBody({ providers }: { providers: ReturnType<typeof useProvider
         <div role="status" className="space-y-1 rounded-md border bg-muted/40 px-4 py-3 text-sm">
           <p className="font-medium">Sign-in works. Task execution is still being built.</p>
           <p className="text-muted-foreground">
-            The app cannot safely create isolated worktrees yet. Account confirmation will not
-            enable tasks.
+            You can use each CLI yourself from Sessions. Automated tasks stay off, because the app
+            cannot safely create isolated worktrees yet.
           </p>
         </div>
       ) : (

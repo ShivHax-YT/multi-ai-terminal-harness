@@ -24,6 +24,8 @@
     "allow-pause-session",
     "allow-resume-session",
     "allow-kill-session",
+    "allow-start-terminal",
+    "allow-choose-terminal-folder",
     "allow-set-takeover",
     "allow-resume-provider",
     "allow-attach-terminal",

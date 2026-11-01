@@ -5,7 +5,7 @@ use crate::fs_guard::{self, FileGuard, NullSink};
 use crate::process::{self, Capture, ProbeError, SignaturePolicy};
 use crate::provider::ProviderId;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 #[derive(Deserialize)]
@@ -62,16 +62,65 @@ impl InstalledCli {
         process::terminal_login(&self.path, &self.home, self.policy, args)
     }
 
-    pub fn probe(&self, command: ProbeCommand) -> Result<Capture, ProbeError> {
+    /// The CLI's own interactive mode, no arguments, for a human on a real terminal.
+    pub fn terminal_session(
+        &self,
+        cwd: &Path,
+        ambient: &[(String, String)],
+    ) -> Result<i32, ProbeError> {
+        let env: Vec<String> = session_env(&self.home, ambient)
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        process::terminal_session(&self.path, cwd, self.policy, &env)
+    }
+
+    fn probe_args(&self, command: ProbeCommand) -> Result<&'static [&'static str], ProbeError> {
         // No task/agent/UI text enters argv. Worker invocation is absent here.
-        let args: &[&str] = match (self.provider, command) {
-            (_, ProbeCommand::Version) => &["--version"],
-            (ProviderId::Claude, ProbeCommand::AuthStatus) => &["auth", "status"],
-            (ProviderId::Codex, ProbeCommand::AuthStatus) => &["login", "status"],
-            _ => return Err(ProbeError::Unsupported),
-        };
+        match (self.provider, command) {
+            (_, ProbeCommand::Version) => Ok(&["--version"]),
+            (ProviderId::Claude, ProbeCommand::AuthStatus) => Ok(&["auth", "status"]),
+            (ProviderId::Codex, ProbeCommand::AuthStatus) => Ok(&["login", "status"]),
+            _ => Err(ProbeError::Unsupported),
+        }
+    }
+
+    pub fn probe(&self, command: ProbeCommand) -> Result<Capture, ProbeError> {
+        let args = self.probe_args(command)?;
         process::probe(&self.path, &self.home, self.policy, args)
     }
+
+    /// For reporting status when the pinned probe refused: a routine vendor update changes the release hash. The
+    /// kernel still requires the vendor identity. The caller records that the release is unreviewed.
+    pub fn probe_any_release(&self, command: ProbeCommand) -> Result<Capture, ProbeError> {
+        let args = self.probe_args(command)?;
+        process::probe_any_release(&self.path, &self.home, self.policy, args)
+    }
+}
+
+/// Everything an interactive CLI may inherit from the launch environment. This is an allowlist, so a config-home
+/// override (rule 2) or anything else set in the app's environment never reaches a CLI.
+const SESSION_ENV_PASSTHROUGH: [&str; 3] = ["SHELL", "TMPDIR", "SSH_AUTH_SOCK"];
+
+/// The whole environment of a human terminal session (rules 2 and 4). The CLI keeps its default config home.
+pub fn session_env(home: &Path, ambient: &[(String, String)]) -> Vec<(String, String)> {
+    let home_text = home.to_string_lossy();
+    let path = format!(
+        "{home_text}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    );
+    let mut env = vec![
+        ("HOME".to_owned(), home_text.into_owned()),
+        ("PATH".to_owned(), path),
+        ("TERM".to_owned(), "xterm-256color".to_owned()),
+        ("COLORTERM".to_owned(), "truecolor".to_owned()),
+        ("LANG".to_owned(), "en_US.UTF-8".to_owned()),
+    ];
+    for (key, value) in ambient {
+        if SESSION_ENV_PASSTHROUGH.contains(&key.as_str()) {
+            env.push((key.clone(), value.clone()));
+        }
+    }
+    env
 }
 
 pub(crate) fn install_hint(provider: ProviderId) -> Option<&'static str> {
@@ -122,6 +171,28 @@ pub(crate) fn discover(provider: ProviderId) -> Discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_environment_is_an_allowlist_without_config_homes() {
+        // Any name outside the allowlist is dropped, including a provider's config-home override (rule 2).
+        let ambient: Vec<(String, String)> = [
+            "SOME_PROVIDER_HOME",
+            "SOME_CONFIG_DIR",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "CLAUDECODE",
+            "SSH_AUTH_SOCK",
+        ]
+        .iter()
+        .map(|key| (key.to_string(), "x".to_string()))
+        .collect();
+        let env = session_env(Path::new("/Users/someone"), &ambient);
+        let keys: Vec<&str> = env.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["HOME", "PATH", "TERM", "COLORTERM", "LANG", "SSH_AUTH_SOCK"]
+        );
+    }
 
     #[test]
     fn only_the_two_native_providers_have_compiled_trust_pins() {

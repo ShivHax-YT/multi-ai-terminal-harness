@@ -27,6 +27,21 @@ extern "C" {
         stderr: i32,
         stdin: i32,
     ) -> *mut c_void;
+    fn harness_session_start(
+        path: *const libc::c_char,
+        cwd: *const libc::c_char,
+        team: *const libc::c_char,
+        identifier: *const libc::c_char,
+        platform_test: bool,
+        env: *const *const libc::c_char,
+        envc: usize,
+        argv: *const *const libc::c_char,
+        argc: usize,
+        stdout: i32,
+        stderr: i32,
+        stdin: i32,
+    ) -> *mut c_void;
+    fn harness_choose_folder() -> *mut libc::c_char;
     fn harness_probe_poll(handle: *mut c_void, code: *mut i32) -> bool;
     fn harness_probe_cancel(handle: *mut c_void);
     fn harness_probe_wait(handle: *mut c_void);
@@ -154,7 +169,19 @@ pub(super) fn run(
     args: &[&str],
     timeout: Duration,
 ) -> Result<Capture, ProbeError> {
-    run_with_hook(path, home, policy, args, timeout, || {})
+    run_with_hook(path, home, policy, args, timeout, true, || {})
+}
+
+/// The same bounded probe, without the reviewed-release hash: the kernel still requires the vendor, identifier,
+/// Developer ID category and runtime flags. For reporting a newer official release, never for dispatching work.
+pub(super) fn run_any_release(
+    path: &Path,
+    home: &Path,
+    policy: SignaturePolicy,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Capture, ProbeError> {
+    run_with_hook(path, home, policy, args, timeout, false, || {})
 }
 
 fn run_with_hook(
@@ -163,6 +190,7 @@ fn run_with_hook(
     policy: SignaturePolicy,
     args: &[&str],
     timeout: Duration,
+    pin_release: bool,
     before_spawn: impl FnOnce(),
 ) -> Result<Capture, ProbeError> {
     // Status is not inference, but serialize it to bound native subprocess use.
@@ -174,6 +202,15 @@ fn run_with_hook(
     if !path.is_absolute() || !home.is_absolute() {
         return Err(ProbeError::Verification);
     }
+    // The same fixed environment and neutral folder as the pinned path in the bridge.
+    let env = c_strings(&[
+        format!("HOME={}", home.to_string_lossy()),
+        "PATH=/usr/bin:/bin:/usr/sbin:/sbin".to_owned(),
+        "LANG=en_US.UTF-8".to_owned(),
+        "LC_ALL=C".to_owned(),
+    ])?;
+    let env_ptrs: Vec<_> = env.iter().map(|s| s.as_ptr()).collect();
+    let root = CString::new("/").map_err(|_| ProbeError::Failed)?;
     let path = cstring(path.as_os_str())?;
     let home = cstring(home.as_os_str())?;
     let team = CString::new(policy.team).map_err(|_| ProbeError::Verification)?;
@@ -192,19 +229,36 @@ fn run_with_hook(
     // bridge installs the code requirement BEFORE Process.run. Only inherited
     // pipe descriptors are passed, never handles for candidate file contents.
     let handle = unsafe {
-        harness_probe_start(
-            path.as_ptr(),
-            home.as_ptr(),
-            team.as_ptr(),
-            identifier.as_ptr(),
-            release_cdhash.as_ptr(),
-            policy.platform_test,
-            argv.as_ptr(),
-            argv.len(),
-            out_write.as_raw_fd(),
-            err_write.as_raw_fd(),
-            -1,
-        )
+        if pin_release {
+            harness_probe_start(
+                path.as_ptr(),
+                home.as_ptr(),
+                team.as_ptr(),
+                identifier.as_ptr(),
+                release_cdhash.as_ptr(),
+                policy.platform_test,
+                argv.as_ptr(),
+                argv.len(),
+                out_write.as_raw_fd(),
+                err_write.as_raw_fd(),
+                -1,
+            )
+        } else {
+            harness_session_start(
+                path.as_ptr(),
+                root.as_ptr(),
+                team.as_ptr(),
+                identifier.as_ptr(),
+                policy.platform_test,
+                env_ptrs.as_ptr(),
+                env_ptrs.len(),
+                argv.as_ptr(),
+                argv.len(),
+                out_write.as_raw_fd(),
+                err_write.as_raw_fd(),
+                -1,
+            )
+        }
     };
     if handle.is_null() {
         return Err(ProbeError::Verification);
@@ -297,10 +351,193 @@ pub(super) fn terminal_login(
     task.exited().ok_or(ProbeError::Failed)
 }
 
+fn c_strings(values: &[String]) -> Result<Vec<CString>, ProbeError> {
+    values
+        .iter()
+        .map(|s| CString::new(s.as_str()).map_err(|_| ProbeError::Failed))
+        .collect()
+}
+
+/// Human-driven interactive CLI on the wrapper's own controlling terminal. The
+/// kernel applies the vendor identity at launch. `stdio` is (stdout, stderr, stdin);
+/// a stdin below zero means no terminal, for the pipe-based tests.
+pub(super) fn session(
+    path: &Path,
+    cwd: &Path,
+    policy: SignaturePolicy,
+    env: &[String],
+    args: &[String],
+    stdio: (i32, i32, i32),
+) -> Result<i32, ProbeError> {
+    let path = cstring(path.as_os_str())?;
+    let cwd = cstring(cwd.as_os_str())?;
+    let team = CString::new(policy.team).map_err(|_| ProbeError::Verification)?;
+    let identifier = CString::new(policy.identifier).map_err(|_| ProbeError::Verification)?;
+    let env = c_strings(env)?;
+    let env_ptrs: Vec<_> = env.iter().map(|s| s.as_ptr()).collect();
+    let args = c_strings(args)?;
+    let arg_ptrs: Vec<_> = args.iter().map(|s| s.as_ptr()).collect();
+    // SAFETY: strings and arrays live through the synchronous call; the bridge
+    // installs the code requirement before Process.run.
+    let handle = unsafe {
+        harness_session_start(
+            path.as_ptr(),
+            cwd.as_ptr(),
+            team.as_ptr(),
+            identifier.as_ptr(),
+            policy.platform_test,
+            env_ptrs.as_ptr(),
+            env_ptrs.len(),
+            arg_ptrs.as_ptr(),
+            arg_ptrs.len(),
+            stdio.0,
+            stdio.1,
+            stdio.2,
+        )
+    };
+    if handle.is_null() {
+        return Err(ProbeError::Verification);
+    }
+    let task = Task {
+        handle: handle as usize,
+        permit: None,
+    };
+    // SAFETY: the human owns this session, and Foundation owns the process.
+    unsafe { harness_probe_wait(handle) };
+    task.exited().ok_or(ProbeError::Failed)
+}
+
+/// The native folder panel. Call on the main thread only.
+pub(super) fn choose_folder() -> Option<std::path::PathBuf> {
+    // SAFETY: the bridge returns a malloc'd C string or null; it is copied, then freed once.
+    unsafe {
+        let raw = harness_choose_folder();
+        if raw.is_null() {
+            return None;
+        }
+        let bytes = std::ffi::CStr::from_ptr(raw).to_bytes().to_vec();
+        libc::free(raw.cast());
+        Some(std::path::PathBuf::from(OsStr::from_bytes(&bytes)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    fn session_output(
+        path: &str,
+        identifier: &'static str,
+        cwd: &Path,
+        env: &[String],
+    ) -> Result<(i32, String), ProbeError> {
+        let policy = SignaturePolicy {
+            team: "",
+            identifier,
+            release_cdhash: "",
+            platform_test: true,
+        };
+        let (out, write) = pipe()?;
+        let code = session(
+            Path::new(path),
+            cwd,
+            policy,
+            env,
+            &[],
+            (write.as_raw_fd(), write.as_raw_fd(), -1),
+        )?;
+        drop(write);
+        let mut bytes = Vec::new();
+        drain(&out, &mut bytes)?;
+        Ok((code, String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    #[test]
+    fn a_session_runs_in_the_chosen_folder_with_only_the_given_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().canonicalize().unwrap();
+        let (code, pwd) =
+            session_output("/bin/pwd", "com.apple.pwd", &folder, &["A=1".into()]).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(pwd.trim(), folder.to_str().unwrap());
+        // SAFETY: test process; the variable is unique to this test.
+        unsafe { std::env::set_var("HARNESS_TEST_MUST_NOT_LEAK", "leaked") };
+        let (code, env) = session_output(
+            "/usr/bin/env",
+            "com.apple.env",
+            &folder,
+            &["ONLY=this=value".into()],
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(env.trim(), "ONLY=this=value");
+    }
+
+    #[test]
+    fn the_any_release_probe_still_enforces_the_vendor_identity() {
+        let _serial = SERIAL.lock().unwrap();
+        // A release hash that does not match is ignored on this lane.
+        let policy = SignaturePolicy {
+            release_cdhash: "0000000000000000000000000000000000000000",
+            ..ECHO
+        };
+        let ok = run_any_release(
+            Path::new("/bin/echo"),
+            Path::new("/var/empty"),
+            policy,
+            &["hello"],
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(ok.stdout, "hello\n");
+        // A different identity is still refused by the kernel.
+        let wrong = SignaturePolicy {
+            identifier: "com.apple.sleep",
+            ..ECHO
+        };
+        assert!(matches!(
+            run_any_release(
+                Path::new("/bin/echo"),
+                Path::new("/var/empty"),
+                wrong,
+                &["hello"],
+                Duration::from_secs(5)
+            ),
+            Err(ProbeError::Verification)
+        ));
+    }
+
+    #[test]
+    fn the_kernel_refuses_a_session_for_the_wrong_identity() {
+        // The kernel refuses either at launch or by killing the image before its first instruction.
+        let refused = session_output("/bin/pwd", "com.apple.echo", Path::new("/"), &[]);
+        match refused {
+            Err(ProbeError::Verification) => {}
+            Ok((code, output)) => {
+                assert!(code < 0, "ran with exit code {code}");
+                assert_eq!(output, "", "the refused image printed output");
+            }
+            Err(other) => panic!("unexpected: {other}"),
+        }
+        let vendor = SignaturePolicy {
+            team: "Q6L2SF6YDW",
+            identifier: "com.apple.pwd",
+            release_cdhash: "",
+            platform_test: false,
+        };
+        assert!(!matches!(
+            session(
+                Path::new("/bin/pwd"),
+                Path::new("/"),
+                vendor,
+                &[],
+                &[],
+                (1, 2, -1)
+            ),
+            Ok(0)
+        ));
+    }
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::Mutex;
 
@@ -383,6 +620,7 @@ mod tests {
             ECHO,
             &[],
             Duration::from_secs(5),
+            true,
             || {
                 fs::rename(&path, dir.path().join("old")).unwrap();
                 fs::write(
@@ -411,6 +649,7 @@ mod tests {
             ECHO,
             &["30"],
             Duration::from_secs(5),
+            true,
             || {
                 fs::rename(&parent, dir.path().join("old")).unwrap();
                 fs::create_dir(&parent).unwrap();

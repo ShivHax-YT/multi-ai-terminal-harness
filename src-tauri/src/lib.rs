@@ -4,11 +4,16 @@
 //! below, granted one by one in capabilities/main.json.
 
 pub mod commands;
+pub mod terminals;
 
 /// Starts the app.
 pub fn run() {
     tauri::Builder::default()
         .manage(harness_core::plan::simulation::Simulation::default())
+        .setup(|app| {
+            terminals::Terminals::shared().bind_app(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::sim_snapshot,
             commands::sim_submit,
@@ -34,6 +39,8 @@ pub fn run() {
             commands::pause_session,
             commands::resume_session,
             commands::kill_session,
+            commands::start_terminal,
+            commands::choose_terminal_folder,
             commands::set_takeover,
             commands::resume_provider,
             commands::attach_terminal,

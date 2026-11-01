@@ -4,9 +4,11 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
+import { xtermFrozenPrototype } from "./vite.xterm-frozen-prototype.ts";
+
 // Rule 5: the dev server binds to loopback only, on the fixed port that tauri.conf.json devUrl points at.
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), xtermFrozenPrototype()],
   resolve: {
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),

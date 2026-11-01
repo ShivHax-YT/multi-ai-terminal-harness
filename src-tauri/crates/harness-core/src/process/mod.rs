@@ -53,6 +53,53 @@ pub(crate) fn probe(
     }
 }
 
+/// Fixed-argument probe of a release newer than the reviewed pin. The kernel still enforces the vendor identity.
+pub(crate) fn probe_any_release(
+    path: &std::path::Path,
+    home: &std::path::Path,
+    policy: SignaturePolicy,
+    args: &[&str],
+) -> Result<Capture, ProbeError> {
+    #[cfg(target_os = "macos")]
+    {
+        signed_probe::run_any_release(path, home, policy, args, std::time::Duration::from_secs(20))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, home, policy, args);
+        Err(ProbeError::Unsupported)
+    }
+}
+
+/// The native folder panel, for the app shell. Call on the main thread only.
+pub fn choose_folder() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        signed_probe::choose_folder()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+pub(crate) fn terminal_session(
+    path: &std::path::Path,
+    cwd: &std::path::Path,
+    policy: SignaturePolicy,
+    env: &[String],
+) -> Result<i32, ProbeError> {
+    #[cfg(target_os = "macos")]
+    {
+        signed_probe::session(path, cwd, policy, env, &[], (1, 2, 0))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, cwd, policy, env);
+        Err(ProbeError::Unsupported)
+    }
+}
+
 pub(crate) fn terminal_login(
     path: &std::path::Path,
     home: &std::path::Path,

@@ -49,6 +49,8 @@ function createClient(): IpcClient {
     pause_session: (args) => call("pause_session", { ...args }),
     resume_session: (args) => call("resume_session", { ...args }),
     kill_session: (args) => call("kill_session", { ...args }),
+    start_terminal: (args) => call("start_terminal", { ...args }),
+    choose_terminal_folder: () => call("choose_terminal_folder"),
     set_takeover: (args) => call("set_takeover", { ...args }),
     resume_provider: (args) => call("resume_provider", { ...args }),
     attach_terminal: (args) => call("attach_terminal", { ...args }),

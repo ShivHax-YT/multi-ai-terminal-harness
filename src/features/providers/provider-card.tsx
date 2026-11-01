@@ -199,6 +199,12 @@ function TechnicalDetails({ status }: { status: ProviderStatus }) {
             clearance to run tasks.
           </p>
         )}
+        {status.binary.release_reviewed === false && (
+          <p>
+            This vendor-signed release is newer than the one reviewed for this build. Terminals
+            work, and tasks stay off for it.
+          </p>
+        )}
         {status.sign_in.detail !== undefined && status.sign_in.state !== "unknown" && (
           <UntrustedText text={status.sign_in.detail} block />
         )}

@@ -2,11 +2,13 @@
 //! Raw CLI output, account details and tokens never enter the IPC response/logs.
 
 use crate::binary::{self, Discovery, ProbeCommand};
+use crate::fs_guard::{self, FileGuard, GuardError, NullSink, RootKind};
 use crate::process::{Capture, ProbeError};
 use crate::provider::ProviderId;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 pub struct ProviderRegistry {
@@ -22,7 +24,79 @@ pub fn login_in_terminal(provider: ProviderId) -> Result<i32, String> {
     cli.terminal_login().map_err(|e| e.to_string())
 }
 
+/// Called only by the app's closed human terminal mode, on the terminal the human is driving. The kernel checks the
+/// CLI's identity at launch. Nothing the app or a model produced enters its arguments.
+pub fn session_in_terminal(provider: ProviderId, cwd: &Path) -> Result<i32, String> {
+    let Discovery::Found(cli) = binary::discover(provider) else {
+        return Err("A supported native CLI was not found.".into());
+    };
+    let ambient: Vec<(String, String)> = std::env::vars().collect();
+    cli.terminal_session(cwd, &ambient)
+        .map_err(|e| e.to_string())
+}
+
+/// The current time as the contract's timestamp text.
+pub fn timestamp() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// The whole environment for a human terminal's child process (rules 2 and 4).
+pub fn human_terminal_env() -> Result<Vec<(String, String)>, String> {
+    let home = fs_guard::account_home().map_err(|e| e.to_string())?;
+    let ambient: Vec<(String, String)> = std::env::vars().collect();
+    Ok(binary::session_env(&home, &ambient))
+}
+
+/// Why a provider cannot open a human terminal, before anything starts.
+pub fn human_terminal_check(provider: ProviderId) -> Result<(), &'static str> {
+    if !supported(provider) {
+        return Err("This provider has no supported terminal yet.");
+    }
+    match binary::discover(provider) {
+        Discovery::Found(_) => Ok(()),
+        Discovery::Missing => Err("Install the official CLI first."),
+        Discovery::Unverified => Err("The installed CLI could not be checked safely."),
+    }
+}
+
+/// Resolves a folder the human picked. It must be a real directory and never a credential store (rule 4).
+pub fn human_terminal_folder(folder: &Path) -> Result<PathBuf, &'static str> {
+    const REFUSED: &str = "That folder cannot be used.";
+    let home = fs_guard::account_home().map_err(|_| REFUSED)?;
+    let guard = FileGuard::new(&home, Arc::new(NullSink)).map_err(|_| REFUSED)?;
+    match guard.register_root(RootKind::Repo, folder) {
+        Ok(()) => {}
+        Err(GuardError::Denied { .. }) => {
+            return Err("That folder holds CLI credentials, so it cannot be used.")
+        }
+        Err(GuardError::NotAbsolute) => return Err("Enter the full path of a folder."),
+        Err(GuardError::Io(_)) => return Err("That folder does not exist."),
+        Err(_) => return Err(REFUSED),
+    }
+    let canonical = folder.canonicalize().map_err(|_| REFUSED)?;
+    if !canonical.is_dir() {
+        return Err("That path is not a folder.");
+    }
+    Ok(canonical)
+}
+
 impl ProviderRegistry {
+    pub fn personal_use_confirmed(&self, provider: ProviderId) -> bool {
+        self.confirmed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&provider)
+    }
+
+    /// The human confirmed in the terminal dialog that this is their own account (rule 5). This enables nothing else:
+    /// every other readiness blocker stays in place for tasks.
+    pub fn note_personal_use(&self, provider: ProviderId) {
+        self.confirmed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(provider);
+    }
+
     pub fn list(&self) -> Vec<Value> {
         ProviderId::ALL
             .into_iter()
@@ -53,7 +127,13 @@ impl ProviderRegistry {
         status["install"]["path"] = json!(cli.path);
         let now = chrono::Utc::now().to_rfc3339();
         status["binary"]["checked_at"] = json!(now);
-        let version = match cli.probe(ProbeCommand::Version) {
+        // A routine vendor update changes the release hash. Report it as the official CLI it is, on the vendor
+        // identity alone, and record that this release is unreviewed. Tasks stay off either way.
+        let (first_probe, release_reviewed) = match cli.probe(ProbeCommand::Version) {
+            Err(ProbeError::Verification) => (cli.probe_any_release(ProbeCommand::Version), false),
+            other => (other, true),
+        };
+        let version = match first_probe {
             Ok(output) if output.code == 0 => parse_version(provider, &output.stdout),
             Err(error) => {
                 probe_failure(&mut status, &error);
@@ -75,14 +155,20 @@ impl ProviderRegistry {
         status["install"]["version"] = json!(version);
         status["binary"]["state"] = json!("verified");
         status["binary"]["verification_scope"] = json!("kernel_identity");
+        status["binary"]["release_reviewed"] = json!(release_reviewed);
         status["binary"]["checks"] = json!([
-            {"kind":"codesign", "result":"pass", "detail":"macOS enforced the pinned vendor, CLI identifier, Developer ID category and hardened runtime at launch."},
+            {"kind":"codesign", "result":"pass", "detail":codesign_detail(release_reviewed)},
             {"kind":"install_source", "result":"pass", "detail":"Native vendor-signed image discovered at a supported installation entrypoint; installer history is not inferred."}
         ]);
         // Authentication has its own documented interface. Worker/help support
         // must not suppress an authentication observation. No worker verb is
         // exposed by this lane, and successful auth never grants dispatch.
-        let (state, detail) = match cli.probe(ProbeCommand::AuthStatus) {
+        let auth_probe = if release_reviewed {
+            cli.probe(ProbeCommand::AuthStatus)
+        } else {
+            cli.probe_any_release(ProbeCommand::AuthStatus)
+        };
+        let (state, detail) = match auth_probe {
             Ok(output) => parse_auth(provider, &output),
             Err(error) => {
                 probe_failure(&mut status, &error);
@@ -146,6 +232,14 @@ impl ProviderRegistry {
             blockers.retain(|b| b != "personal_use_unconfirmed");
         }
         Ok(status)
+    }
+}
+
+fn codesign_detail(release_reviewed: bool) -> &'static str {
+    if release_reviewed {
+        "macOS enforced the pinned vendor, CLI identifier, Developer ID category and hardened runtime at launch."
+    } else {
+        "macOS enforced the vendor, CLI identifier, Developer ID category and hardened runtime at launch. This vendor-signed release is newer than the one reviewed for this build, so tasks stay off for it. Terminals are not affected."
     }
 }
 
@@ -337,6 +431,58 @@ mod tests {
             .0,
             "unknown"
         );
+    }
+
+    #[test]
+    fn an_unreviewed_release_says_so_and_never_claims_the_pin() {
+        assert!(codesign_detail(true).contains("pinned"));
+        let unreviewed = codesign_detail(false);
+        assert!(!unreviewed.contains("pinned"));
+        assert!(unreviewed.contains("tasks stay off"));
+    }
+
+    #[test]
+    fn a_terminal_folder_must_be_a_real_directory_outside_credential_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            human_terminal_folder(dir.path()).unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+        assert!(human_terminal_folder(Path::new("relative/path")).is_err());
+        assert!(human_terminal_folder(&dir.path().join("missing")).is_err());
+        let file = dir.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(human_terminal_folder(&file).is_err());
+        let home = fs_guard::account_home().unwrap();
+        let denylist = fs_guard::Denylist::embedded().unwrap();
+        assert!(!denylist.home_dirs().is_empty());
+        for store in denylist.home_dirs() {
+            // Lexical refusal: the path is never opened.
+            assert!(human_terminal_folder(&home.join(store)).is_err(), "{store}");
+        }
+    }
+
+    #[test]
+    fn only_supported_providers_can_open_a_human_terminal() {
+        for provider in [
+            ProviderId::Grok,
+            ProviderId::Kimi,
+            ProviderId::Gemini,
+            ProviderId::Glm,
+        ] {
+            assert!(human_terminal_check(provider).is_err());
+        }
+    }
+
+    #[test]
+    fn noting_personal_use_never_makes_a_provider_usable_for_tasks() {
+        let registry = ProviderRegistry::default();
+        assert!(!registry.personal_use_confirmed(ProviderId::Claude));
+        registry.note_personal_use(ProviderId::Claude);
+        assert!(registry.personal_use_confirmed(ProviderId::Claude));
+        let status = registry.refresh(ProviderId::Gemini);
+        assert_eq!(status["usable"]["worker"], false);
+        assert_eq!(status["usable"]["lead"], false);
     }
 
     #[test]

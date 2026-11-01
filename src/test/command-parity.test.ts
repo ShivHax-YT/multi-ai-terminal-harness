@@ -39,9 +39,9 @@ function commandFns(): string[] {
 }
 
 describe("command parity", () => {
-  it("the contract lists 37 unique commands", () => {
+  it("the contract lists 39 unique commands", () => {
     expect(new Set(COMMANDS).size).toBe(COMMANDS.length);
-    expect(COMMANDS.length).toBe(37);
+    expect(COMMANDS.length).toBe(39);
   });
 
   it("contract = generate_handler! = build.rs = capability = commands.rs", () => {
