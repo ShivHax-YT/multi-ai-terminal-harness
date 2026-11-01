@@ -26,7 +26,10 @@ const USER_EVENTS = [
 ] as const;
 
 /** Cursor-position reports, device-attribute replies, and focus reports. */
-const QUERY_REPLY = /^(?:\u001b\[\d+(?:;\d+)*R|\u001b\[(?:\?|>)?[\d;]*c|\u001b\[[IO])$/;
+const ESC = "\u001b";
+const QUERY_REPLY = new RegExp(
+  `^(?:${ESC}\\[\\d+(?:;\\d+)*R|${ESC}\\[(?:\\?|>)?[\\d;]*c|${ESC}\\[[IO])$`,
+);
 
 export function isTerminalQueryReply(data: string): boolean {
   return QUERY_REPLY.test(data);
@@ -79,7 +82,9 @@ function deferredUserEvent(event: Event): boolean {
   }
   if (event.type === "keydown" || event.type === "keypress") {
     const key = event as KeyboardEvent;
-    return key.key === "Dead" || key.key === "Process" || key.keyCode === 229;
+    // keyCode 229 is the IME "processing" code. The property is legacy; read it without naming the deprecated field.
+    const legacyCode = Reflect.get(key, "keyCode");
+    return key.key === "Dead" || key.key === "Process" || legacyCode === 229;
   }
   return false;
 }

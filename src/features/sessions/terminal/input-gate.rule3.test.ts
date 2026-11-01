@@ -124,18 +124,19 @@ describe("input gate", () => {
     earlier.dispose();
     // Registered before the gate, like xterm's own listener: its setTimeout(0) is queued during the
     // event, after the gate's capture-phase outer timer and before the nested clear.
-    let gate: ReturnType<typeof createInputGate>;
+    const held: { gate: ReturnType<typeof createInputGate> | null } = { gate: null };
     element.addEventListener("compositionend", () => {
       setTimeout(() => {
-        gate.onData("é");
+        held.gate?.onData("é");
       }, 0);
     });
-    gate = createInputGate(element, {
+    const gate = createInputGate(element, {
       write,
       takeoverOn: () => state.takeover,
       onRefused,
       isUserEvent: () => true,
     });
+    held.gate = gate;
     element.dispatchEvent(new KeyboardEvent("keydown", { key: "Dead", bubbles: true }));
     element.dispatchEvent(new CompositionEvent("compositionend", { data: "é", bubbles: true }));
     await flush();
