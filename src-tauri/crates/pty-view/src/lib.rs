@@ -195,7 +195,9 @@ impl InteractivePty {
             .as_raw_fd()
             .ok_or_else(|| io::Error::other("the terminal has no master"))?;
         // The slot lock is held, so `poll` cannot collect the child until this returns. The ioctl does not use a pid.
-        signal_foreground(fd)?;
+        // A stopped foreground group does not take SIGHUP until it is continued. Continue it on this pty first.
+        let _ = signal_foreground(fd, libc::SIGCONT);
+        signal_foreground(fd, libc::SIGHUP)?;
         self.owned.signals.fetch_add(1, Ordering::Relaxed);
         Ok(StopSignal::Sent)
     }
@@ -223,10 +225,10 @@ impl InteractivePty {
 
 /// `TIOCSIG` on the master delivers `signal` to the foreground group of this pty. On macOS the signal number is the
 /// ioctl argument itself. It is not a pointer and it is not a process id.
-fn signal_foreground(fd: RawFd) -> io::Result<()> {
+fn signal_foreground(fd: RawFd, signal: libc::c_int) -> io::Result<()> {
     // SAFETY: `fd` is the master of this session's pty, owned by `InteractivePty` for the call. The kernel names the
     // foreground group of that terminal; this process does not choose a pid.
-    let result = unsafe { libc::ioctl(fd, libc::TIOCSIG as libc::c_ulong, libc::SIGHUP) };
+    let result = unsafe { libc::ioctl(fd, libc::TIOCSIG as libc::c_ulong, signal) };
     if result == -1 {
         Err(io::Error::last_os_error())
     } else {

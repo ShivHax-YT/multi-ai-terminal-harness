@@ -475,6 +475,18 @@ mod tests {
     }
 
     #[test]
+    fn a_foreground_child_that_stops_is_continued_and_keeps_its_exit_code() {
+        extern "C" {
+            fn harness_test_continue_owned_child(stops: bool) -> i32;
+        }
+        // SAFETY: test-only bridge. It spawns /bin/sh, not a provider CLI.
+        let plain = unsafe { harness_test_continue_owned_child(false) };
+        assert_eq!(plain, 4, "a normal exit was not preserved");
+        let stopped = unsafe { harness_test_continue_owned_child(true) };
+        assert_eq!(stopped, 9, "a stopped child was not continued");
+    }
+
+    #[test]
     fn the_any_release_probe_still_enforces_the_vendor_identity() {
         let _serial = SERIAL.lock().unwrap();
         // A release hash that does not match is ignored on this lane.

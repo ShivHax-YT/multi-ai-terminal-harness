@@ -119,15 +119,18 @@ describe("input gate", () => {
     expect(write).not.toHaveBeenCalled();
   });
 
-  it("keeps text xterm sends on the timer after compositionend", async () => {
+  it("keeps composed text when input follows compositionend before xterm's timer", async () => {
     const { element, write, onRefused, state, gate: earlier } = setup();
     earlier.dispose();
-    // Registered before the gate, like xterm's own listener: its setTimeout(0) is queued during the
-    // event, after the gate's capture-phase outer timer and before the nested clear.
+    // xterm's listener is registered first. It queues onData from compositionend. The browser then
+    // dispatches input before that timer. Closing the turn on that input drops the character.
     const held: { gate: ReturnType<typeof createInputGate> | null } = { gate: null };
     element.addEventListener("compositionend", () => {
       setTimeout(() => {
         held.gate?.onData("é");
+        held.gate?.onData("\u001b[?12;1R");
+        held.gate?.onData("\u001b[0n");
+        held.gate?.onData("\u001b[12;1R");
       }, 0);
     });
     const gate = createInputGate(element, {
@@ -139,6 +142,11 @@ describe("input gate", () => {
     held.gate = gate;
     element.dispatchEvent(new KeyboardEvent("keydown", { key: "Dead", bubbles: true }));
     element.dispatchEvent(new CompositionEvent("compositionend", { data: "é", bubbles: true }));
+    element.dispatchEvent(new InputEvent("input", { bubbles: true, data: "é" }));
+    element.dispatchEvent(
+      new InputEvent("input", { bubbles: true, inputType: "insertFromComposition", data: "é" }),
+    );
+    element.dispatchEvent(new KeyboardEvent("keypress", { key: "é", bubbles: true }));
     await flush();
     expect(write).toHaveBeenCalledTimes(1);
     expect(write).toHaveBeenCalledWith("é");
@@ -147,23 +155,29 @@ describe("input gate", () => {
     expect(write).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps a dead-key character and drops a query reply in the same turn", async () => {
-    const { element, gate, write } = setup();
-    element.addEventListener(
-      "compositionend",
-      () => {
-        setTimeout(() => {
-          gate.onData("\u001b[12;1R");
-          gate.onData("é");
-        }, 0);
-      },
-      true,
-    );
-    element.dispatchEvent(new KeyboardEvent("keydown", { key: "Dead", bubbles: true }));
-    element.dispatchEvent(new CompositionEvent("compositionend", { data: "é", bubbles: true }));
+  it("keeps text when input follows keyCode 229 before xterm's timer", async () => {
+    const { element, write, onRefused, state, gate: earlier } = setup();
+    earlier.dispose();
+    const held: { gate: ReturnType<typeof createInputGate> | null } = { gate: null };
+    element.addEventListener("keydown", () => {
+      setTimeout(() => {
+        held.gate?.onData("日");
+      }, 0);
+    });
+    const gate = createInputGate(element, {
+      write,
+      takeoverOn: () => state.takeover,
+      onRefused,
+      isUserEvent: () => true,
+    });
+    held.gate = gate;
+    const key = new KeyboardEvent("keydown", { key: "Unidentified", bubbles: true });
+    Object.defineProperty(key, "keyCode", { get: () => 229 });
+    element.dispatchEvent(key);
+    element.dispatchEvent(new InputEvent("input", { bubbles: true, data: "日" }));
     await flush();
     expect(write).toHaveBeenCalledTimes(1);
-    expect(write).toHaveBeenCalledWith("é");
+    expect(write).toHaveBeenCalledWith("日");
   });
 
   it("drops cursor, device-attribute, and focus replies while a key is dispatching", async () => {

@@ -5,6 +5,34 @@ import Darwin
 import Foundation
 import LightweightCodeRequirements
 
+// A stopped status from waitpid(WUNTRACED). A continued process is not a stop.
+private func childStopped(_ status: Int32) -> Bool {
+  let code = status & 0x7f
+  let signal = (status >> 8) & 0xff
+  return code == 0x7f && signal != SIGCONT
+}
+
+// There is no job-control shell. Ctrl-Z stops the foreground CLI, and
+// waitUntilExit does not return while it is stopped. WUNTRACED reports that
+// stop. WNOHANG leaves an exit for Foundation to reap. SIGCONT is sent only to
+// the pid waitpid just returned for a stop: that child is unreaped, so the pid
+// cannot have been reused. An exit status is not signaled, and the pid is not
+// saved for a later kill.
+private func continueOwnedStops(_ task: Process) {
+  while task.isRunning {
+    var status: Int32 = 0
+    let pid = task.processIdentifier
+    if pid <= 0 || !task.isRunning { return }
+    let waited = waitpid(pid, &status, WUNTRACED | WNOHANG)
+    if waited < 0 { return }
+    if waited == pid && !childStopped(status) { return }
+    if waited == pid && task.isRunning {
+      _ = kill(waited, SIGCONT)
+    }
+    usleep(20_000)
+  }
+}
+
 // Foundation creates a new process group. Give the login CLI foreground TTY
 // ownership for human input/Ctrl-C, then return it to the wrapper's group.
 private func runInHumanTerminal(_ task: Process, _ fd: Int32) -> Bool {
@@ -29,6 +57,9 @@ private func runInHumanTerminal(_ task: Process, _ fd: Int32) -> Bool {
     return false
   }
   _ = task.resume()
+  DispatchQueue.global(qos: .userInitiated).async {
+    continueOwnedStops(task)
+  }
   task.waitUntilExit()
   return tcsetpgrp(fd, previous) == 0
 }
@@ -166,6 +197,37 @@ public func harnessSessionStart(
       return nil
     }
   }
+}
+
+// Test hook for the stop/continue loop. Spawns /bin/sh, not a provider CLI.
+// Returns the child's exit code, or a value above 89 if the child did not finish.
+@_cdecl("harness_test_continue_owned_child")
+public func harnessTestContinueOwnedChild(_ stops: Bool) -> Int32 {
+  let task = Process()
+  task.executableURL = URL(fileURLWithPath: "/bin/sh")
+  task.arguments = [
+    "-c",
+    stops
+      ? "echo started; kill -TSTP $$; echo continued; exit 9"
+      : "echo plain; exit 4",
+  ]
+  let pipe = Pipe()
+  task.standardOutput = pipe
+  do { try task.run() } catch { return 90 }
+  DispatchQueue.global(qos: .userInitiated).async {
+    continueOwnedStops(task)
+  }
+  let deadline = Date().addingTimeInterval(5)
+  while task.isRunning && Date() < deadline {
+    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+  }
+  if task.isRunning {
+    task.terminate()
+    return 92
+  }
+  let out = String(data: pipe.fileHandleForReading.availableData, encoding: .utf8) ?? ""
+  if stops && !out.contains("continued") { return 93 }
+  return task.terminationStatus
 }
 
 // The human picks the folder for a terminal. Main thread only; the app shell

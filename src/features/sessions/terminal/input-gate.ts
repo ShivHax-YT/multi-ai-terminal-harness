@@ -3,10 +3,10 @@
 // sequences are dropped even when a composition window is still open.
 //
 // Ordinary keys are synchronous: xterm emits them inside the key event, and the window closes when that dispatch
-// ends, before any timer. Composed text (IME, dead keys) is different. xterm 6 commits it from its own
-// setTimeout(0), queued during the event, after a capture-phase timer would already have been queued. For those
-// events the window stays open until a nested setTimeout(0): the outer timer is queued with xterm's flush, and the
-// inner one clears only after that flush has run.
+// ends, before any timer. Composed text is different. xterm 6 queues the character on setTimeout(0) during
+// compositionend, and the browser then dispatches beforeinput, input, and keypress before that timer. Those later
+// events must not close the window while that flush is still outstanding. The clear timer is nested so it runs
+// after a composition timer that was already queued.
 
 /** Longest chunk the backend accepts in one write (a paste is split). */
 export const MAX_CHUNK_BYTES = 4 * 1024;
@@ -25,10 +25,13 @@ const USER_EVENTS = [
   "mouseup",
 ] as const;
 
-/** Cursor-position reports, device-attribute replies, and focus reports. */
+/**
+ * Cursor-position reports (`CSI r;c R` and xterm's private `CSI ?r;c R`), device attributes,
+ * focus reports, and status reports (`CSI 0n`). Dropped even while a composition flush is open.
+ */
 const ESC = "\u001b";
 const QUERY_REPLY = new RegExp(
-  `^(?:${ESC}\\[\\d+(?:;\\d+)*R|${ESC}\\[(?:\\?|>)?[\\d;]*c|${ESC}\\[[IO])$`,
+  `^(?:${ESC}\\[\\??\\d+(?:;\\d+)*R|${ESC}\\[(?:\\?|>)?[\\d;]*c|${ESC}\\[[IO]|${ESC}\\[\\d*n)$`,
 );
 
 export function isTerminalQueryReply(data: string): boolean {
@@ -75,10 +78,18 @@ function deferredUserEvent(event: Event): boolean {
   if (
     event.type === "compositionstart" ||
     event.type === "compositionupdate" ||
-    event.type === "compositionend" ||
-    event.type === "beforeinput"
+    event.type === "compositionend"
   ) {
     return true;
+  }
+  if (event.type === "beforeinput" || event.type === "input") {
+    const inputType = (event as InputEvent).inputType;
+    return (
+      inputType === "insertCompositionText" ||
+      inputType === "insertFromComposition" ||
+      inputType === "deleteCompositionText" ||
+      inputType === "deleteByComposition"
+    );
   }
   if (event.type === "keydown" || event.type === "keypress") {
     const key = event as KeyboardEvent;
@@ -93,6 +104,8 @@ export function createInputGate(element: HTMLElement, options: InputGateOptions)
   const isUserEvent = options.isUserEvent ?? ((event: Event) => event.isTrusted);
   let userTurn = false;
   let disposed = false;
+  // True from a composition or dead key until the nested clear runs, after xterm's flush.
+  let flushPending = false;
   let outer: ReturnType<typeof setTimeout> | undefined;
   let inner: ReturnType<typeof setTimeout> | undefined;
   // One at a time, so keystrokes reach the CLI in the order they were typed.
@@ -105,14 +118,17 @@ export function createInputGate(element: HTMLElement, options: InputGateOptions)
     inner = undefined;
   };
 
-  // Queued from the composition event, ahead of xterm's target-phase setTimeout(0). The inner timer is queued
-  // when the outer one runs, so it clears only after that flush.
+  // The inner timer is queued when the outer one runs, so it lands after a composition flush already on the queue.
   const armDeferred = () => {
     userTurn = true;
+    flushPending = true;
     clearDeferred();
     outer = setTimeout(() => {
+      outer = undefined;
       inner = setTimeout(() => {
+        inner = undefined;
         userTurn = false;
+        flushPending = false;
       }, 0);
     }, 0);
   };
@@ -123,10 +139,21 @@ export function createInputGate(element: HTMLElement, options: InputGateOptions)
       armDeferred();
       return;
     }
+    // beforeinput/input/keypress follow compositionend and must not open or close a sync window.
+    if (flushPending) return;
     userTurn = true;
   };
   const endDispatch = (event: Event) => {
     if (disposed || !isUserEvent(event) || deferredUserEvent(event)) return;
+    // xterm queues the composed character on setTimeout(0) during compositionend. The browser then
+    // dispatches input and keypress before that timer. Those must not close the turn. An ordinary
+    // keydown still closes when its own dispatch ends.
+    if (
+      flushPending &&
+      (event.type === "input" || event.type === "keypress" || event.type === "beforeinput")
+    ) {
+      return;
+    }
     userTurn = false;
   };
   for (const type of USER_EVENTS) {
@@ -157,6 +184,7 @@ export function createInputGate(element: HTMLElement, options: InputGateOptions)
     dispose() {
       disposed = true;
       userTurn = false;
+      flushPending = false;
       clearDeferred();
       for (const type of USER_EVENTS) {
         element.removeEventListener(type, mark, true);
