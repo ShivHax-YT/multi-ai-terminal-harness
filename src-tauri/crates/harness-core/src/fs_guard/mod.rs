@@ -1,12 +1,7 @@
 //! The file-access layer with the credential denylist (hard rule 4). Owned by T-114.
 //!
-//! App data-file access goes through this module. Reads check the denylist and registered roots and record a hashed
-//! operation trace. These checks are not kernel mediation: real-directory renames and returned read handles remain a
-//! limitation. The trace records guard outcomes, not every operating-system open. Native repository import/worker
-//! access must stay unavailable on this boundary. File mutation and directory creation refuse before mutation.
-//!
-//! Use a [`FileGuard`] directly, or [`install`] one process-wide and call the free functions. Nothing is installed
-//! implicitly: until [`install`] runs, the free functions fail closed with [`GuardError::NotInstalled`].
+//! Production file access remains closed until a kernel-enforced filesystem boundary is available. The fake-home
+//! tests exercise the existing checks and hashed operation trace. A trace records guard outcomes, not kernel opens.
 
 mod denylist;
 mod open;
@@ -54,6 +49,8 @@ pub enum GuardError {
     DirectoryCreationUnavailable,
     #[error("guarded file mutation is unavailable: no kernel-enforced rename boundary")]
     FileMutationUnavailable,
+    #[error("guarded file access is unavailable: no kernel-enforced rename boundary")]
+    FileAccessUnavailable,
     #[error("root rejected")]
     RootRejected,
     #[error("denylist unusable: {0}")]

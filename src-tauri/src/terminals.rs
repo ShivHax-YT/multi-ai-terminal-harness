@@ -6,16 +6,15 @@
 //! foreground, so Ctrl-C and window-size signals reach the CLI directly (rule 6).
 
 use base64::Engine;
+use harness_core::clock::{Clock, SystemClock};
 use pty_view::{Attach, InteractivePty, InteractiveSpec, StopSignal};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::Emitter;
 
-const DEFAULT_COLS: u16 = 100;
-const DEFAULT_ROWS: u16 = 30;
 /// Ended sessions kept so their last output stays readable.
 const MAX_ENDED_KEPT: usize = 20;
 
@@ -31,6 +30,7 @@ struct Entry {
 pub struct Terminals {
     entries: Mutex<BTreeMap<u64, Entry>>,
     next_id: AtomicU64,
+    shutting_down: AtomicBool,
     app: OnceLock<tauri::AppHandle>,
 }
 
@@ -98,6 +98,9 @@ impl Terminals {
         let number = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let id = session_id(number);
         let mut entries = self.entries();
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(TerminalError::Failed("The app is shutting down."));
+        }
         let live = entries
             .values()
             .filter(|e| e.view["provider"] == provider && is_live(&e.view))
@@ -127,7 +130,7 @@ impl Terminals {
             "state": { "kind": "running" },
             "paused": null,
             "turns": { "current": 0, "limit": 0 },
-            "started_at": harness_core::status::timestamp(),
+            "started_at": SystemClock::new().now().to_rfc3339(),
             "takeover": true,
         });
         let mut entry = Entry {
@@ -197,14 +200,22 @@ impl Terminals {
 
     /// Human keystrokes only. Refused unless take-over is on (rule 3).
     pub fn write(&self, id: &str, data: &str) -> Result<(), TerminalError> {
-        let (pty, view) = self.pty(id).map_err(|_| TerminalError::TakeoverOff)?;
-        if view["takeover"] != true {
+        let entries = self.entries();
+        let entry = parse_id(id)
+            .and_then(|number| entries.get(&number))
+            .ok_or(TerminalError::TakeoverOff)?;
+        if entry.view["takeover"] != true {
             return Err(TerminalError::TakeoverOff);
         }
-        if !is_live(&view) {
+        if !is_live(&entry.view) {
             return Err(TerminalError::Ended);
         }
-        pty.write(data.as_bytes())
+        // Keep the authorization and nonblocking write in one state transition.
+        entry
+            .pty
+            .as_ref()
+            .ok_or(TerminalError::TakeoverOff)?
+            .write(data.as_bytes())
             .map_err(|_| TerminalError::Failed("The keystroke did not reach the terminal."))
     }
 
@@ -245,76 +256,37 @@ impl Terminals {
         Ok(view)
     }
 
-    /// Asks the foreground group to stop. The session keeps its ceiling slot until the wrapper is waited.
-    /// A second stop while that is in progress does not signal again. A stop after the process has exited
-    /// returns the ended view and does not signal.
+    /// Starts signal escalation and retains the ceiling slot until the child is reaped.
     pub fn kill(&self, id: &str) -> Result<Value, TerminalError> {
         let number = parse_id(id).ok_or(TerminalError::NotFound)?;
-        let pty = {
+        let view = {
             let mut entries = self.entries();
             let entry = entries.get_mut(&number).ok_or(TerminalError::NotFound)?;
-            if has_ended(&entry.view) || entry.view["state"]["kind"] == "stopping" {
+            if has_ended(&entry.view) || entry.stop_requested {
                 return Ok(entry.view.clone());
             }
-            // Set before the signal so a process that exits immediately is recorded as killed, not as a
-            // natural exit that frees the slot with the wrong state.
-            entry.stop_requested = true;
-            entry.pty.clone()
-        };
-        let Some(pty) = pty else {
-            return Err(TerminalError::NotFound);
-        };
-        let signal = match pty.kill() {
-            Ok(signal) => signal,
-            Err(_) => {
-                let mut entries = self.entries();
-                if let Some(entry) = entries.get_mut(&number) {
-                    if has_ended(&entry.view) {
-                        return Ok(entry.view.clone());
-                    }
-                    entry.stop_requested = false;
+            let pty = entry.pty.as_ref().ok_or(TerminalError::NotFound)?;
+            entry.view["state"] = match pty.kill() {
+                StopSignal::Sent => {
+                    entry.stop_requested = true;
+                    json!({ "kind": "stopping" })
                 }
-                return Err(TerminalError::Failed("The session could not be stopped."));
-            }
+                StopSignal::AlreadyExited => match pty.collected_exit() {
+                    Some(code) => json!({ "kind": "exited", "code": code }),
+                    None => json!({ "kind": "exited" }),
+                },
+            };
+            entry.view["takeover"] = json!(false);
+            bump(entry);
+            entry.view.clone()
         };
-        let (view, changed) = {
-            let mut entries = self.entries();
-            let entry = entries.get_mut(&number).ok_or(TerminalError::NotFound)?;
-            if has_ended(&entry.view) {
-                (entry.view.clone(), false)
-            } else {
-                match signal {
-                    StopSignal::Sent => {
-                        entry.stop_requested = true;
-                        entry.view["state"] = json!({ "kind": "stopping" });
-                        entry.view["takeover"] = json!(false);
-                        bump(entry);
-                        (entry.view.clone(), true)
-                    }
-                    StopSignal::AlreadyExited => {
-                        entry.view["state"] = if entry.stop_requested {
-                            json!({ "kind": "killed" })
-                        } else {
-                            match pty.collected_exit() {
-                                Some(code) => json!({ "kind": "exited", "code": code }),
-                                None => json!({ "kind": "exited" }),
-                            }
-                        };
-                        entry.view["takeover"] = json!(false);
-                        bump(entry);
-                        (entry.view.clone(), true)
-                    }
-                }
-            }
-        };
-        if changed {
-            self.emit("session_changed", view.clone());
-        }
+        self.emit("session_changed", view.clone());
         Ok(view)
     }
 
-    /// Quit: the same foreground-group signal as Stop, then wait until each owned process has been collected.
+    /// Quit: refuse new sessions, request stop and give the monitor time to reap.
     pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
         let ids: Vec<String> = self
             .entries()
             .values()
@@ -336,23 +308,6 @@ impl Terminals {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
-}
-
-/// The spec for a real provider session: this app's closed wrapper mode, in the folder the human picked.
-pub fn provider_spec(
-    provider: &str,
-    folder: std::path::PathBuf,
-) -> Result<InteractiveSpec, String> {
-    let program =
-        std::env::current_exe().map_err(|_| "The app could not locate itself.".to_owned())?;
-    Ok(InteractiveSpec {
-        program,
-        args: vec![format!("--provider-session={provider}")],
-        cwd: folder,
-        env: harness_core::status::human_terminal_env()?,
-        cols: DEFAULT_COLS,
-        rows: DEFAULT_ROWS,
-    })
 }
 
 #[cfg(test)]
@@ -503,11 +458,10 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_that_does_not_end_the_process_keeps_the_slot() {
+    fn stop_escalates_for_a_child_that_ignores_hangup_and_terminate() {
         let t = fresh();
-        // The shell ignores SIGHUP. `read` is a builtin, so the foreground group staying up is the shell itself.
-        // Stop must not free the slot before this process actually exits.
-        let script = "trap '' HUP; echo ready; i=0; while [ \"$i\" -lt 8 ]; do i=$((i+1)); read -t 0.25 _ || true; done; exit 0";
+        // This shell can exit only when the monitor escalates past HUP and TERM.
+        let script = "trap '' HUP TERM; echo ready; while :; do read _; done";
         let held = t.start("claude", "f", "/f", shell(script)).unwrap()["session_id"]
             .as_str()
             .unwrap()
@@ -536,67 +490,16 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_stop_keeps_the_session_running_and_holds_the_slot() {
-        let t = fresh();
-        let first = start(t, "claude").unwrap();
-        let _second = start(t, "claude").unwrap();
-        {
-            let entries = t.entries();
-            let number = parse_id(&first).unwrap();
-            entries
-                .get(&number)
-                .unwrap()
-                .pty
-                .as_ref()
-                .unwrap()
-                .fail_next_stop();
-        }
-        assert_eq!(
-            t.kill(&first),
-            Err(TerminalError::Failed("The session could not be stopped."))
-        );
-        let view = t
-            .list()
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|view| view["session_id"] == first)
-            .unwrap()
-            .clone();
-        assert_eq!(view["state"]["kind"], "running");
-        assert_eq!(view["takeover"], true);
-        assert_eq!(start(t, "claude"), Err(TerminalError::AtCeiling));
-        t.kill(&first).unwrap();
-        wait_for(|| {
-            let list = t.list();
-            let ended = list
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|view| view["session_id"] == first)
-                .unwrap();
-            !is_live(ended)
-        });
-        assert!(start(t, "claude").is_ok());
-        t.shutdown();
-    }
-
-    #[test]
     fn shutdown_collects_a_live_session() {
         let t = fresh();
         let id = start(t, "claude").unwrap();
         t.shutdown();
-        wait_for(|| {
-            let list = t.list();
-            let view = list
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|view| view["session_id"] == id)
-                .unwrap();
-            view["state"]["kind"] == "killed" || view["state"]["kind"] == "exited"
-        });
+        assert!(!is_live(&t.list()[0]));
         assert!(t.write(&id, "x").is_err());
+        assert_eq!(
+            start(t, "claude"),
+            Err(TerminalError::Failed("The app is shutting down."))
+        );
     }
 
     #[test]

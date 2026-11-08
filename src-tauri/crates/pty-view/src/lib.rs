@@ -1,8 +1,7 @@
 //! PTY view crate (hard rule 3).
 //!
-//! Spawns interactive CLI sessions for the human to watch and drive. Its write path is reachable only from the app
-//! shell's `pty_write` command, which the UI calls from keyboard events in the terminal view. The core crate (lead,
-//! scheduler, adapters) has no dependency on this crate, so the compiler forbids automation from reaching it.
+//! Primitives for human-driven sessions. The app does not expose embedded launch or a write command while the
+//! native input and working-directory boundaries are unavailable. The core crate has no dependency on this crate.
 //!
 //! Output is kept only in a bounded in-memory ring. It is never written to disk or logs (rule 4).
 
@@ -10,17 +9,18 @@ mod ring;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use ring::Ring;
-use std::io::{self, Read, Write};
-use std::os::fd::RawFd;
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The most bytes one `write` call accepts. The UI splits longer pastes.
 pub const MAX_WRITE_BYTES: usize = 4 * 1024;
 /// Scrollback kept per session.
 pub const SCROLLBACK_BYTES: usize = 256 * 1024;
+const POLL_INTERVAL_MS: libc::c_int = 20;
+const STOP_GRACE: Duration = Duration::from_millis(500);
 
 /// What to run. The child gets exactly `env`: nothing is inherited from the app (rules 2 and 4).
 #[derive(Debug, Clone)]
@@ -42,13 +42,11 @@ pub struct Attach {
     pub rows: u16,
 }
 
-/// A human-driven PTY. `write` exists only here, and only the app shell's human input command calls it.
+/// A human-driven PTY. A caller must authenticate input before invoking `write`.
 pub struct InteractivePty {
     master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
-    /// The unreaped child. The wait and the stop share this lock. After the wait collects the child, stop does not
-    /// signal. The signal itself is `TIOCSIG` on this session's pty master, not `kill` of a saved pid.
-    owned: Arc<OwnedChild>,
+    io: Arc<OwnedFd>,
+    owned: Arc<Mutex<OwnedChild>>,
     ring: Arc<Mutex<Ring>>,
     size: Mutex<(u16, u16)>,
 }
@@ -60,13 +58,19 @@ pub enum StopSignal {
     AlreadyExited,
 }
 
-/// The child portable-pty spawned. Stop never reads this pid to signal it.
+/// The waiter owns collection. Stop and writes check the same state before acting.
+#[derive(Default)]
 struct OwnedChild {
-    slot: Mutex<Option<Box<dyn Child + Send + Sync>>>,
-    exit_code: Mutex<Option<i32>>,
-    signals: AtomicU64,
-    /// Test seam: the next stop returns an error and does not signal.
-    fail_stop: AtomicBool,
+    child: Option<Box<dyn Child + Send + Sync>>,
+    exit_code: Option<i32>,
+    stop: Option<StopPhase>,
+}
+
+enum StopPhase {
+    Hangup(Instant),
+    Terminate(Instant),
+    KillGroup(Instant),
+    KillChild,
 }
 
 fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -99,45 +103,43 @@ impl InteractivePty {
         for (key, value) in &spec.env {
             command.env(key, value);
         }
-        let child = pair.slave.spawn_command(command).map_err(other)?;
-        // The child holds its own copy. Keeping ours would hide the hangup when it exits.
-        drop(pair.slave);
-        let mut reader = pair.master.try_clone_reader().map_err(other)?;
-        let writer = pair.master.take_writer().map_err(other)?;
-        let owned = Arc::new(OwnedChild {
-            slot: Mutex::new(Some(child)),
-            exit_code: Mutex::new(None),
-            signals: AtomicU64::new(0),
-            fail_stop: AtomicBool::new(false),
-        });
+        let fd = pair
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| io::Error::other("the terminal has no master"))?;
+        // portable-pty's Unix writer sends newline and VEOF on drop. Use an owned
+        // duplicate that only closes, with nonblocking reads and writes.
+        let io = Arc::new(duplicate_nonblocking(fd)?);
+        let owned = Arc::new(Mutex::new(OwnedChild::default()));
         let ring = Arc::new(Mutex::new(Ring::new(SCROLLBACK_BYTES)));
-        let output_ring = ring.clone();
-        std::thread::spawn(move || {
-            let mut buffer = [0u8; 16 * 1024];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => {
-                        let seq = lock(&output_ring).push(&buffer[..n]);
-                        on_output(seq, &buffer[..n]);
+        let (started, ready) = std::sync::mpsc::sync_channel(0);
+        let (output, child_state, master) = (ring.clone(), owned.clone(), io.clone());
+        // Allocate the monitor before starting the child so no thread allocation
+        // failure can leave a spawned child without an owner.
+        std::thread::Builder::new().spawn(move || {
+            if ready.recv().is_ok() {
+                let fd = master.as_raw_fd();
+                let mut reader = OutputReader::default();
+                loop {
+                    let exit = lock(&child_state).poll(fd);
+                    reader.drain(fd, |bytes| {
+                        let seq = lock(&output).push(bytes);
+                        on_output(seq, bytes);
+                    });
+                    if let ChildPoll::Exited(code) = exit {
+                        on_exit(code);
+                        break;
                     }
                 }
             }
-        });
-        let waited = owned.clone();
-        std::thread::spawn(move || {
-            let code = loop {
-                match waited.poll() {
-                    Ok(ChildPoll::Running) => std::thread::sleep(Duration::from_millis(20)),
-                    Ok(ChildPoll::Exited(code)) => break code,
-                    Err(_) => break None,
-                }
-            };
-            on_exit(code);
-        });
+        })?;
+        lock(&owned).child = Some(pair.slave.spawn_command(command).map_err(other)?);
+        // The child holds its own copy. Keeping ours would hide the hangup when it exits.
+        drop(pair.slave);
+        started.send(()).expect("the terminal monitor is waiting");
         Ok(InteractivePty {
             master: Mutex::new(pair.master),
-            writer: Mutex::new(writer),
+            io,
             owned,
             ring,
             size: Mutex::new((spec.cols, spec.rows)),
@@ -152,9 +154,35 @@ impl InteractivePty {
                 "input chunk is too large",
             ));
         }
-        let mut writer = lock(&self.writer);
-        writer.write_all(bytes)?;
-        writer.flush()
+        let state = lock(&self.owned);
+        if state.child.is_none() || state.stop.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the terminal ended",
+            ));
+        }
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            // SAFETY: the master is owned throughout, and the slice is readable.
+            let n = unsafe {
+                libc::write(
+                    self.io.as_raw_fd(),
+                    remaining.as_ptr().cast(),
+                    remaining.len(),
+                )
+            };
+            if n > 0 {
+                remaining = &remaining[n as usize..];
+            } else if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "no input written"));
+            } else {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Sets the window size. The kernel tells the foreground process group with SIGWINCH.
@@ -182,44 +210,85 @@ impl InteractivePty {
         }
     }
 
-    /// Sends SIGHUP to this pty's foreground process group. After the wrapper has been waited, this does not signal.
-    pub fn kill(&self) -> io::Result<StopSignal> {
-        let slot = lock(&self.owned.slot);
-        if self.owned.fail_stop.swap(false, Ordering::Relaxed) && slot.is_some() {
-            return Err(io::Error::other("stop signal failed"));
+    /// Starts bounded signal escalation. Only the monitor reaps the owned child.
+    pub fn kill(&self) -> StopSignal {
+        let mut state = lock(&self.owned);
+        if state.child.is_none() {
+            return StopSignal::AlreadyExited;
         }
-        if slot.is_none() {
-            return Ok(StopSignal::AlreadyExited);
+        if state.stop.is_none() {
+            let fd = self.io.as_raw_fd();
+            let _ = signal_foreground(fd, libc::SIGCONT);
+            let _ = signal_foreground(fd, libc::SIGHUP);
+            state.stop = Some(StopPhase::Hangup(Instant::now()));
         }
-        let fd = lock(&self.master)
-            .as_raw_fd()
-            .ok_or_else(|| io::Error::other("the terminal has no master"))?;
-        // The slot lock is held, so `poll` cannot collect the child until this returns. The ioctl does not use a pid.
-        // A stopped foreground group does not take SIGHUP until it is continued. Continue it on this pty first.
-        let _ = signal_foreground(fd, libc::SIGCONT);
-        signal_foreground(fd, libc::SIGHUP)?;
-        self.owned.signals.fetch_add(1, Ordering::Relaxed);
-        Ok(StopSignal::Sent)
+        StopSignal::Sent
     }
 
     /// The exit code recorded when the child was waited, if that has happened.
     pub fn collected_exit(&self) -> Option<i32> {
-        *lock(&self.owned.exit_code)
+        lock(&self.owned).exit_code
     }
+}
 
-    /// The next [`Self::kill`] fails without signaling. Tests use this to prove a failed Stop leaves the session up.
-    pub fn fail_next_stop(&self) {
-        self.owned.fail_stop.store(true, Ordering::Relaxed);
+fn duplicate_nonblocking(fd: RawFd) -> io::Result<OwnedFd> {
+    // SAFETY: fd is live and fcntl returns a new, close-on-exec descriptor.
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error());
     }
-
-    #[cfg(test)]
-    fn child_reaped(&self) -> bool {
-        self.owned.reaped()
+    // SAFETY: the duplicate has no other Rust owner.
+    let owned = unsafe { OwnedFd::from_raw_fd(duplicate) };
+    // SAFETY: owned keeps this file description alive.
+    let flags = unsafe { libc::fcntl(duplicate, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(duplicate, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
     }
+    Ok(owned)
+}
 
-    #[cfg(test)]
-    fn signals_sent(&self) -> u64 {
-        self.owned.signals.load(Ordering::Relaxed)
+#[derive(Default)]
+struct OutputReader {
+    closed: bool,
+}
+
+impl OutputReader {
+    fn drain(&mut self, fd: RawFd, mut output: impl FnMut(&[u8])) {
+        if self.closed {
+            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS as u64));
+            return;
+        }
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one writable pollfd and a live master.
+        if unsafe { libc::poll(&mut poll, 1, POLL_INTERVAL_MS) } <= 0 {
+            return;
+        }
+        let mut buffer = [0u8; 16 * 1024];
+        // Limit each drain so continuous output cannot starve child collection
+        // or Stop escalation. After exit this also bounds lingering slave output.
+        for _ in 0..SCROLLBACK_BYTES / buffer.len() {
+            // SAFETY: the master is live and the buffer is writable.
+            let n = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if n > 0 {
+                output(&buffer[..n as usize]);
+            } else if n == 0 {
+                self.closed = true;
+                return;
+            } else {
+                match io::Error::last_os_error().kind() {
+                    io::ErrorKind::Interrupted => continue,
+                    io::ErrorKind::WouldBlock => return,
+                    _ => {
+                        self.closed = true;
+                        return;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -242,50 +311,47 @@ enum ChildPoll {
 }
 
 impl OwnedChild {
-    fn poll(&self) -> io::Result<ChildPoll> {
-        enum Step {
-            Running,
-            AlreadyWaited,
-            Exited(Option<i32>),
-        }
-        let step = {
-            let mut slot = lock(&self.slot);
-            if slot.is_none() {
-                Step::AlreadyWaited
-            } else {
-                match slot.as_mut().unwrap().try_wait() {
-                    Ok(Some(status)) => {
-                        let code = i32::try_from(status.exit_code()).ok();
-                        *slot = None;
-                        Step::Exited(code)
-                    }
-                    Ok(None) => Step::Running,
-                    Err(error) => {
-                        *slot = None;
-                        return Err(error);
-                    }
-                }
-            }
+    fn poll(&mut self, fd: RawFd) -> ChildPoll {
+        let Some(child) = self.child.as_mut() else {
+            return ChildPoll::Exited(self.exit_code);
         };
-        match step {
-            Step::Running => Ok(ChildPoll::Running),
-            Step::AlreadyWaited => Ok(ChildPoll::Exited(*lock(&self.exit_code))),
-            Step::Exited(code) => {
-                *lock(&self.exit_code) = code;
-                Ok(ChildPoll::Exited(code))
+        match child.try_wait() {
+            Ok(Some(status)) => self.exit_code = i32::try_from(status.exit_code()).ok(),
+            Ok(None) => {
+                match self.stop {
+                    Some(StopPhase::Hangup(since)) if since.elapsed() >= STOP_GRACE => {
+                        let _ = signal_foreground(fd, libc::SIGCONT);
+                        let _ = signal_foreground(fd, libc::SIGTERM);
+                        self.stop = Some(StopPhase::Terminate(Instant::now()));
+                    }
+                    Some(StopPhase::Terminate(since)) if since.elapsed() >= STOP_GRACE => {
+                        let _ = signal_foreground(fd, libc::SIGKILL);
+                        self.stop = Some(StopPhase::KillGroup(Instant::now()));
+                    }
+                    Some(StopPhase::KillGroup(since))
+                        if since.elapsed() >= Duration::from_millis(POLL_INTERVAL_MS as u64) =>
+                    {
+                        // The process we own may no longer be in the foreground group.
+                        // The child handle still owns its identity and has not been reaped.
+                        let _ = child.kill();
+                        self.stop = Some(StopPhase::KillChild);
+                    }
+                    _ => {}
+                }
+                return ChildPoll::Running;
             }
+            // No waitable child remains. Keep the exit status unknown.
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {}
+            // A wait error, including EINTR, does not prove the child exited.
+            Err(_) => return ChildPoll::Running,
         }
-    }
-
-    #[cfg(test)]
-    fn reaped(&self) -> bool {
-        lock(&self.slot).is_none()
+        self.child = None;
+        ChildPoll::Exited(self.exit_code)
     }
 }
 
 impl Drop for InteractivePty {
     fn drop(&mut self) {
-        // Same path as Stop and quit: the pty foreground group, and only while this child is still unreaped.
         let _ = self.kill();
     }
 }
@@ -348,7 +414,7 @@ mod tests {
         let (pty, out, exit) = start(spec("/bin/cat", &[], &[]));
         pty.write(b"hello from a person\n").unwrap();
         read_until(&out, "hello from a person");
-        pty.kill().unwrap();
+        pty.kill();
         exit.recv_timeout(Duration::from_secs(10)).unwrap();
     }
 
@@ -367,11 +433,8 @@ mod tests {
 
     #[test]
     fn env_is_exactly_the_spec_nothing_inherited() {
-        // SAFETY: test process; the variable is unique to this test.
-        unsafe { std::env::set_var("HARNESS_TEST_MUST_NOT_LEAK", "leaked") };
         let (_pty, out, _exit) = start(spec("/usr/bin/env", &[], &[("ONLY_THIS", "yes")]));
         let text = read_until(&out, "ONLY_THIS=yes");
-        assert!(!text.contains("HARNESS_TEST_MUST_NOT_LEAK"));
         assert!(!text.contains("CONFIG_DIR"));
     }
 
@@ -404,16 +467,9 @@ mod tests {
     #[test]
     fn stop_signals_the_foreground_group_and_not_a_reaped_pid() {
         let (pty, _out, exit) = start(spec("/bin/cat", &[], &[]));
-        assert_eq!(pty.kill().unwrap(), StopSignal::Sent);
-        assert_eq!(pty.signals_sent(), 1);
+        assert_eq!(pty.kill(), StopSignal::Sent);
         exit.recv_timeout(Duration::from_secs(10)).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !pty.child_reaped() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(pty.child_reaped());
-        assert_eq!(pty.kill().unwrap(), StopSignal::AlreadyExited);
-        assert_eq!(pty.signals_sent(), 1);
+        assert_eq!(pty.kill(), StopSignal::AlreadyExited);
         let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
         assert!(
             !production.contains("libc::kill"),

@@ -1,14 +1,12 @@
 //! Real CLI observations, kept separate from permission to execute work (T-133).
 //! Raw CLI output, account details and tokens never enter the IPC response/logs.
 
-use crate::binary::{self, Discovery, ProbeCommand};
-use crate::fs_guard::{self, FileGuard, GuardError, NullSink, RootKind};
+use crate::binary::{self, ProbeCommand};
 use crate::process::{Capture, ProbeError};
 use crate::provider::ProviderId;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 #[derive(Default)]
 pub struct ProviderRegistry {
@@ -18,86 +16,12 @@ pub struct ProviderRegistry {
 /// Called only by the app's explicit human Terminal login mode, never by a task
 /// or scheduler. The CLI's own sign-in UI handles every authentication response.
 pub fn login_in_terminal(provider: ProviderId) -> Result<i32, String> {
-    let Discovery::Found(cli) = binary::discover(provider) else {
-        return Err("A supported native CLI was not found.".into());
-    };
-    cli.terminal_login().map_err(|e| e.to_string())
-}
-
-/// Called only by the app's closed human terminal mode, on the terminal the human is driving. The kernel checks the
-/// CLI's identity at launch. Nothing the app or a model produced enters its arguments.
-pub fn session_in_terminal(provider: ProviderId, cwd: &Path) -> Result<i32, String> {
-    let Discovery::Found(cli) = binary::discover(provider) else {
-        return Err("A supported native CLI was not found.".into());
-    };
-    let ambient: Vec<(String, String)> = std::env::vars().collect();
-    cli.terminal_session(cwd, &ambient)
+    binary::try_candidates(provider, binary::InstalledCli::terminal_login)
+        .map(|(_, code)| code)
         .map_err(|e| e.to_string())
 }
 
-/// The current time as the contract's timestamp text.
-pub fn timestamp() -> String {
-    chrono::Utc::now().to_rfc3339()
-}
-
-/// The whole environment for a human terminal's child process (rules 2 and 4).
-pub fn human_terminal_env() -> Result<Vec<(String, String)>, String> {
-    let home = fs_guard::account_home().map_err(|e| e.to_string())?;
-    let ambient: Vec<(String, String)> = std::env::vars().collect();
-    Ok(binary::session_env(&home, &ambient))
-}
-
-/// Why a provider cannot open a human terminal, before anything starts.
-pub fn human_terminal_check(provider: ProviderId) -> Result<(), &'static str> {
-    if !supported(provider) {
-        return Err("This provider has no supported terminal yet.");
-    }
-    match binary::discover(provider) {
-        Discovery::Found(_) => Ok(()),
-        Discovery::Missing => Err("Install the official CLI first."),
-        Discovery::Unverified => Err("The installed CLI could not be checked safely."),
-    }
-}
-
-/// Resolves a folder the human picked. It must be a real directory and never a credential store (rule 4).
-pub fn human_terminal_folder(folder: &Path) -> Result<PathBuf, &'static str> {
-    const REFUSED: &str = "That folder cannot be used.";
-    let home = fs_guard::account_home().map_err(|_| REFUSED)?;
-    let guard = FileGuard::new(&home, Arc::new(NullSink)).map_err(|_| REFUSED)?;
-    match guard.register_root(RootKind::Repo, folder) {
-        Ok(()) => {}
-        Err(GuardError::Denied { .. }) => {
-            return Err("That folder holds CLI credentials, so it cannot be used.")
-        }
-        Err(GuardError::NotAbsolute) => return Err("Enter the full path of a folder."),
-        Err(GuardError::Io(_)) => return Err("That folder does not exist."),
-        Err(_) => return Err(REFUSED),
-    }
-    let canonical = folder.canonicalize().map_err(|_| REFUSED)?;
-    if !canonical.is_dir() {
-        return Err("That path is not a folder.");
-    }
-    Ok(canonical)
-}
-
 impl ProviderRegistry {
-    pub fn personal_use_confirmed(&self, provider: ProviderId) -> bool {
-        self.confirmed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&provider)
-    }
-
-    /// The human confirmed in the terminal dialog that this is their own account (rule 5).
-    /// This is the in-memory mark only. It does not check that the CLI is verified; `confirm` keeps that check.
-    /// It never clears task blockers or makes a provider usable for automated work.
-    pub fn note_personal_use(&self, provider: ProviderId) {
-        self.confirmed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(provider);
-    }
-
     pub fn list(&self) -> Vec<Value> {
         ProviderId::ALL
             .into_iter()
@@ -110,43 +34,38 @@ impl ProviderRegistry {
         if !supported(provider) {
             return status;
         }
-        let cli = match binary::discover(provider) {
-            Discovery::Missing => return status,
-            Discovery::Unverified => {
-                status["install"]["state"] = json!("installed");
-                status["usable"]["blockers"] = json!([
-                    "binary_unchecked",
-                    "execution_boundary_unavailable",
-                    "runtime_controls_unavailable",
-                    "provider_policy_unverified"
-                ]);
-                return status;
-            }
-            Discovery::Found(cli) => cli,
-        };
-        status["install"]["state"] = json!("installed");
-        status["install"]["path"] = json!(cli.path);
-        let now = chrono::Utc::now().to_rfc3339();
-        status["binary"]["checked_at"] = json!(now);
-        // A routine vendor update changes the release hash. Report it as the official CLI it is, on the vendor
-        // identity alone, and record that this release is unreviewed. Tasks stay off either way.
-        let (first_probe, release_reviewed) = match cli.probe(ProbeCommand::Version) {
-            Err(ProbeError::Verification) => (cli.probe_any_release(ProbeCommand::Version), false),
-            other => (other, true),
-        };
-        let version = match first_probe {
-            Ok(output) if output.code == 0 => parse_version(provider, &output.stdout),
+        // Search only by attempting a kernel-verified launch. The app never resolves or stats the executable
+        // or a credential-store alias. Prefer the reviewed image and report a distinct scope after a pin mismatch.
+        let probe =
+            binary::try_candidates(provider, |cli| match cli.probe(ProbeCommand::Version) {
+                Err(ProbeError::Verification) => match cli.probe_any_release(ProbeCommand::Version)
+                {
+                    Err(ProbeError::Missing) => Err(ProbeError::Verification),
+                    result => result.map(|capture| (capture, false)),
+                },
+                result => result.map(|capture| (capture, true)),
+            });
+        let (cli, (capture, release_reviewed)) = match probe {
+            Ok(result) => result,
+            Err(ProbeError::Missing) => return status,
             Err(error) => {
+                status["install"]["state"] = json!("unknown");
                 probe_failure(&mut status, &error);
                 return status;
             }
-            _ => None,
         };
+        status["install"]["state"] = json!("installed");
+        status["install"]["path"] = json!(cli.path);
+        status["binary"]["checked_at"] = json!(chrono::Utc::now().to_rfc3339());
+        let version = (capture.code == 0)
+            .then(|| parse_version(provider, &capture.stdout))
+            .flatten();
         let Some(version) = version else {
-            status["binary"]["state"] = json!("failed");
-            status["binary"]["checks"] = json!([{"kind":"codesign", "result":"fail", "detail":"The signed CLI did not return a supported version response."}]);
+            status["binary"]["state"] = json!("unchecked");
+            status["sign_in"]["detail"] =
+                json!("The CLI did not return a supported version response.");
             status["usable"]["blockers"] = json!([
-                "binary_failed",
+                "binary_unchecked",
                 "execution_boundary_unavailable",
                 "runtime_controls_unavailable",
                 "provider_policy_unverified"
@@ -159,7 +78,7 @@ impl ProviderRegistry {
         status["binary"]["release_reviewed"] = json!(release_reviewed);
         status["binary"]["checks"] = json!([
             {"kind":"codesign", "result":"pass", "detail":codesign_detail(release_reviewed)},
-            {"kind":"install_source", "result":"pass", "detail":"Native vendor-signed image discovered at a supported installation entrypoint; installer history is not inferred."}
+            {"kind":"install_source", "result":"not_checked", "detail":"Found at a supported CLI entrypoint. Installer provenance was not verified."}
         ]);
         // Authentication has its own documented interface. Worker/help support
         // must not suppress an authentication observation. No worker verb is
@@ -181,7 +100,7 @@ impl ProviderRegistry {
         // Preparation only: the human runs the vendor's official browser login
         // in their own Terminal. No interactive keystroke or login/account change
         // is dispatched by this app. A refresh checks the actual CLI afterward.
-        if state != "signed_in" {
+        if state != "signed_in" && release_reviewed {
             if let Ok(executable) = std::env::current_exe() {
                 // The app's closed Terminal mode re-applies the kernel identity
                 // requirement at the moment of login, instead of asking the
@@ -198,8 +117,7 @@ impl ProviderRegistry {
             .unwrap_or_else(|e| e.into_inner())
             .contains(&provider);
         status["personal_use_confirmed"] = json!(confirmed);
-        // Lead and worker stay false. An unreviewed vendor release is an explicit task blocker, separate from the
-        // human terminal, which may still open that signed CLI.
+        // Lead and worker stay false. An unreviewed vendor release is also an explicit task blocker.
         set_task_usability(&mut status, release_reviewed, state, confirmed);
         status
     }
@@ -228,27 +146,18 @@ fn codesign_detail(release_reviewed: bool) -> &'static str {
     if release_reviewed {
         "macOS enforced the pinned vendor, CLI identifier, Developer ID category and hardened runtime at launch."
     } else {
-        "macOS enforced the vendor, CLI identifier, Developer ID category and hardened runtime at launch. This vendor-signed release is newer than the one reviewed for this build, so tasks stay off for it. Terminals are not affected."
+        "macOS enforced the vendor, CLI identifier, Developer ID category and hardened runtime at launch. This vendor-signed release does not match the reviewed release pin."
     }
 }
 
-/// Human terminals are open only for providers this build can launch with a compiled vendor pin.
-/// Grok, Kimi, Gemini and GLM stay closed: this tree has no pin for the first three, Gemini has no
-/// app-managed key launch, and GLM has no base-URL setting here.
-pub fn human_terminal_supported(provider: ProviderId) -> bool {
+fn supported(provider: ProviderId) -> bool {
     matches!(provider, ProviderId::Claude | ProviderId::Codex)
 }
 
-fn supported(provider: ProviderId) -> bool {
-    human_terminal_supported(provider)
-}
-
-/// Automated workers are not part of this build. `tasks_enabled` still refuses `release_unreviewed` on its own,
-/// so deleting the placeholder blockers cannot make an unreviewed release runnable.
+/// Automated workers remain closed until the execution boundary and runtime controls are connected.
 const WORKERS_ENABLED: bool = false;
 
-/// Writes the automated-task gate. A vendor-signed release that this build has not reviewed gets its own blocker,
-/// separate from the human terminal.
+/// Writes the automated-task gate and the independent blocker for an unreviewed release.
 fn set_task_usability(status: &mut Value, release_reviewed: bool, sign_in: &str, confirmed: bool) {
     let blockers = automated_task_blockers(release_reviewed, sign_in, confirmed);
     let allowed = tasks_enabled(&blockers);
@@ -260,10 +169,7 @@ fn set_task_usability(status: &mut Value, release_reviewed: bool, sign_in: &str,
 }
 
 fn tasks_enabled(blockers: &[&str]) -> bool {
-    WORKERS_ENABLED
-        && blockers
-            .iter()
-            .all(|blocker| *blocker != "release_unreviewed")
+    WORKERS_ENABLED && blockers.is_empty()
 }
 
 /// Blockers for automated tasks. `lead` and `worker` are never turned on by this list.
@@ -294,8 +200,10 @@ fn automated_task_blockers(
 
 fn probe_failure(status: &mut Value, error: &ProbeError) {
     let refused = matches!(error, ProbeError::Verification);
-    status["binary"]["state"] = json!(if refused { "failed" } else { "unchecked" });
-    status["binary"]["checks"] = json!([{"kind":"codesign", "result":if refused { "fail" } else { "not_applicable" }, "detail":error.to_string()}]);
+    status["binary"] = json!({
+        "state": if refused { "failed" } else { "unchecked" },
+        "checks": [{"kind": "codesign", "result": if refused { "fail" } else { "not_checked" }, "detail": error.to_string()}],
+    });
     status["sign_in"] = json!({"state":"unknown", "detail":error.to_string()});
     status["usable"]["blockers"] = json!([
         if refused {
@@ -483,77 +391,31 @@ mod tests {
         assert!(codesign_detail(true).contains("pinned"));
         let unreviewed = codesign_detail(false);
         assert!(!unreviewed.contains("pinned"));
-        assert!(unreviewed.contains("tasks stay off"));
+        assert!(unreviewed.contains("does not match the reviewed release pin"));
     }
 
     #[test]
-    fn a_terminal_folder_must_be_a_real_directory_outside_credential_stores() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(
-            human_terminal_folder(dir.path()).unwrap(),
-            dir.path().canonicalize().unwrap()
-        );
-        assert!(human_terminal_folder(Path::new("relative/path")).is_err());
-        assert!(human_terminal_folder(&dir.path().join("missing")).is_err());
-        let file = dir.path().join("file");
-        std::fs::write(&file, "x").unwrap();
-        assert!(human_terminal_folder(&file).is_err());
-        let home = fs_guard::account_home().unwrap();
-        let denylist = fs_guard::Denylist::embedded().unwrap();
-        assert!(!denylist.home_dirs().is_empty());
-        for store in denylist.home_dirs() {
-            // Lexical refusal: the path is never opened.
-            assert!(human_terminal_folder(&home.join(store)).is_err(), "{store}");
-        }
-    }
-
-    #[test]
-    fn only_supported_providers_can_open_a_human_terminal() {
-        for provider in [
-            ProviderId::Grok,
-            ProviderId::Kimi,
-            ProviderId::Gemini,
-            ProviderId::Glm,
-        ] {
-            assert!(human_terminal_check(provider).is_err());
-        }
-    }
-
-    #[test]
-    fn noting_personal_use_never_makes_a_provider_usable_for_tasks() {
-        let registry = ProviderRegistry::default();
-        assert!(!registry.personal_use_confirmed(ProviderId::Claude));
-        registry.note_personal_use(ProviderId::Claude);
-        assert!(registry.personal_use_confirmed(ProviderId::Claude));
-        // Supported provider, signed in, no confirmation: tasks stay blocked on that fact.
+    fn personal_use_confirmation_cannot_make_a_signed_in_provider_usable() {
         let mut status = unavailable(ProviderId::Claude);
-        set_task_usability(&mut status, true, "signed_in", false);
-        assert_eq!(status["usable"]["lead"], false);
-        assert_eq!(status["usable"]["worker"], false);
-        let blockers = status["usable"]["blockers"].as_array().unwrap();
-        assert!(blockers
-            .iter()
-            .any(|blocker| blocker == "personal_use_unconfirmed"));
-        assert!(blockers
-            .iter()
-            .any(|blocker| blocker == "execution_boundary_unavailable"));
-        set_task_usability(&mut status, true, "signed_in", true);
-        assert_eq!(status["usable"]["lead"], false);
-        assert_eq!(status["usable"]["worker"], false);
-        let confirmed = status["usable"]["blockers"].as_array().unwrap();
-        assert!(!confirmed
-            .iter()
-            .any(|blocker| blocker == "personal_use_unconfirmed"));
-        assert!(confirmed
-            .iter()
-            .any(|blocker| blocker == "execution_boundary_unavailable"));
-        let gemini = registry.refresh(ProviderId::Gemini);
-        assert_eq!(gemini["usable"]["worker"], false);
-        assert_eq!(gemini["usable"]["lead"], false);
+        for confirmed in [false, true] {
+            set_task_usability(&mut status, true, "signed_in", confirmed);
+            assert_eq!(status["usable"]["lead"], false);
+            assert_eq!(status["usable"]["worker"], false);
+            let blockers = status["usable"]["blockers"].as_array().unwrap();
+            assert_eq!(
+                blockers
+                    .iter()
+                    .any(|blocker| blocker == "personal_use_unconfirmed"),
+                !confirmed
+            );
+            assert!(blockers
+                .iter()
+                .any(|blocker| blocker == "execution_boundary_unavailable"));
+        }
     }
 
     #[test]
-    fn an_unreviewed_release_blocks_automated_tasks_and_not_the_terminal_gate() {
+    fn an_unreviewed_release_blocks_automated_tasks() {
         let mut status = unavailable(ProviderId::Codex);
         status["usable"]["lead"] = json!(true);
         status["usable"]["worker"] = json!(true);
@@ -570,16 +432,6 @@ mod tests {
         // The placeholder blockers are not what keeps tasks off for this release.
         assert!(!tasks_enabled(&["release_unreviewed"]));
         assert!(!tasks_enabled(&[]));
-        assert!(human_terminal_supported(ProviderId::Claude));
-        assert!(human_terminal_supported(ProviderId::Codex));
-        for provider in [
-            ProviderId::Grok,
-            ProviderId::Kimi,
-            ProviderId::Gemini,
-            ProviderId::Glm,
-        ] {
-            assert!(!human_terminal_supported(provider), "{provider}");
-        }
     }
 
     #[test]
@@ -596,12 +448,18 @@ mod tests {
             ProbeError::Verification,
             ProbeError::Timeout,
             ProbeError::CleanupPending,
+            ProbeError::Busy,
+            ProbeError::IdentityGateUnavailable,
         ] {
             let mut status = unavailable(ProviderId::Claude);
             status["binary"]["state"] = json!("verified");
+            status["binary"]["verification_scope"] = json!("kernel_identity");
+            status["binary"]["release_reviewed"] = json!(false);
             status["sign_in"]["state"] = json!("signed_in");
             probe_failure(&mut status, &error);
             assert_ne!(status["binary"]["state"], "verified");
+            assert!(status["binary"].get("verification_scope").is_none());
+            assert!(status["binary"].get("release_reviewed").is_none());
             assert_eq!(status["sign_in"]["state"], "unknown");
             if !matches!(error, ProbeError::Verification) {
                 assert_ne!(status["binary"]["state"], "failed");

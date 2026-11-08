@@ -41,7 +41,6 @@ fn main() {
     println!("cargo:rustc-link-lib=static=harness_launch_gate");
     // Test binaries target an older macOS, where the Swift runtime is found by rpath.
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
-    println!("cargo:rustc-link-lib=framework=AppKit");
     println!("cargo:rustc-link-lib=framework=Foundation");
     println!("cargo:rustc-link-lib=framework=LightweightCodeRequirements");
 }

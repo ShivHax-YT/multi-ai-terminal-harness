@@ -37,19 +37,19 @@ Providers: `claude`, `codex`, `grok`, `kimi`, `gemini`, `glm`.
 
 ```
 hash = sha256( canonical_json( plan without "approval" ) ), lowercase hex
-spike: jq -S -c 'del(.approval)' plan.json | shasum -a 256
+spike: jq -j -S -c 'del(.approval)' plan.json | shasum -a 256
 ```
 
 Everything except `approval` is covered: provider, scope (`owned_files`, `acceptance`), usage estimates, fallbacks and
 dependencies. Changing any of them changes the hash and so voids the approval (rule 9: "any change of provider, scope or
 estimated usage beyond the approved plan needs new approval").
 
-### JCS in the app, `jq -S -c` in the spike
+### JCS in the app, `jq -j -S -c` in the spike
 
 The app will use RFC 8785 (JSON Canonicalization Scheme) so any implementation (Rust, Swift, TypeScript) yields the
-same bytes. The spike's `jq -S -c` is close to JCS only for the restricted shape the checker enforces: a fixed set of
-ASCII keys (unknown keys rejected), strings, and **canonical integers** (below). For that subset both forms sort keys and
-drop insignificant whitespace. Known gaps:
+same bytes. The spike's `jq -j -S -c` suppresses the record newline. It is close to JCS for the restricted plan shape,
+which uses a fixed set of ASCII keys, strings, and **canonical integers** (below). Both forms sort these keys and drop
+insignificant whitespace. Known gaps:
 
 - **Number literals.** jq 1.7 preserves number literals, so `20.0` and `20` are different bytes and hash differently, and
   the result depends on the jq version's number handling. JCS would print both as `20`. The spike therefore rejects

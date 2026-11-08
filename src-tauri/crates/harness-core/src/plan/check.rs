@@ -9,8 +9,12 @@ use crate::plan::model::{AuthMode, PlanModel};
 use crate::plan::Plan;
 use crate::provider::ProviderId;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
+
+const MAX_REPORTED_VIOLATIONS: usize = 128;
+const MAX_DIAGNOSTIC_BYTES: usize = 1024;
+const MAX_DIAGNOSTIC_ID_BYTES: usize = 256;
 
 /// One finding. Maps to `PlanViolation` in the IPC contract (`PlanView.violations`); all violations block approval in
 /// Phase 1, so there is no severity.
@@ -26,19 +30,54 @@ pub struct Violation {
 
 impl Violation {
     pub fn new(rule: u8, message: impl Into<String>) -> Self {
+        let mut message = message.into();
+        if message.len() > MAX_DIAGNOSTIC_BYTES {
+            message.truncate(message.floor_char_boundary(MAX_DIAGNOSTIC_BYTES - '…'.len_utf8()));
+            message.push('…');
+        }
         Self {
             rule,
-            message: message.into(),
+            message,
             task_id: None,
         }
     }
 
-    fn for_task(rule: u8, message: String, task_id: &str) -> Self {
-        Self {
-            rule,
-            message,
-            task_id: Some(task_id.to_owned()),
+    pub(super) fn with_task(mut self, task_id: &str) -> Self {
+        if task_id.len() <= MAX_DIAGNOSTIC_ID_BYTES {
+            self.task_id = Some(task_id.to_owned());
         }
+        self
+    }
+
+    fn for_task(rule: u8, message: String, task_id: &str) -> Self {
+        Self::new(rule, message).with_task(task_id)
+    }
+}
+
+/// Bound the text echoed into diagnostics without changing the plan or its hash.
+pub(super) fn diagnostic_id(id: &str) -> &str {
+    &id[..id.floor_char_boundary(MAX_DIAGNOSTIC_ID_BYTES)]
+}
+
+#[derive(Default)]
+pub(super) struct Violations(Vec<Violation>);
+
+impl Violations {
+    pub(super) fn push(&mut self, violation: Violation) {
+        if self.0.len() < MAX_REPORTED_VIOLATIONS {
+            self.0.push(violation);
+        } else if self.0.len() == MAX_REPORTED_VIOLATIONS {
+            self.0
+                .push(Violation::new(9, "additional plan violations omitted"));
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(super) fn into_vec(self) -> Vec<Violation> {
+        self.0
     }
 }
 
@@ -57,8 +96,8 @@ pub enum Mode {
     Scheduler,
 }
 
-/// Every violation of `plan` in spike order (shape first; rule checks only for a well-shaped plan). Empty means the plan
-/// passes. Callers decide on `is_empty()` of this result, never on a missing call.
+/// Bounded violations in spike order (shape first; rule checks only for a well-shaped plan). Empty means the plan passes.
+/// Callers decide on `is_empty()` of this result, never on a missing call.
 pub fn check(plan: &Plan, mode: Mode) -> Vec<Violation> {
     let mut out = match plan.model() {
         Ok(model) => rule_violations(model, plan.hash()),
@@ -76,7 +115,7 @@ fn is_gemini_without_api_key(provider: ProviderId, auth_mode: AuthMode) -> bool 
 }
 
 fn rule_violations(plan: &PlanModel, computed_hash: &str) -> Vec<Violation> {
-    let mut out = Vec::new();
+    let mut out = Violations::default();
     let used: HashSet<ProviderId> = plan.tasks.iter().map(|t| t.provider).collect();
 
     // Rule 7: Gemini on API key only, for the lead too.
@@ -100,7 +139,8 @@ fn rule_violations(plan: &PlanModel, computed_hash: &str) -> Vec<Violation> {
                 2,
                 format!(
                     "task {} lists its own provider {} as a fallback",
-                    t.id, t.provider
+                    diagnostic_id(&t.id),
+                    t.provider
                 ),
                 &t.id,
             ));
@@ -113,7 +153,10 @@ fn rule_violations(plan: &PlanModel, computed_hash: &str) -> Vec<Violation> {
             if n > 1 {
                 out.push(Violation::for_task(
                     2,
-                    format!("task {} repeats fallback provider {name}", t.id),
+                    format!(
+                        "task {} repeats fallback provider {name}",
+                        diagnostic_id(&t.id)
+                    ),
                     &t.id,
                 ));
             }
@@ -129,7 +172,8 @@ fn rule_violations(plan: &PlanModel, computed_hash: &str) -> Vec<Violation> {
                     9,
                     format!(
                         "task {} fallback provider {} is not used by any task in the plan",
-                        t.id, f.provider
+                        diagnostic_id(&t.id),
+                        f.provider
                     ),
                     &t.id,
                 ));
@@ -144,7 +188,7 @@ fn rule_violations(plan: &PlanModel, computed_hash: &str) -> Vec<Violation> {
                 7,
                 format!(
                     "task {} uses gemini with auth_mode {}; gemini is api_key only",
-                    t.id,
+                    diagnostic_id(&t.id),
                     t.auth_mode.as_str()
                 ),
                 &t.id,
@@ -158,7 +202,7 @@ fn rule_violations(plan: &PlanModel, computed_hash: &str) -> Vec<Violation> {
                     7,
                     format!(
                         "task {} has a gemini fallback with auth_mode {}; gemini is api_key only",
-                        t.id,
+                        diagnostic_id(&t.id),
                         f.auth_mode.as_str()
                     ),
                     &t.id,
@@ -174,7 +218,8 @@ fn rule_violations(plan: &PlanModel, computed_hash: &str) -> Vec<Violation> {
                 1,
                 format!(
                     "task {} estimates {} turns, ceiling is {MAX_TURNS_PER_TASK}",
-                    t.id, t.estimated_usage.turns
+                    diagnostic_id(&t.id),
+                    t.estimated_usage.turns
                 ),
                 &t.id,
             ));
@@ -207,7 +252,14 @@ fn rule_violations(plan: &PlanModel, computed_hash: &str) -> Vec<Violation> {
     if !stuck.is_empty() {
         out.push(Violation::new(
             9,
-            format!("tasks blocked by a dependency cycle: {}", stuck.join(", ")),
+            format!(
+                "tasks blocked by a dependency cycle: {}",
+                stuck
+                    .into_iter()
+                    .map(diagnostic_id)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         ));
     }
 
@@ -226,29 +278,42 @@ fn rule_violations(plan: &PlanModel, computed_hash: &str) -> Vec<Violation> {
             out.push(Violation::new(9, "approval approved_via must be \"ui\""));
         }
     }
-    out
+    out.into_vec()
 }
 
 /// Tasks whose `depends_on` can never be satisfied: part of, or downstream of, a cycle (Kahn's algorithm).
 fn stuck_tasks(plan: &PlanModel) -> Vec<&str> {
-    let mut done: HashSet<&str> = HashSet::new();
-    loop {
-        let before = done.len();
-        for t in &plan.tasks {
-            if !done.contains(t.id.as_str())
-                && t.depends_on.iter().all(|d| done.contains(d.as_str()))
-            {
-                done.insert(&t.id);
-            }
+    let indices: HashMap<&str, usize> = plan
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(i, task)| (task.id.as_str(), i))
+        .collect();
+    let mut dependents = vec![Vec::new(); plan.tasks.len()];
+    let mut pending = Vec::with_capacity(plan.tasks.len());
+    let mut ready = VecDeque::new();
+    for (i, task) in plan.tasks.iter().enumerate() {
+        pending.push(task.depends_on.len());
+        if task.depends_on.is_empty() {
+            ready.push_back(i);
         }
-        if done.len() == before {
-            break;
+        for dependency in &task.depends_on {
+            dependents[indices[dependency.as_str()]].push(i);
+        }
+    }
+    while let Some(i) = ready.pop_front() {
+        for &dependent in &dependents[i] {
+            pending[dependent] -= 1;
+            if pending[dependent] == 0 {
+                ready.push_back(dependent);
+            }
         }
     }
     plan.tasks
         .iter()
-        .map(|t| t.id.as_str())
-        .filter(|id| !done.contains(id))
+        .zip(pending)
+        .filter(|(_, count)| *count != 0)
+        .map(|(task, _)| task.id.as_str())
         .collect()
 }
 

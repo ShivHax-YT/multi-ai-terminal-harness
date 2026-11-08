@@ -5,15 +5,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 import {
+  IpcRejection,
   toIpcRejection,
   type ApprovalPort,
-  type CommandName,
   type IpcBundle,
   type IpcClient,
+  type NativeCommandName,
   type PtyInputPort,
 } from "./contract";
 
-async function call<T>(command: CommandName, args?: Record<string, unknown>): Promise<T> {
+async function call<T>(command: NativeCommandName, args?: Record<string, unknown>): Promise<T> {
   try {
     return await invoke<T>(command, args);
   } catch (error) {
@@ -21,11 +22,29 @@ async function call<T>(command: CommandName, args?: Record<string, unknown>): Pr
   }
 }
 
+function embeddedTerminalUnavailable(): Promise<never> {
+  return Promise.reject(
+    new IpcRejection({
+      kind: "not_implemented",
+      message: "Embedded terminals are unavailable. Use the installed CLI in macOS Terminal.",
+    }),
+  );
+}
+
+function sampleRunUnavailable(): Promise<never> {
+  return Promise.reject(
+    new IpcRejection({
+      kind: "not_implemented",
+      message: "Only the browser demo can run a sample plan.",
+    }),
+  );
+}
+
 function createClient(): IpcClient {
   return {
     sim_snapshot: () => call("sim_snapshot"),
     sim_submit: (args) => call("sim_submit", { ...args }),
-    sim_run: (args) => call("sim_run", { ...args }),
+    sim_run: sampleRunUnavailable,
     get_app_info: () => call("get_app_info"),
 
     list_providers: () => call("list_providers"),
@@ -49,8 +68,8 @@ function createClient(): IpcClient {
     pause_session: (args) => call("pause_session", { ...args }),
     resume_session: (args) => call("resume_session", { ...args }),
     kill_session: (args) => call("kill_session", { ...args }),
-    start_terminal: (args) => call("start_terminal", { ...args }),
-    choose_terminal_folder: () => call("choose_terminal_folder"),
+    start_terminal: embeddedTerminalUnavailable,
+    choose_terminal_folder: embeddedTerminalUnavailable,
     set_takeover: (args) => call("set_takeover", { ...args }),
     resume_provider: (args) => call("resume_provider", { ...args }),
     attach_terminal: (args) => call("attach_terminal", { ...args }),
@@ -79,13 +98,22 @@ function createClient(): IpcClient {
 function createApproval(): ApprovalPort {
   return {
     approve_plan: (args) => call("approve_plan", { ...args }),
-    sim_approve_plan: (args) => call("sim_approve_plan", { ...args }),
+    sim_approve_plan: sampleRunUnavailable,
   };
 }
 
 /** Rule 3: handed out only through ./pty-input (usePtyInput). */
 function createPtyInput(): PtyInputPort {
-  return { pty_write: (args) => call("pty_write", { ...args }) };
+  return {
+    pty_write: () =>
+      Promise.reject(
+        new IpcRejection({
+          kind: "rule_blocked",
+          rule: 3,
+          message: "Native terminal input requires a trusted keyboard path.",
+        }),
+      ),
+  };
 }
 
 export function createTauriIpc(): IpcBundle {

@@ -2,7 +2,7 @@
 //! This is not a complete same-user real-directory-rename boundary. Descriptor checks and operation traces cannot
 //! prove that no prohibited open occurred. Do not enable native repository/worker access on these checks alone.
 //!
-//! Each call runs the same pipeline:
+//! Production guards refuse before any path resolution. The fake-home tests exercise this pipeline:
 //! 1. require an absolute path and refuse if its lexical form is denied;
 //! 2. canonicalize (resolving symlinks) and refuse if the canonical form is denied (deny wins over every allow rule);
 //! 3. require a registered root (a writable one for writes);
@@ -153,6 +153,7 @@ pub struct FileGuard {
     matcher: DenyMatcher,
     roots: RwLock<Vec<(RootKind, PathBuf)>>,
     sink: Arc<dyn TraceSink>,
+    fixture_access: bool,
 }
 
 impl std::fmt::Debug for FileGuard {
@@ -162,13 +163,11 @@ impl std::fmt::Debug for FileGuard {
 }
 
 impl FileGuard {
-    /// Build a guard from the embedded denylist. `home` is the caller's home directory, already expanded by the
-    /// caller. The denylist is applied under both `home` and the account home from the password database, so a wrong
-    /// or spoofed `home` cannot hide the real one.
+    /// Build a closed production guard. Neither the supplied home nor the account home is probed.
     pub fn new(home: &Path, sink: Arc<dyn TraceSink>) -> Result<FileGuard, GuardError> {
         let denylist = Denylist::embedded().map_err(GuardError::Denylist)?;
         let homes = FileGuard::homes_for(home)?;
-        Ok(FileGuard::build(denylist, &homes, sink))
+        Ok(FileGuard::build(denylist, &homes, sink, false))
     }
 
     /// The homes the denylist covers for a caller-supplied `home`.
@@ -184,15 +183,17 @@ impl FileGuard {
         Ok(homes)
     }
 
-    pub(crate) fn build(
+    fn build(
         denylist: &Denylist,
         homes: &[PathBuf],
         sink: Arc<dyn TraceSink>,
+        fixture_access: bool,
     ) -> FileGuard {
         FileGuard {
-            matcher: DenyMatcher::new(denylist, homes),
+            matcher: DenyMatcher::new(denylist, homes, fixture_access),
             roots: RwLock::new(Vec::new()),
             sink,
+            fixture_access,
         }
     }
 
@@ -201,7 +202,7 @@ impl FileGuard {
     pub(crate) fn for_test(homes: &[&Path], sink: Arc<dyn TraceSink>) -> FileGuard {
         let denylist = Denylist::embedded().expect("embedded denylist");
         let homes: Vec<PathBuf> = homes.iter().map(|h| h.to_path_buf()).collect();
-        FileGuard::build(denylist, &homes, sink)
+        FileGuard::build(denylist, &homes, sink, true)
     }
 
     /// Register a root the app may access. The root must exist, must not be the filesystem root and must not be denied.
@@ -219,6 +220,9 @@ impl FileGuard {
     }
 
     fn try_register_root(&self, kind: RootKind, path: &Path) -> Result<(), GuardError> {
+        if !self.fixture_access {
+            return Err(GuardError::FileAccessUnavailable);
+        }
         if !path.is_absolute() {
             return Err(GuardError::NotAbsolute);
         }
@@ -317,7 +321,7 @@ impl FileGuard {
     }
 
     /// Resolve a CLI binary path for the binary verifier (rule 6) and nothing else. Returns the canonical path of a
-    /// regular, executable file. It never opens the file and never lists or reads its directory.
+    /// regular, executable fixture file. It never opens the file and never lists or reads its directory.
     ///
     /// The denylist still applies: a path inside a denied directory (or reached through a link that ends there) is
     /// refused with the same `Denied` error whether or not it exists, unless its file name is one of the five CLI binary
@@ -347,6 +351,7 @@ impl FileGuard {
         let mut file = sys::open(&canonical, OpenKind::ExecRead)?;
         let opened = file.metadata()?;
         if !opened.is_file()
+            || opened.nlink() != 1
             || opened.dev() != meta.dev()
             || opened.ino() != meta.ino()
             || !is_executable(&opened)
@@ -378,6 +383,9 @@ impl FileGuard {
 
     /// The checks shared by `exec_resolve` and `hash_executable`. Returns the canonical path and its metadata.
     fn exec_target(&self, path: &Path) -> Result<(PathBuf, Metadata), GuardError> {
+        if !self.fixture_access {
+            return Err(GuardError::FileAccessUnavailable);
+        }
         if !path.is_absolute() {
             return Err(GuardError::NotAbsolute);
         }
@@ -404,9 +412,7 @@ impl FileGuard {
                 path_hash: hash_path(&canonical),
             });
         }
-        if !meta.is_file() {
-            return Err(GuardError::NotAFile);
-        }
+        check_object(&meta, OpenKind::ExecRead)?;
         if !is_executable(&meta) {
             return Err(GuardError::NotExecutable);
         }
@@ -421,6 +427,16 @@ impl FileGuard {
         write: bool,
         action: impl FnOnce(&Path) -> Result<T, GuardError>,
     ) -> Result<T, GuardError> {
+        if !self.fixture_access {
+            let error = match op {
+                TraceOp::CreateDirAll => GuardError::DirectoryCreationUnavailable,
+                TraceOp::CreateWrite | TraceOp::Append => GuardError::FileMutationUnavailable,
+                _ => GuardError::FileAccessUnavailable,
+            };
+            self.sink
+                .record(TraceEvent::now(path, op, TraceOutcome::Refused));
+            return Err(error);
+        }
         let canonical = match self.authorize(path, write) {
             Ok(canonical) => canonical,
             Err(refusal) => {
@@ -493,7 +509,7 @@ impl FileGuard {
                 check_object(&meta, kind)?;
                 Some(meta)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) if kind.writes() && e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
         #[cfg(test)]
@@ -518,6 +534,9 @@ impl FileGuard {
 
     /// Re-run the denylist and root checks on the path an open descriptor really refers to.
     pub(crate) fn verify_fd(&self, file: &File, write: bool) -> Result<PathBuf, GuardError> {
+        if !self.fixture_access {
+            return Err(GuardError::FileAccessUnavailable);
+        }
         let path = sys::fd_path(file)?;
         let snap = self.matcher.snapshot();
         if snap.is_denied(&path) || snap.identity_denied(&path) {

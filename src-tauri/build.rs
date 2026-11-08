@@ -1,12 +1,10 @@
 // Every IPC command is listed here so tauri-build generates one `allow-<command>` permission per command, and
 // capabilities/main.json grants exactly those. A command missing from this list cannot be called from the webview.
 // src/test/command-parity.test.ts checks that this list, lib.rs `generate_handler!`, the capability and the TS
-// contract (src/lib/ipc/contract.ts) name the same commands.
+// contract's native subset (src/lib/ipc/contract.ts) name the same commands.
 const COMMANDS: &[&str] = &[
     "sim_snapshot",
     "sim_submit",
-    "sim_approve_plan",
-    "sim_run",
     "get_app_info",
     "list_providers",
     "refresh_provider_status",
@@ -27,13 +25,10 @@ const COMMANDS: &[&str] = &[
     "pause_session",
     "resume_session",
     "kill_session",
-    "start_terminal",
-    "choose_terminal_folder",
     "set_takeover",
     "resume_provider",
     "attach_terminal",
     "resize_terminal",
-    "pty_write",
     "list_reviews",
     "get_review",
     "mark_reviewed",

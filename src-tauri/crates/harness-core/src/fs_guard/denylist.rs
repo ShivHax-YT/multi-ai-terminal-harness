@@ -152,14 +152,12 @@ pub struct DenyMatcher {
 }
 
 impl DenyMatcher {
-    /// Build the matcher for `homes` (already expanded by the caller; the caller passes the account home from the
-    /// password database and the home it was given). Each home is also canonicalized, so a symlinked home is covered
-    /// under both spellings.
-    pub(crate) fn new(denylist: &Denylist, homes: &[PathBuf]) -> DenyMatcher {
+    /// Expand canonical spellings only for fake homes used to exercise the guard's filesystem checks.
+    pub(crate) fn new(denylist: &Denylist, homes: &[PathBuf], fixture_access: bool) -> DenyMatcher {
         let mut all: Vec<PathBuf> = Vec::new();
         for home in homes {
             let mut spellings = vec![lexical_normalize(home)];
-            if let Ok(canonical) = home.canonicalize() {
+            if let Some(Ok(canonical)) = fixture_access.then(|| home.canonicalize()) {
                 spellings.push(canonical);
             }
             for s in spellings {

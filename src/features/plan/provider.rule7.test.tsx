@@ -1,6 +1,6 @@
 // Rule 7: an API-key-only provider (Gemini) can be chosen only in API key mode.
 import { screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { createMockIpc } from "@/lib/ipc/mock";
 import { renderRoute } from "@/test/render";
@@ -19,6 +19,11 @@ async function geminiPlan() {
 describe("rule 7: provider edit", () => {
   it("offers only API key for Gemini and saves exactly that", async () => {
     const mock = await geminiPlan();
+    const statuses = await mock.client.list_providers();
+    const gemini = statuses.find((status) => status.provider === "gemini");
+    if (gemini === undefined) throw new Error("fixture has no Gemini status");
+    gemini.auth_modes = ["subscription", "api_key"];
+    vi.spyOn(mock.client, "list_providers").mockResolvedValue(statuses);
     const { user } = renderRoute(`/plans/${DRAFT_ID}`, { mock });
     const t1 = await task("t1");
     await user.click(t1.getByRole("button", { name: "Edit provider" }));

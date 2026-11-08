@@ -21,7 +21,9 @@ export function SampleFlow() {
       : query.data?.plans.find((p) => p.id === planId);
   const run = useMutation({
     mutationFn: async () => {
-      if (plan === undefined) throw new Error("Plan not found");
+      if (query.data?.runtime !== "browser" || plan === undefined) {
+        throw new Error("Sample runs are available in the browser demo.");
+      }
       const { token } = await approval.sim_approve_plan({ plan_id: plan.id, plan_hash: plan.hash });
       return ipc.sim_run({ plan_id: plan.id, plan_hash: plan.hash, token });
     },
@@ -63,7 +65,7 @@ export function SampleFlow() {
           <dt className="text-muted-foreground">Isolation</dt>
           <dd>
             {query.data.runtime === "native"
-              ? "Worktree creation blocked by the safety guard; native execution will refuse"
+              ? "Native preview only. Worktree creation is unavailable."
               : "Browser memory only; no files or worktrees"}
           </dd>
           <dt className="text-muted-foreground">Validation</dt>
@@ -78,7 +80,11 @@ export function SampleFlow() {
         <p className="text-xs text-muted-foreground">Approval is tied to this plan hash.</p>
         <UntrustedText text={plan.hash} mono block className="break-all" />
       </div>
-      {plan.error !== null && <p role="alert">{plan.error}</p>}
+      {plan.error !== null && (
+        <div role="alert">
+          <UntrustedText text={plan.error} />
+        </div>
+      )}
       {run.isError && <ErrorAlert error={run.error} />}
       {plan.status === "pending" && (
         <Button

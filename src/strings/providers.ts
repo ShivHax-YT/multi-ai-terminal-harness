@@ -10,6 +10,9 @@ export type ProviderId = (typeof PROVIDER_IDS)[number];
 /** Providers in the MVP (lead + one worker). */
 export const MVP_PROVIDER_IDS = ["claude", "codex"] as const satisfies readonly ProviderId[];
 
+/** Providers that may never offer subscription auth (rule 7). */
+export const API_KEY_ONLY_PROVIDER_IDS: readonly ProviderId[] = ["gemini"];
+
 const LABELS: Record<ProviderId, string> = {
   claude: "Claude Code",
   codex: "Codex CLI",

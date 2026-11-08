@@ -1,6 +1,6 @@
 // Pure helpers for the plan screen. No IPC, no React.
 import type { AuthMode, PlanView, ProviderAuth, ProviderStatus, Task } from "@/lib/ipc";
-import { MVP_PROVIDER_IDS, type ProviderId } from "@/strings/providers";
+import { API_KEY_ONLY_PROVIDER_IDS, MVP_PROVIDER_IDS, type ProviderId } from "@/strings/providers";
 
 /** The sample workflow plans (T-133) use ids like "sim-1"; real plans never do. */
 export function isSamplePlanId(id: string | undefined): boolean {
@@ -40,7 +40,10 @@ export function authModesFor(
   statuses: readonly ProviderStatus[] | undefined,
   provider: ProviderId,
 ): ProviderStatus["auth_modes"] {
-  return statuses?.find((s) => s.provider === provider)?.auth_modes ?? [];
+  const modes = statuses?.find((s) => s.provider === provider)?.auth_modes ?? [];
+  return API_KEY_ONLY_PROVIDER_IDS.includes(provider)
+    ? modes.filter((mode) => mode === "api_key")
+    : modes;
 }
 
 /**

@@ -1,8 +1,8 @@
 //! The trace hook: one event per call through the file-access layer.
 //!
 //! An event holds a SHA-256 hash of the path, never the path, so the trace itself carries no sensitive path. The
-//! credential canary (rule 4) hashes the paths it planted and checks that no event matches. The app installs a sink in
-//! production; tests install a [`RecordingSink`].
+//! credential canary (rule 4) hashes the paths it planted and checks that no event matches. Tests use a
+//! [`RecordingSink`]. No production sink is installed while file access is closed.
 
 use std::path::Path;
 use std::sync::Mutex;

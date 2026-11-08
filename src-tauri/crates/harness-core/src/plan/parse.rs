@@ -6,6 +6,7 @@
 //! so a float never reaches the canonicalizer.
 
 use crate::plan::model::{Value, MAX_SAFE_INT};
+use std::collections::HashSet;
 
 /// Largest plan document accepted, in bytes.
 pub const MAX_PLAN_BYTES: usize = 4 * 1024 * 1024;
@@ -162,6 +163,7 @@ impl Parser<'_> {
         }
         self.pos += 1; // {
         let mut entries: Vec<(String, Value)> = Vec::new();
+        let mut keys = HashSet::new();
         self.skip_ws();
         if self.peek() == Some(b'}') {
             self.pos += 1;
@@ -173,8 +175,8 @@ impl Parser<'_> {
                 return Err(self.syntax());
             }
             let key = self.string()?;
-            // Compared after unescaping, so "a" and "a" are the same key.
-            if entries.iter().any(|(k, _)| *k == key) {
+            // Compare decoded names, including keys spelled with escapes.
+            if !keys.insert(key.clone()) {
                 return Err(ParseError::DuplicateKey(key));
             }
             self.skip_ws();

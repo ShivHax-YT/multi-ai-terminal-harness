@@ -107,7 +107,7 @@ export function TaskCard({
     >
       <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
         <UntrustedText text={task.id} mono className="font-semibold" />
-        <span className="text-sm">{task.role}</span>
+        <UntrustedText text={task.role} className="text-sm" />
         <span className="text-sm">
           <ProviderName id={task.provider} /> ({authModeLabel(task.auth_mode)})
         </span>

@@ -2,7 +2,7 @@
 //! apply: there are no defaults. A wrong type, a missing field or an unknown key is a violation, never a panic and
 //! never silently `0` or `[]`. The messages and rule numbers are a port of the shape half of `spike/plan/check.jq`.
 
-use crate::plan::check::Violation;
+use crate::plan::check::{diagnostic_id, Violation, Violations};
 use crate::plan::jcs::write_string;
 use crate::plan::model::{
     Approval, AuthMode, EstimatedUsage, PlanModel, ProviderChoice, Task, Value,
@@ -104,18 +104,20 @@ pub(crate) fn validate(root: &Value) -> Result<PlanModel, Vec<Violation>> {
             if out.0.is_empty() {
                 out.rule9("plan shape could not be validated");
             }
-            Err(out.0)
+            Err(out.0.into_vec())
         }
     }
 }
 
 #[derive(Default)]
-struct Out(Vec<Violation>);
+struct Out(Violations);
 
 impl Out {
     fn push(&mut self, rule: u8, message: String, task_id: Option<&str>) {
         let mut v = Violation::new(rule, message);
-        v.task_id = task_id.map(str::to_owned);
+        if let Some(id) = task_id {
+            v = v.with_task(id);
+        }
         self.0.push(v);
     }
 
@@ -322,12 +324,12 @@ fn task(i: usize, v: &Value, out: &mut Out) -> Option<Task> {
             None
         }
         Some(items) => {
-            let parsed: Vec<Option<ProviderChoice>> = items
+            let parsed: Vec<ProviderChoice> = items
                 .iter()
                 .enumerate()
-                .map(|(j, item)| fallback(i, j, item, tid, out))
+                .filter_map(|(j, item)| fallback(i, j, item, tid, out))
                 .collect();
-            parsed.into_iter().collect::<Option<Vec<_>>>()
+            (parsed.len() == items.len()).then_some(parsed)
         }
     };
     let estimated_usage = usage(i, v.get("estimated_usage"), tid, out);
@@ -391,30 +393,33 @@ fn tasks(v: Option<&Value>, out: &mut Out) -> Option<Vec<Task>> {
             return None;
         }
     };
-    let parsed: Vec<Option<Task>> = items
+    let parsed: Vec<Task> = items
         .iter()
         .enumerate()
-        .map(|(i, item)| task(i, item, out))
+        .filter_map(|(i, item)| task(i, item, out))
         .collect();
 
     // Ids of every task object that has a string id, even a malformed one.
-    let ids: Vec<&str> = items
+    let mut ids: Vec<&str> = items
         .iter()
         .filter_map(|t| t.get("id").and_then(Value::as_str))
         .collect();
-    let mut sorted = ids.clone();
-    sorted.sort_unstable();
+    ids.sort_unstable();
     let mut last_dup = None;
-    for pair in sorted.windows(2) {
+    for pair in ids.windows(2) {
         if pair[0] == pair[1] && last_dup != Some(pair[0]) {
-            out.push(9, format!("duplicate task id {}", pair[0]), Some(pair[0]));
+            out.push(
+                9,
+                format!("duplicate task id {}", diagnostic_id(pair[0])),
+                Some(pair[0]),
+            );
             last_dup = Some(pair[0]);
         }
     }
     for (i, item) in items.iter().enumerate() {
         dependency_shape(i, item, &ids, out);
     }
-    parsed.into_iter().collect()
+    (parsed.len() == items.len()).then_some(parsed)
 }
 
 /// `depends_on` references: no duplicates, no self-dependency, no dangling ids. Cycles are a rule check.
@@ -428,9 +433,8 @@ fn dependency_shape(i: usize, item: &Value, ids: &[&str], out: &mut Out) {
     let own = item.get("id").and_then(Value::as_str);
     let deps: Vec<&str> = deps.iter().filter_map(Value::as_str).collect();
     let quote = |s: &str| {
-        let shown: String = s.chars().collect();
         let mut q = String::new();
-        write_string(&shown, &mut q);
+        write_string(diagnostic_id(s), &mut q);
         q
     };
     let mut sorted = deps.clone();
@@ -455,7 +459,7 @@ fn dependency_shape(i: usize, item: &Value, ids: &[&str], out: &mut Out) {
         }
     }
     for d in &deps {
-        if Some(*d) != own && !ids.contains(d) {
+        if Some(*d) != own && ids.binary_search(d).is_err() {
             out.push(
                 9,
                 format!("tasks[{i}] depends_on references unknown task {}", quote(d)),

@@ -18,6 +18,7 @@ describe("untrusted plan text", () => {
     const first = plan.tasks[0];
     if (first === undefined) throw new Error("fixture has tasks");
     first.title = HOSTILE;
+    first.role = "Untrusted role <img src=x>";
     first.owned_files = ["<script>alert(1)</script>.ts"];
     first.acceptance = [HOSTILE];
     const { container } = renderRoute(`/plans/${DRAFT_ID}`, { mock });
@@ -32,5 +33,6 @@ describe("untrusted plan text", () => {
     expect(main.querySelectorAll("h1")).toHaveLength(0);
     expect(main.querySelector("strong")).toBeNull();
     expect(screen.getByText("<script>alert(1)</script>.ts")).toHaveClass("font-mono");
+    expect(screen.getByText("Untrusted role <img src=x>")).toHaveAttribute("data-untrusted");
   });
 });

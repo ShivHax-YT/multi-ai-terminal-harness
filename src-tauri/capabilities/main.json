@@ -24,13 +24,10 @@
     "allow-pause-session",
     "allow-resume-session",
     "allow-kill-session",
-    "allow-start-terminal",
-    "allow-choose-terminal-folder",
     "allow-set-takeover",
     "allow-resume-provider",
     "allow-attach-terminal",
     "allow-resize-terminal",
-    "allow-pty-write",
     "allow-list-reviews",
     "allow-get-review",
     "allow-mark-reviewed",
@@ -40,8 +37,6 @@
     "allow-update-settings",
     "allow-get-killswitch-status",
     "allow-sim-snapshot",
-    "allow-sim-submit",
-    "allow-sim-approve-plan",
-    "allow-sim-run"
+    "allow-sim-submit"
   ]
 }

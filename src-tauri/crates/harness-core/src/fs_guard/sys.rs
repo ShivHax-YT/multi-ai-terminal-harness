@@ -110,6 +110,7 @@ pub(super) struct RawEntry {
 
 /// List the directory behind `dir` through its descriptor (`fdopendir`), so the listing cannot be redirected by a path
 /// swapped after the open. Skips `.` and `..`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) fn list_dir(dir: &File) -> io::Result<Vec<RawEntry>> {
     let owned = dir.try_clone()?;
     let fd = std::os::fd::IntoRawFd::into_raw_fd(owned);
@@ -121,12 +122,26 @@ pub(super) fn list_dir(dir: &File) -> io::Result<Vec<RawEntry>> {
         unsafe { libc::close(fd) };
         return Err(err);
     }
+    // SAFETY: these libc calls return the writable errno slot for the current thread.
+    #[cfg(target_os = "macos")]
+    let errno = unsafe { libc::__error() };
+    #[cfg(target_os = "linux")]
+    let errno = unsafe { libc::__errno_location() };
     let mut out = Vec::new();
-    loop {
-        // SAFETY: stream is a valid DIR* until closedir below; readdir's result is only used before the next call.
-        let ent = unsafe { libc::readdir(stream) };
+    let result = loop {
+        // SAFETY: errno is the current thread's slot. stream is valid until closedir.
+        let ent = unsafe {
+            *errno = 0;
+            libc::readdir(stream)
+        };
         if ent.is_null() {
-            break;
+            // SAFETY: readdir leaves errno unchanged at EOF and sets it on error.
+            let error = unsafe { *errno };
+            break if error == 0 {
+                Ok(out)
+            } else {
+                Err(io::Error::from_raw_os_error(error))
+            };
         }
         // SAFETY: ent points to a valid dirent whose d_name is NUL-terminated.
         let (name, d_type) = unsafe {
@@ -143,10 +158,17 @@ pub(super) fn list_dir(dir: &File) -> io::Result<Vec<RawEntry>> {
             name: OsString::from_vec(name),
             d_type,
         });
-    }
+    };
     // SAFETY: stream came from fdopendir and is closed exactly once.
-    unsafe { libc::closedir(stream) };
-    Ok(out)
+    if unsafe { libc::closedir(stream) } == -1 && result.is_ok() {
+        return Err(io::Error::last_os_error());
+    }
+    result
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(super) fn list_dir(_dir: &File) -> io::Result<Vec<RawEntry>> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 pub(super) const DT_DIR: u8 = libc::DT_DIR;

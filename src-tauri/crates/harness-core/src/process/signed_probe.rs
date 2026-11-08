@@ -8,10 +8,70 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+const PLATFORM_ECHO: SignaturePolicy = SignaturePolicy {
+    team: "",
+    identifier: "com.apple.echo",
+    release_cdhash: "",
+    platform_test: true,
+};
+const WRONG_CDHASH: &str = "0000000000000000000000000000000000000000";
+
+fn attests_launch_requirements(
+    check: impl Fn(SignaturePolicy) -> Result<Capture, ProbeError>,
+) -> bool {
+    let valid = check(PLATFORM_ECHO).is_ok_and(|capture| {
+        capture.code == 0
+            && capture.stdout == "harness identity check\n"
+            && capture.stderr.is_empty()
+    });
+    valid
+        && [
+            SignaturePolicy {
+                identifier: "com.apple.sleep",
+                ..PLATFORM_ECHO
+            },
+            SignaturePolicy {
+                release_cdhash: WRONG_CDHASH,
+                ..PLATFORM_ECHO
+            },
+            SignaturePolicy {
+                team: "AAAAAAAAAA",
+                platform_test: false,
+                ..PLATFORM_ECHO
+            },
+        ]
+        .into_iter()
+        .all(|policy| matches!(check(policy), Err(ProbeError::Verification)))
+}
+
+fn require_launch_requirements() -> Result<(), ProbeError> {
+    static ENFORCED: OnceLock<bool> = OnceLock::new();
+    // Some macOS environments accept a launch requirement but execute an image
+    // that fails it. Probe the OS first using only a sealed-system executable.
+    if *ENFORCED.get_or_init(|| {
+        attests_launch_requirements(|policy| {
+            capture_with_hook(
+                Path::new("/bin/echo"),
+                Path::new("/var/empty"),
+                policy,
+                &["harness identity check"],
+                Duration::from_secs(2),
+                true,
+                || {},
+            )
+        })
+    }) {
+        Ok(())
+    } else {
+        Err(ProbeError::IdentityGateUnavailable)
+    }
+}
 
 extern "C" {
     fn harness_probe_start(
@@ -26,22 +86,8 @@ extern "C" {
         stdout: i32,
         stderr: i32,
         stdin: i32,
+        launch_error: *mut i32,
     ) -> *mut c_void;
-    fn harness_session_start(
-        path: *const libc::c_char,
-        cwd: *const libc::c_char,
-        team: *const libc::c_char,
-        identifier: *const libc::c_char,
-        platform_test: bool,
-        env: *const *const libc::c_char,
-        envc: usize,
-        argv: *const *const libc::c_char,
-        argc: usize,
-        stdout: i32,
-        stderr: i32,
-        stdin: i32,
-    ) -> *mut c_void;
-    fn harness_choose_folder() -> *mut libc::c_char;
     fn harness_probe_poll(handle: *mut c_void, code: *mut i32) -> bool;
     fn harness_probe_cancel(handle: *mut c_void);
     fn harness_probe_wait(handle: *mut c_void);
@@ -126,15 +172,21 @@ impl Drop for Task {
         } else {
             // SAFETY: still owned; public Process API handles its process identity.
             unsafe { harness_probe_cancel(handle as *mut c_void) };
+            // Release the lane only after the reaper has collected the process.
+            // If a thread cannot be allocated, retain the process and fail closed
+            // for the lifetime of the app instead of admitting another probe.
             let permit = self.permit.take();
-            // Transfer exclusive ownership to a reaper, without a raw-PID signal.
-            std::thread::spawn(move || {
+            let held = permit.is_some();
+            std::mem::forget(permit);
+            let _ = std::thread::Builder::new().spawn(move || {
                 // SAFETY: this is now the sole owner; Process is NS_SWIFT_SENDABLE.
                 unsafe {
                     harness_probe_wait(handle as *mut c_void);
                     harness_probe_release(handle as *mut c_void);
                 }
-                drop(permit);
+                if held {
+                    drop(Permit);
+                }
             });
         }
     }
@@ -193,30 +245,41 @@ fn run_with_hook(
     pin_release: bool,
     before_spawn: impl FnOnce(),
 ) -> Result<Capture, ProbeError> {
+    require_launch_requirements()?;
+    if pin_release && !policy.platform_test && policy.release_cdhash.len() != 40 {
+        return Err(ProbeError::Verification);
+    }
+    capture_with_hook(path, home, policy, args, timeout, pin_release, before_spawn)
+}
+
+fn capture_with_hook(
+    path: &Path,
+    home: &Path,
+    policy: SignaturePolicy,
+    args: &[&str],
+    timeout: Duration,
+    pin_release: bool,
+    before_spawn: impl FnOnce(),
+) -> Result<Capture, ProbeError> {
     // Status is not inference, but serialize it to bound native subprocess use.
     // A hung cleanup retains this slot; repeated refreshes cannot leak children.
     ACTIVE
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| ProbeError::CleanupPending)?;
+        .map_err(|_| ProbeError::Busy)?;
     let permit = Permit;
     if !path.is_absolute() || !home.is_absolute() {
         return Err(ProbeError::Verification);
     }
-    // The same fixed environment and neutral folder as the pinned path in the bridge.
-    let env = c_strings(&[
-        format!("HOME={}", home.to_string_lossy()),
-        "PATH=/usr/bin:/bin:/usr/sbin:/sbin".to_owned(),
-        "LANG=en_US.UTF-8".to_owned(),
-        "LC_ALL=C".to_owned(),
-    ])?;
-    let env_ptrs: Vec<_> = env.iter().map(|s| s.as_ptr()).collect();
-    let root = CString::new("/").map_err(|_| ProbeError::Failed)?;
     let path = cstring(path.as_os_str())?;
     let home = cstring(home.as_os_str())?;
     let team = CString::new(policy.team).map_err(|_| ProbeError::Verification)?;
     let identifier = CString::new(policy.identifier).map_err(|_| ProbeError::Verification)?;
-    let release_cdhash =
-        CString::new(policy.release_cdhash).map_err(|_| ProbeError::Verification)?;
+    let release_cdhash = CString::new(if pin_release {
+        policy.release_cdhash
+    } else {
+        ""
+    })
+    .map_err(|_| ProbeError::Verification)?;
     let arguments: Vec<CString> = args
         .iter()
         .map(|s| CString::new(*s).map_err(|_| ProbeError::Failed))
@@ -228,40 +291,29 @@ fn run_with_hook(
     // SAFETY: strings and arrays live through the synchronous call; the native
     // bridge installs the code requirement BEFORE Process.run. Only inherited
     // pipe descriptors are passed, never handles for candidate file contents.
+    let mut launch_error = 0;
     let handle = unsafe {
-        if pin_release {
-            harness_probe_start(
-                path.as_ptr(),
-                home.as_ptr(),
-                team.as_ptr(),
-                identifier.as_ptr(),
-                release_cdhash.as_ptr(),
-                policy.platform_test,
-                argv.as_ptr(),
-                argv.len(),
-                out_write.as_raw_fd(),
-                err_write.as_raw_fd(),
-                -1,
-            )
-        } else {
-            harness_session_start(
-                path.as_ptr(),
-                root.as_ptr(),
-                team.as_ptr(),
-                identifier.as_ptr(),
-                policy.platform_test,
-                env_ptrs.as_ptr(),
-                env_ptrs.len(),
-                argv.as_ptr(),
-                argv.len(),
-                out_write.as_raw_fd(),
-                err_write.as_raw_fd(),
-                -1,
-            )
-        }
+        harness_probe_start(
+            path.as_ptr(),
+            home.as_ptr(),
+            team.as_ptr(),
+            identifier.as_ptr(),
+            release_cdhash.as_ptr(),
+            policy.platform_test,
+            argv.as_ptr(),
+            argv.len(),
+            out_write.as_raw_fd(),
+            err_write.as_raw_fd(),
+            -1,
+            &mut launch_error,
+        )
     };
     if handle.is_null() {
-        return Err(ProbeError::Verification);
+        return Err(if launch_error == libc::ENOENT {
+            ProbeError::Missing
+        } else {
+            ProbeError::Verification
+        });
     }
     let task = Task {
         handle: handle as usize,
@@ -291,7 +343,13 @@ fn run_with_hook(
                 return Err(ProbeError::OutputLimit);
             }
             if code < 0 {
-                return Err(ProbeError::Verification);
+                // A killed image that produced bytes was able to execute.
+                // The negative host controls must never count that as refusal.
+                return Err(if stdout.is_empty() && stderr.is_empty() {
+                    ProbeError::Verification
+                } else {
+                    ProbeError::Failed
+                });
             }
             return Ok(Capture {
                 code,
@@ -311,6 +369,10 @@ pub(super) fn terminal_login(
     policy: SignaturePolicy,
     args: &[&str],
 ) -> Result<i32, ProbeError> {
+    require_launch_requirements()?;
+    if policy.release_cdhash.len() != 40 {
+        return Err(ProbeError::Verification);
+    }
     let path = cstring(path.as_os_str())?;
     let home = cstring(home.as_os_str())?;
     let team = CString::new(policy.team).map_err(|_| ProbeError::Verification)?;
@@ -324,6 +386,7 @@ pub(super) fn terminal_login(
     let argv: Vec<_> = arguments.iter().map(|s| s.as_ptr()).collect();
     // SAFETY: same bridge and kernel requirement as probes; only standard
     // Terminal descriptors are inherited. No general command path is exposed.
+    let mut launch_error = 0;
     let handle = unsafe {
         harness_probe_start(
             path.as_ptr(),
@@ -337,10 +400,15 @@ pub(super) fn terminal_login(
             1,
             2,
             0,
+            &mut launch_error,
         )
     };
     if handle.is_null() {
-        return Err(ProbeError::Verification);
+        return Err(if launch_error == libc::ENOENT {
+            ProbeError::Missing
+        } else {
+            ProbeError::Verification
+        });
     }
     let task = Task {
         handle: handle as usize,
@@ -351,144 +419,17 @@ pub(super) fn terminal_login(
     task.exited().ok_or(ProbeError::Failed)
 }
 
-fn c_strings(values: &[String]) -> Result<Vec<CString>, ProbeError> {
-    values
-        .iter()
-        .map(|s| CString::new(s.as_str()).map_err(|_| ProbeError::Failed))
-        .collect()
-}
-
-/// Human-driven interactive CLI on the wrapper's own controlling terminal. The
-/// kernel applies the vendor identity at launch. `stdio` is (stdout, stderr, stdin);
-/// a stdin below zero means no terminal, for the pipe-based tests.
-pub(super) fn session(
-    path: &Path,
-    cwd: &Path,
-    policy: SignaturePolicy,
-    env: &[String],
-    args: &[String],
-    stdio: (i32, i32, i32),
-) -> Result<i32, ProbeError> {
-    let path = cstring(path.as_os_str())?;
-    let cwd = cstring(cwd.as_os_str())?;
-    let team = CString::new(policy.team).map_err(|_| ProbeError::Verification)?;
-    let identifier = CString::new(policy.identifier).map_err(|_| ProbeError::Verification)?;
-    let env = c_strings(env)?;
-    let env_ptrs: Vec<_> = env.iter().map(|s| s.as_ptr()).collect();
-    let args = c_strings(args)?;
-    let arg_ptrs: Vec<_> = args.iter().map(|s| s.as_ptr()).collect();
-    // SAFETY: strings and arrays live through the synchronous call; the bridge
-    // installs the code requirement before Process.run.
-    let handle = unsafe {
-        harness_session_start(
-            path.as_ptr(),
-            cwd.as_ptr(),
-            team.as_ptr(),
-            identifier.as_ptr(),
-            policy.platform_test,
-            env_ptrs.as_ptr(),
-            env_ptrs.len(),
-            arg_ptrs.as_ptr(),
-            arg_ptrs.len(),
-            stdio.0,
-            stdio.1,
-            stdio.2,
-        )
-    };
-    if handle.is_null() {
-        return Err(ProbeError::Verification);
-    }
-    let task = Task {
-        handle: handle as usize,
-        permit: None,
-    };
-    // SAFETY: the human owns this session, and Foundation owns the process.
-    unsafe { harness_probe_wait(handle) };
-    task.exited().ok_or(ProbeError::Failed)
-}
-
-/// The native folder panel. Call on the main thread only.
-pub(super) fn choose_folder() -> Option<std::path::PathBuf> {
-    // SAFETY: the bridge returns a malloc'd C string or null; it is copied, then freed once.
-    unsafe {
-        let raw = harness_choose_folder();
-        if raw.is_null() {
-            return None;
-        }
-        let bytes = std::ffi::CStr::from_ptr(raw).to_bytes().to_vec();
-        libc::free(raw.cast());
-        Some(std::path::PathBuf::from(OsStr::from_bytes(&bytes)))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
 
-    fn session_output(
-        path: &str,
-        identifier: &'static str,
-        cwd: &Path,
-        env: &[String],
-    ) -> Result<(i32, String), ProbeError> {
-        let policy = SignaturePolicy {
-            team: "",
-            identifier,
-            release_cdhash: "",
-            platform_test: true,
-        };
-        let (out, write) = pipe()?;
-        let code = session(
-            Path::new(path),
-            cwd,
-            policy,
-            env,
-            &[],
-            (write.as_raw_fd(), write.as_raw_fd(), -1),
-        )?;
-        drop(write);
-        let mut bytes = Vec::new();
-        drain(&out, &mut bytes)?;
-        Ok((code, String::from_utf8_lossy(&bytes).into_owned()))
-    }
-
-    #[test]
-    fn a_session_runs_in_the_chosen_folder_with_only_the_given_environment() {
-        let dir = tempfile::tempdir().unwrap();
-        let folder = dir.path().canonicalize().unwrap();
-        let (code, pwd) =
-            session_output("/bin/pwd", "com.apple.pwd", &folder, &["A=1".into()]).unwrap();
-        assert_eq!(code, 0);
-        assert_eq!(pwd.trim(), folder.to_str().unwrap());
-        // SAFETY: test process; the variable is unique to this test.
-        unsafe { std::env::set_var("HARNESS_TEST_MUST_NOT_LEAK", "leaked") };
-        let (code, env) = session_output(
-            "/usr/bin/env",
-            "com.apple.env",
-            &folder,
-            &["ONLY=this=value".into()],
-        )
-        .unwrap();
-        assert_eq!(code, 0);
-        assert_eq!(env.trim(), "ONLY=this=value");
-    }
-
-    #[test]
-    fn a_foreground_child_that_stops_is_continued_and_keeps_its_exit_code() {
-        extern "C" {
-            fn harness_test_continue_owned_child(stops: bool) -> i32;
-        }
-        // SAFETY: test-only bridge. It spawns /bin/sh, not a provider CLI.
-        let plain = unsafe { harness_test_continue_owned_child(false) };
-        assert_eq!(plain, 4, "a normal exit was not preserved");
-        let stopped = unsafe { harness_test_continue_owned_child(true) };
-        assert_eq!(stopped, 9, "a stopped child was not continued");
-    }
-
     #[test]
     fn the_any_release_probe_still_enforces_the_vendor_identity() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !supported_or_refused() {
+            return;
+        }
         // A release hash that does not match is ignored on this lane.
         let policy = SignaturePolicy {
             release_cdhash: "0000000000000000000000000000000000000000",
@@ -520,52 +461,97 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn the_kernel_refuses_a_session_for_the_wrong_identity() {
-        // The kernel refuses either at launch or by killing the image before its first instruction.
-        let refused = session_output("/bin/pwd", "com.apple.echo", Path::new("/"), &[]);
-        match refused {
-            Err(ProbeError::Verification) => {}
-            Ok((code, output)) => {
-                assert!(code < 0, "ran with exit code {code}");
-                assert_eq!(output, "", "the refused image printed output");
-            }
-            Err(other) => panic!("unexpected: {other}"),
-        }
-        let vendor = SignaturePolicy {
-            team: "Q6L2SF6YDW",
-            identifier: "com.apple.pwd",
-            release_cdhash: "",
-            platform_test: false,
-        };
-        assert!(!matches!(
-            session(
-                Path::new("/bin/pwd"),
-                Path::new("/"),
-                vendor,
-                &[],
-                &[],
-                (1, 2, -1)
-            ),
-            Ok(0)
-        ));
-    }
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::Mutex;
 
     // Keep these process-global lane tests sequential while the rest of the
     // crate's tests remain parallel. They never invoke an actual provider.
     static SERIAL: Mutex<()> = Mutex::new(());
-    const ECHO: SignaturePolicy = SignaturePolicy {
-        team: "",
-        identifier: "com.apple.echo",
-        release_cdhash: "",
-        platform_test: true,
-    };
+    const ECHO: SignaturePolicy = PLATFORM_ECHO;
+
+    fn supported_or_refused() -> bool {
+        match require_launch_requirements() {
+            Ok(()) => true,
+            Err(ProbeError::IdentityGateUnavailable) => {
+                assert!(matches!(
+                    run_with_hook(
+                        Path::new("/bin/echo"),
+                        Path::new("/var/empty"),
+                        ECHO,
+                        &[],
+                        Duration::from_secs(2),
+                        true,
+                        || panic!("unverified host reached a launch"),
+                    ),
+                    Err(ProbeError::IdentityGateUnavailable)
+                ));
+                assert!(matches!(
+                    terminal_login(Path::new("/bin/echo"), Path::new("/var/empty"), ECHO, &[]),
+                    Err(ProbeError::IdentityGateUnavailable)
+                ));
+                false
+            }
+            Err(error) => panic!("unexpected host check result: {error}"),
+        }
+    }
 
     #[test]
-    fn the_kernel_allows_the_exact_signed_image_and_passes_arguments_as_data() {
-        let _serial = SERIAL.lock().unwrap();
+    fn production_launch_gate_checks_this_host() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        if supported_or_refused() {
+            eprintln!("launch requirements enforced by this host");
+        } else {
+            eprintln!("host did not enforce launch requirements; provider launch refused");
+        }
+    }
+
+    #[test]
+    fn the_host_check_requires_the_positive_and_every_negative_control() {
+        fn success() -> Result<Capture, ProbeError> {
+            Ok(Capture {
+                code: 0,
+                stdout: "harness identity check\n".into(),
+                stderr: String::new(),
+            })
+        }
+
+        let is_allowed = |policy: SignaturePolicy| {
+            policy.platform_test
+                && policy.identifier == PLATFORM_ECHO.identifier
+                && policy.release_cdhash.is_empty()
+        };
+        assert!(attests_launch_requirements(|policy| {
+            if is_allowed(policy) {
+                success()
+            } else {
+                Err(ProbeError::Verification)
+            }
+        }));
+        for ignores in 0..3 {
+            assert!(!attests_launch_requirements(|policy| {
+                let ignored = match ignores {
+                    0 => policy.identifier != PLATFORM_ECHO.identifier,
+                    1 => !policy.release_cdhash.is_empty(),
+                    _ => !policy.platform_test,
+                };
+                if is_allowed(policy) || ignored {
+                    success()
+                } else {
+                    Err(ProbeError::Verification)
+                }
+            }));
+        }
+        assert!(!attests_launch_requirements(|_| Err(
+            ProbeError::Verification
+        )));
+    }
+
+    #[test]
+    fn the_kernel_allows_the_signed_image_and_passes_arguments_as_data() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !supported_or_refused() {
+            return;
+        }
         let text = "literal ; $(touch unwanted) <script>data</script>";
         let result = run(
             Path::new("/bin/echo"),
@@ -581,7 +567,10 @@ mod tests {
 
     #[test]
     fn the_kernel_refuses_a_wrong_signer() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !supported_or_refused() {
+            return;
+        }
         let wrong = SignaturePolicy {
             team: "untrusted",
             identifier: "com.apple.echo",
@@ -602,7 +591,10 @@ mod tests {
 
     #[test]
     fn the_kernel_refuses_a_different_release_with_the_same_signer_and_identifier() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !supported_or_refused() {
+            return;
+        }
         let policy = SignaturePolicy {
             release_cdhash: "0000000000000000000000000000000000000000",
             ..ECHO
@@ -621,7 +613,10 @@ mod tests {
 
     #[test]
     fn a_swapped_script_never_reaches_its_first_instruction() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !supported_or_refused() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("candidate");
         let marker = dir.path().join("must-not-exist");
@@ -649,7 +644,10 @@ mod tests {
 
     #[test]
     fn a_parent_swap_cannot_launch_a_different_signed_image() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !supported_or_refused() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().join("install");
         fs::create_dir(&parent).unwrap();
@@ -673,7 +671,10 @@ mod tests {
 
     #[test]
     fn timeouts_stop_the_owned_process_before_releasing_the_lane() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !supported_or_refused() {
+            return;
+        }
         let policy = SignaturePolicy {
             team: "",
             identifier: "com.apple.sleep",
@@ -698,7 +699,10 @@ mod tests {
 
     #[test]
     fn output_is_bounded_and_the_process_is_stopped() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !supported_or_refused() {
+            return;
+        }
         let policy = SignaturePolicy {
             team: "",
             identifier: "com.apple.yes",
@@ -716,6 +720,25 @@ mod tests {
             Err(ProbeError::OutputLimit)
         ));
         assert!(!ACTIVE.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_missing_image_does_not_claim_a_signature_failure() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !supported_or_refused() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            run_any_release(
+                &dir.path().join("missing"),
+                Path::new("/var/empty"),
+                ECHO,
+                &[],
+                Duration::from_secs(5),
+            ),
+            Err(ProbeError::Missing)
+        ));
     }
 
     #[test]

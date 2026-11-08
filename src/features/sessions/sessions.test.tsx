@@ -1,7 +1,8 @@
 // The Sessions screen against the mock backend, with a stand-in for xterm (it needs real layout).
-import { screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { App } from "@/app/app";
 import { createMockIpc } from "@/lib/ipc/mock";
 import { renderRoute } from "@/test/render";
 
@@ -70,6 +71,17 @@ async function openClaude() {
   await view.user.click(open);
   return view;
 }
+
+it("keeps the native Sessions route closed without mounting a terminal", async () => {
+  const mock = createMockIpc({ scenario: "fresh" });
+  window.location.hash = "#/sessions";
+  render(<App bundle={{ ...mock, mode: "native" }} />);
+  expect(await screen.findByText("Embedded terminals are unavailable")).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Open Providers" })).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Choose" })).toBeNull();
+  expect(mock.control.calls).toHaveLength(0);
+  expect(xterm.options).toHaveLength(0);
+});
 
 describe("opening a terminal", () => {
   it("cannot start without a folder", async () => {

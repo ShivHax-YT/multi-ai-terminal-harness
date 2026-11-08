@@ -1509,7 +1509,8 @@ eq "capture dir rejects a bad cli name (rc)" "2" "$?"
 CAPREPO="$SANDBOX/caprepo"
 sbx_mkdir "$CAPREPO"
 check "the capture repo directory exists" test -d "$CAPREPO"
-git -C "$CAPREPO" init -q
+env -i PATH=/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CAPREPO" init -q --template=
 SPIKE_CAPTURES_ROOT="$CAPREPO/captures" spike_capture_dir demo >/dev/null 2>&1
 eq "capture dir refuses a root inside a repo that does not ignore it (rc)" "2" "$?"
 check "refused capture root was not created" test ! -e "$CAPREPO/captures"

@@ -58,14 +58,6 @@ mod plan {
         assert!(out.is_empty(), "{name}: {out:#?}");
     }
 
-    /// plan-approved.json with `approval.plan_hash` set to this module's hash of the plan.
-    fn bound_approved() -> Value {
-        let mut v = example_json("plan-approved.json");
-        let hash = plan_of(&v).hash().to_owned();
-        v["approval"]["plan_hash"] = json!(hash);
-        v
-    }
-
     fn fb(provider: &str) -> Value {
         json!({"provider": provider, "auth_mode": "subscription"})
     }
@@ -79,18 +71,26 @@ mod plan {
         assert_eq!(model.tasks.len(), 4);
         assert_eq!(model.tasks[2].depends_on, ["t1", "t2"]);
         assert!(model.approval.is_none());
-        // Approved and correctly bound to this module's hash: passes in both modes. (The hash stored in
-        // plan-approved.json is the spike's newline-framed one, so it is rebound here; see the T-116 handoff.)
-        let approved = plan_of(&bound_approved());
+        let approved = Plan::from_bytes(&example("plan-approved.json")).unwrap();
         assert_eq!(lines(&approved, Mode::Pre), Vec::<String>::new());
         assert!(lines(&approved, Mode::Scheduler).is_empty());
         assert!(approved.model().unwrap().approval.is_some());
-        // The stored spike hash does not verify: the mismatch is reported, never accepted.
-        let stored = Plan::from_bytes(&example("plan-approved.json")).unwrap();
-        assert!(lines(&stored, Mode::Scheduler)
-            .iter()
-            .any(|l| l.contains("does not match computed plan hash")));
         assert_eq!(model.summary_budget_tokens, 200);
+    }
+
+    #[test]
+    fn oversized_diagnostics_stay_bounded() {
+        let doc = valid(|v| {
+            v["tasks"][0]["id"] = json!("A".repeat(32 * 1024));
+            v["tasks"][0]["fallback_providers"] = json!(vec![false; 256]);
+        });
+        let violations = plan_of(&doc).check(Mode::Pre);
+        assert_eq!(violations.len(), 129);
+        assert_eq!(
+            violations.last().unwrap().message,
+            "additional plan violations omitted"
+        );
+        assert!(serde_json::to_vec(&violations).unwrap().len() < 32 * 1024);
     }
 
     #[test]

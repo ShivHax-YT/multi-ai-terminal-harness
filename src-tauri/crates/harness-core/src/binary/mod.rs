@@ -1,12 +1,12 @@
 //! Official native CLI discovery and pinned signing policy (T-133).
 //! No PATH search, npm/shim launch, credential-file read, or generic command API.
 
-use crate::fs_guard::{self, FileGuard, NullSink};
+use crate::fs_guard;
 use crate::process::{self, Capture, ProbeError, SignaturePolicy};
 use crate::provider::ProviderId;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 #[derive(Deserialize)]
 struct Pins {
@@ -33,12 +33,6 @@ fn pin(provider: ProviderId) -> Option<&'static Pin> {
     .find(|pin| pin.provider == provider)
 }
 
-pub(crate) enum Discovery {
-    Missing,
-    Unverified,
-    Found(InstalledCli),
-}
-
 pub(crate) struct InstalledCli {
     pub path: PathBuf,
     home: PathBuf,
@@ -60,19 +54,6 @@ impl InstalledCli {
             _ => return Err(ProbeError::Unsupported),
         };
         process::terminal_login(&self.path, &self.home, self.policy, args)
-    }
-
-    /// The CLI's own interactive mode, no arguments, for a human on a real terminal.
-    pub fn terminal_session(
-        &self,
-        cwd: &Path,
-        ambient: &[(String, String)],
-    ) -> Result<i32, ProbeError> {
-        let env: Vec<String> = session_env(&self.home, ambient)
-            .into_iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect();
-        process::terminal_session(&self.path, cwd, self.policy, &env)
     }
 
     fn probe_args(&self, command: ProbeCommand) -> Result<&'static [&'static str], ProbeError> {
@@ -98,100 +79,92 @@ impl InstalledCli {
     }
 }
 
-/// Everything an interactive CLI may inherit from the launch environment. This is an allowlist, so a config-home
-/// override (rule 2) or anything else set in the app's environment never reaches a CLI.
-const SESSION_ENV_PASSTHROUGH: [&str; 3] = ["SHELL", "TMPDIR", "SSH_AUTH_SOCK"];
-
-/// The whole environment of a human terminal session (rules 2 and 4). The CLI keeps its default config home.
-pub fn session_env(home: &Path, ambient: &[(String, String)]) -> Vec<(String, String)> {
-    let home_text = home.to_string_lossy();
-    let path = format!(
-        "{home_text}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-    );
-    let mut env = vec![
-        ("HOME".to_owned(), home_text.into_owned()),
-        ("PATH".to_owned(), path),
-        ("TERM".to_owned(), "xterm-256color".to_owned()),
-        ("COLORTERM".to_owned(), "truecolor".to_owned()),
-        ("LANG".to_owned(), "en_US.UTF-8".to_owned()),
-    ];
-    for (key, value) in ambient {
-        if SESSION_ENV_PASSTHROUGH.contains(&key.as_str()) {
-            env.push((key.clone(), value.clone()));
-        }
-    }
-    env
-}
-
 pub(crate) fn install_hint(provider: ProviderId) -> Option<&'static str> {
     pin(provider).map(|pin| pin.install_hint.as_str())
 }
 
-pub(crate) fn discover(provider: ProviderId) -> Discovery {
-    let Some(pin) = pin(provider) else {
-        return Discovery::Missing;
-    };
-    let Ok(home) = fs_guard::account_home() else {
-        return Discovery::Unverified;
-    };
-    let Ok(guard) = FileGuard::new(&home, Arc::new(NullSink)) else {
-        return Discovery::Unverified;
-    };
-    // Documented native installation entrypoints only. The CLI-specific guard
-    // exception resolves the public executable, never siblings in its store.
+/// Try documented entrypoints without inspecting candidate paths or the CLI stores.
+/// Only a missing entrypoint allows fallback. The kernel checks each launched image.
+pub(crate) fn try_candidates<T>(
+    provider: ProviderId,
+    invoke: impl FnMut(&InstalledCli) -> Result<T, ProbeError>,
+) -> Result<(InstalledCli, T), ProbeError> {
+    let policy = pin(provider).ok_or(ProbeError::Unsupported)?;
+    let home = fs_guard::account_home().map_err(|_| ProbeError::Failed)?;
     let candidates = [
         home.join(".local/bin").join(provider.as_str()),
         PathBuf::from("/opt/homebrew/bin").join(provider.as_str()),
         PathBuf::from("/usr/local/bin").join(provider.as_str()),
-    ];
-    for candidate in candidates {
-        match guard.exec_resolve(&candidate) {
-            Ok(path) => {
-                return Discovery::Found(InstalledCli {
-                    path,
-                    home,
-                    provider,
-                    policy: SignaturePolicy {
-                        team: &pin.team,
-                        identifier: &pin.identifier,
-                        release_cdhash: &pin.release_cdhash,
-                        platform_test: false,
-                    },
-                })
-            }
-            Err(fs_guard::GuardError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
-            // Refuse a present but unsafe preferred installation; don't silently
-            // fall through to a different binary or trust an arbitrary PATH entry.
-            Err(_) => return Discovery::Unverified,
+    ]
+    .into_iter()
+    .map(|path| InstalledCli {
+        path,
+        home: home.clone(),
+        provider,
+        policy: SignaturePolicy {
+            team: &policy.team,
+            identifier: &policy.identifier,
+            release_cdhash: &policy.release_cdhash,
+            platform_test: false,
+        },
+    });
+    first_available(candidates, invoke)
+}
+
+fn first_available<T>(
+    candidates: impl IntoIterator<Item = InstalledCli>,
+    mut invoke: impl FnMut(&InstalledCli) -> Result<T, ProbeError>,
+) -> Result<(InstalledCli, T), ProbeError> {
+    for cli in candidates {
+        match invoke(&cli) {
+            Ok(output) => return Ok((cli, output)),
+            Err(ProbeError::Missing) => continue,
+            Err(error) => return Err(error),
         }
     }
-    Discovery::Missing
+    Err(ProbeError::Missing)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
-    fn a_session_environment_is_an_allowlist_without_config_homes() {
-        // Any name outside the allowlist is dropped, including a provider's config-home override (rule 2).
-        let ambient: Vec<(String, String)> = [
-            "SOME_PROVIDER_HOME",
-            "SOME_CONFIG_DIR",
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "CLAUDECODE",
-            "SSH_AUTH_SOCK",
-        ]
-        .iter()
-        .map(|key| (key.to_string(), "x".to_string()))
-        .collect();
-        let env = session_env(Path::new("/Users/someone"), &ambient);
-        let keys: Vec<&str> = env.iter().map(|(key, _)| key.as_str()).collect();
-        assert_eq!(
-            keys,
-            ["HOME", "PATH", "TERM", "COLORTERM", "LANG", "SSH_AUTH_SOCK"]
-        );
+    fn discovery_falls_back_only_when_an_entrypoint_is_missing() {
+        let pin = pin(ProviderId::Claude).unwrap();
+        let candidates = || {
+            ["/first", "/second"].map(|path| InstalledCli {
+                path: path.into(),
+                home: "/fake-home".into(),
+                provider: ProviderId::Claude,
+                policy: SignaturePolicy {
+                    team: &pin.team,
+                    identifier: &pin.identifier,
+                    release_cdhash: &pin.release_cdhash,
+                    platform_test: false,
+                },
+            })
+        };
+        let (cli, output) = first_available(candidates(), |cli| match cli.path.to_str() {
+            Some("/first") => Err(ProbeError::Missing),
+            Some("/second") => Ok("second"),
+            _ => unreachable!(),
+        })
+        .unwrap();
+        assert_eq!(cli.path, Path::new("/second"));
+        assert_eq!(output, "second");
+        assert!(matches!(
+            first_available(candidates(), |_| Err::<(), _>(ProbeError::Missing)),
+            Err(ProbeError::Missing)
+        ));
+        assert!(matches!(
+            first_available(candidates(), |cli| {
+                assert_eq!(cli.path, Path::new("/first"));
+                Err::<(), _>(ProbeError::Verification)
+            }),
+            Err(ProbeError::Verification)
+        ));
     }
 
     #[test]

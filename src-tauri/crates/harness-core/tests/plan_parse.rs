@@ -49,9 +49,7 @@ mod plan {
 
     #[test]
     fn hash_matches_the_spike_for_the_examples() {
-        // For the plan subset `jq -S -c 'del(.approval)'` emits the same bytes as JCS, plus a trailing newline that
-        // the pipe in spike/plan/hash.sh feeds to `shasum`. The expected values below are
-        // `jq -S -c 'del(.approval)' FILE | tr -d '\n' | shasum -a 256`, i.e. sha256 of the JCS bytes alone.
+        // For these fixtures `jq -j -S -c 'del(.approval)'` emits the JCS bytes without a trailing newline.
         for (file, expected) in [
             ("plan-valid.json", VALID_HASH),
             ("plan-approved.json", VALID_HASH),
@@ -81,10 +79,7 @@ mod plan {
     }
 
     #[test]
-    fn spike_hash_differs_only_by_a_trailing_newline() {
-        // The approval hashes stored in docs/spec/examples were made by spike/plan/hash.sh, which hashes the jq output
-        // with its trailing newline. JCS has no such newline, so those stored approvals do not verify under this
-        // module's hash (reported to the lead in the T-116 handoff). Pin the relationship so it stays visible.
+    fn approval_hash_excludes_the_old_spike_newline() {
         let approved = Plan::from_bytes(&example("plan-approved.json")).unwrap();
         let mut spike_framing = approved.canonical_bytes();
         spike_framing.push(b'\n');
@@ -93,8 +88,8 @@ mod plan {
             .as_str()
             .unwrap()
             .to_owned();
-        assert_eq!(stored, spike_hash);
-        assert_ne!(stored, approved.hash());
+        assert_eq!(stored, approved.hash());
+        assert_ne!(stored, spike_hash);
     }
 
     fn example_json(name: &str) -> serde_json::Value {

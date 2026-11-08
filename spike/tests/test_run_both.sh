@@ -245,9 +245,13 @@ eq "--dry-run --keep exits 0" "0" "$(gated --dry-run --keep)"
 eq "dry-run output is the same with SPIKE_LIVE unset" "$DRY" "$(cat "$TMP/gate.out")"
 
 # ---- ROOT is under spike/captures and git ignores it ---------------------------------------------------------------------------
-if git -C "$REPO_TOP" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  check "git ignores spike/captures/run-both/<stamp>/claude/<ts>/raw.jsonl" git -C "$REPO_TOP" check-ignore -q -- "spike/captures/run-both/20260101T000000Z/claude/20260101T000001Z/raw.jsonl"
-  check "git ignores spike/captures/run-both/<stamp>/run-both.json" git -C "$REPO_TOP" check-ignore -q -- "spike/captures/run-both/20260101T000000Z/run-both.json"
+fixture_git() {
+  env -i PATH=/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_NOSYSTEM=1 git -c core.excludesFile=/dev/null "$@"
+}
+if fixture_git -C "$REPO_TOP" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  check "git ignores spike/captures/run-both/<stamp>/claude/<ts>/raw.jsonl" fixture_git -C "$REPO_TOP" check-ignore -q -- "spike/captures/run-both/20260101T000000Z/claude/20260101T000001Z/raw.jsonl"
+  check "git ignores spike/captures/run-both/<stamp>/run-both.json" fixture_git -C "$REPO_TOP" check-ignore -q -- "spike/captures/run-both/20260101T000000Z/run-both.json"
 else
   ok
   ok

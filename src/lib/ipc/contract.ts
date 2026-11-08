@@ -166,7 +166,7 @@ export type KillSwitchState = "enabled" | "disabled" | "api_key_only" | "unknown
 
 export interface BinaryCheck {
   kind: "codesign" | "checksum" | "install_source";
-  result: "pass" | "fail" | "not_applicable";
+  result: "pass" | "fail" | "not_applicable" | "not_checked";
   detail: string;
 }
 
@@ -176,7 +176,7 @@ export interface ProviderStatus {
   /** API-key-only providers list ["api_key"] only (rule 7). */
   auth_modes: AuthMode[];
   install: {
-    state: "installed" | "not_installed";
+    state: "installed" | "not_installed" | "unknown";
     version?: string;
     path?: string;
     install_hint?: string;
@@ -186,7 +186,7 @@ export interface ProviderStatus {
     state: "verified" | "failed" | "unchecked";
     /** Kernel image identity does not establish full-file integrity. */
     verification_scope?: "kernel_identity" | "full_integrity";
-    /** False: an official release newer than the one reviewed for this build. Work must never dispatch to it. */
+    /** False: an official release that does not match this build’s reviewed pin. */
     release_reviewed?: boolean;
     checked_at?: string;
     checks: BinaryCheck[];
@@ -439,7 +439,7 @@ export interface KillSwitchStatus {
   adapters: { provider: ProviderId; state: KillSwitchState; reason?: string }[];
 }
 
-// The sample workflow is explicitly simulated. Native runs use real Git worktrees; browser runs use memory only.
+// Native can preview a sample plan. Browser-only simulation runs in memory.
 export interface SimResult {
   isolation: "git_worktree" | "browser_memory";
   worktree: string;
@@ -464,7 +464,7 @@ export interface SimSnapshot {
 
 // ---- commands -----------------------------------------------------------------------------------------------------
 
-/** Every command, in contract order. Must equal lib.rs generate_handler!, build.rs and the capability (parity test). */
+/** Shared command names. Only NativeCommandName is available in the Tauri manifest and capability. */
 export const COMMANDS = [
   "sim_snapshot",
   "sim_submit",
@@ -508,6 +508,17 @@ export const COMMANDS = [
 ] as const;
 
 export type CommandName = (typeof COMMANDS)[number];
+
+/** Browser fixture actions have no corresponding native IPC grant or handler. */
+export const BROWSER_ONLY_COMMANDS = [
+  "sim_approve_plan",
+  "sim_run",
+  "start_terminal",
+  "choose_terminal_folder",
+  "pty_write",
+] as const satisfies readonly CommandName[];
+
+export type NativeCommandName = Exclude<CommandName, (typeof BROWSER_ONLY_COMMANDS)[number]>;
 
 /** Commands reachable only through a port module (rule 9: ApprovalPort; rule 3: PtyInputPort). */
 export type PortCommandName = "approve_plan" | "sim_approve_plan" | "pty_write";

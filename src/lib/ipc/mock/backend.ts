@@ -121,6 +121,7 @@ function randomHex(bytes: number): string {
   return [...buf].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/** After setup, a plan mutation replaces the record so its identity is a revision. */
 interface PlanRecord {
   plan: Plan;
   status: PlanStatus;
@@ -614,6 +615,19 @@ export class MockBackend {
     return this.plans.get(planId) ?? notFound("plan");
   }
 
+  private publishPlan(previous: PlanRecord, next: PlanRecord, view: PlanView): PlanView {
+    const id = previous.plan.plan_id;
+    if (this.plans.get(id) !== previous) {
+      return reject({
+        kind: "plan_hash_mismatch",
+        message: "The plan changed since you reviewed it. Review it again.",
+      });
+    }
+    this.plans.set(id, next);
+    this.emit("plan_changed", view);
+    return view;
+  }
+
   private session(sessionId: unknown): SessionView {
     if (typeof sessionId !== "string") return invalid("session_id must be a string");
     return this.sessions.get(sessionId) ?? notFound("session");
@@ -885,15 +899,15 @@ export class MockBackend {
         if (record.status !== "draft" && record.status !== "approved") {
           return invalid(`A ${record.status} plan cannot be edited.`);
         }
-        applyEdit(record.plan, args.edit);
-        if (record.plan.approval !== undefined) {
-          delete record.plan.approval;
-          record.needs_reapproval = true;
-        }
-        record.status = "draft";
-        const view = await this.planView(record);
-        this.emit("plan_changed", view);
-        return view;
+        const plan = clone<Plan>(record.plan);
+        applyEdit(plan, args.edit);
+        const next: PlanRecord = {
+          plan,
+          status: "draft",
+          needs_reapproval: record.needs_reapproval || plan.approval !== undefined,
+        };
+        delete plan.approval;
+        return this.publishPlan(record, next, await this.planView(next));
       }),
 
     discard_plan: (args) =>
@@ -1156,17 +1170,22 @@ export class MockBackend {
             message: `The plan has ${String(view.violations.length)} open violation(s).`,
           });
         }
-        record.plan.approval = {
-          plan_hash: view.plan_hash,
-          approved_at: this.nowIso(),
-          approved_via: "ui",
-          nonce: randomHex(16),
+        const next: PlanRecord = {
+          plan: {
+            ...record.plan,
+            approval: {
+              plan_hash: view.plan_hash,
+              approved_at: this.nowIso(),
+              approved_via: "ui",
+              nonce: randomHex(16),
+            },
+          },
+          status: "approved",
+          needs_reapproval: false,
         };
-        record.status = "approved";
-        record.needs_reapproval = false;
-        const out = await this.planView(record);
-        this.emit("plan_changed", out);
-        return out;
+        // Approval is excluded from the digest, so the checked snapshot supplies
+        // the hash and estimates without another asynchronous digest.
+        return this.publishPlan(record, next, { ...view, ...next });
       }),
   };
 

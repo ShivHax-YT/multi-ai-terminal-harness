@@ -1249,7 +1249,7 @@ fn module_sources(dir: &str) -> Vec<(String, String)> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src")
         .join(dir);
-    let guard = FileGuard::new(std::path::Path::new("/"), std::sync::Arc::new(NullSink)).unwrap();
+    let guard = FileGuard::for_test(&[], std::sync::Arc::new(NullSink));
     guard.register_root(RootKind::Repo, &root).unwrap();
     let mut out = Vec::new();
     for entry in guard.read_dir(&root).unwrap() {

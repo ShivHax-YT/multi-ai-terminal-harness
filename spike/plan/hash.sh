@@ -1,7 +1,7 @@
 #!/bin/bash
 # Plan hashing and approval-binding helper (T-005, docs/spec/plan.md).
 #
-#   hash.sh FILE                          print the plan hash: sha256 of `jq -S -c 'del(.approval)'`
+#   hash.sh FILE                          print the plan hash: sha256 of `jq -j -S -c 'del(.approval)'`
 #   hash.sh --check FILE                  pre-approval check (the UI warning): exit 1 on any violation
 #   hash.sh --check --require-approval FILE
 #                                         scheduler check: also rejects a plan with no approval (rule 9)
@@ -37,7 +37,7 @@ load_plan() {
 }
 
 plan_hash() {
-  jq -S -c 'del(.approval)' "$PLAN" | shasum -a 256 | cut -d' ' -f1
+  jq -j -S -c 'del(.approval)' "$PLAN" | shasum -a 256 | cut -d' ' -f1
 }
 
 check_plan() {

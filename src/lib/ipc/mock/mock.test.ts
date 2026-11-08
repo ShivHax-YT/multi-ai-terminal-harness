@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { IpcRejection, type IpcError, type PlanView, type ProviderId } from "../contract";
 import planJson from "../fixtures/plan.json";
@@ -349,6 +349,42 @@ describe("lead and plans (rule 9)", () => {
     });
     const again = await m.approval.approve_plan({ plan_id: PLAN_ID, plan_hash: edited.plan_hash });
     expect(again.needs_reapproval).toBe(false);
+  });
+
+  it("refuses approval if the plan changes while its digest is in flight", async () => {
+    const m = createMockIpc({ scenario: "plan_draft" });
+    const view = await m.client.get_plan({ plan_id: PLAN_ID });
+    let enter: () => void = () => undefined;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    let resume: () => void = () => undefined;
+    const paused = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const digest = crypto.subtle.digest.bind(crypto.subtle);
+    const spy = vi
+      .spyOn(crypto.subtle, "digest")
+      .mockImplementationOnce(async (algorithm, data) => {
+        enter();
+        await paused;
+        return digest(algorithm, data);
+      });
+    try {
+      const pending = m.approval.approve_plan({ plan_id: PLAN_ID, plan_hash: view.plan_hash });
+      await entered;
+      const edited = await m.client.update_plan({
+        plan_id: PLAN_ID,
+        edit: { kind: "set_acceptance", task_id: "t3", acceptance: ["Changed during approval"] },
+      });
+      expect(edited.plan_hash).not.toBe(view.plan_hash);
+      resume();
+      expect(await rejection(pending)).toMatchObject({ kind: "plan_hash_mismatch" });
+      expect(await m.client.get_plan({ plan_id: PLAN_ID })).toEqual(edited);
+    } finally {
+      resume();
+      spy.mockRestore();
+    }
   });
 
   it("an edit that makes a fallback the task's own provider opens a rule 2 violation", async () => {

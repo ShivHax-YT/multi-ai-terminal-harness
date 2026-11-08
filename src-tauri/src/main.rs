@@ -3,20 +3,12 @@
 
 use harness_core::provider::ProviderId;
 
-/// The closed command-line modes. Each runs one official CLI for the human on the current terminal.
-#[derive(Debug, PartialEq, Eq)]
-enum Mode {
-    Login(ProviderId),
-    Session(ProviderId),
-}
-
-fn closed_mode(arguments: &[String]) -> Result<Option<Mode>, &'static str> {
+/// Only a documented human-owned login command can be invoked from an existing terminal.
+fn closed_login(arguments: &[String]) -> Result<Option<ProviderId>, &'static str> {
     if let [mode] = arguments {
         let parsed = match mode.as_str() {
-            "--provider-login=claude" => Some(Mode::Login(ProviderId::Claude)),
-            "--provider-login=codex" => Some(Mode::Login(ProviderId::Codex)),
-            "--provider-session=claude" => Some(Mode::Session(ProviderId::Claude)),
-            "--provider-session=codex" => Some(Mode::Session(ProviderId::Codex)),
+            "--provider-login=claude" => Some(ProviderId::Claude),
+            "--provider-login=codex" => Some(ProviderId::Codex),
             _ => None,
         };
         if parsed.is_some() {
@@ -27,37 +19,27 @@ fn closed_mode(arguments: &[String]) -> Result<Option<Mode>, &'static str> {
         .iter()
         .any(|arg| arg.starts_with("--provider-login") || arg.starts_with("--provider-session"))
     {
-        return Err("Sign-in and sessions accept only claude or codex, with no extra arguments.");
+        return Err(
+            "Only provider sign-in for claude or codex is available here, with no extra arguments.",
+        );
     }
     Ok(None)
 }
 
-fn run_session(provider: ProviderId) -> Result<i32, String> {
-    let cwd = std::env::current_dir().map_err(|_| "the folder is unavailable".to_owned())?;
-    let code = harness_core::status::session_in_terminal(provider, &cwd)?;
-    if code < 0 {
-        // Killed by a signal. macOS kills an image that fails the launch requirement this way.
-        eprintln!("The CLI was stopped (signal {}). macOS stops a CLI that fails its vendor identity check.", -code);
-    }
-    Ok(code)
-}
-
 fn main() {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
-    match closed_mode(&arguments) {
-        Ok(Some(mode)) => {
-            let result = match mode {
-                Mode::Login(provider) => harness_core::status::login_in_terminal(provider),
-                Mode::Session(provider) => run_session(provider),
-            };
-            match result {
-                Ok(code) => std::process::exit(if code < 0 { 1 } else { code }),
-                Err(message) => {
-                    eprintln!("The CLI could not start: {message}");
-                    std::process::exit(1);
-                }
+    match closed_login(&arguments) {
+        Ok(Some(provider)) => match harness_core::status::login_in_terminal(provider) {
+            Ok(code) if code < 0 => {
+                eprintln!("The CLI was stopped (signal {}).", -code);
+                std::process::exit(128 - code);
             }
-        }
+            Ok(code) => std::process::exit(code),
+            Err(message) => {
+                eprintln!("The CLI could not start: {message}");
+                std::process::exit(1);
+            }
+        },
         Err(message) => {
             eprintln!("{message}");
             std::process::exit(2);
@@ -72,34 +54,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn closed_modes_reject_extra_arguments_or_unsupported_providers() {
+    fn closed_logins_reject_extra_arguments_or_unsupported_providers() {
         assert_eq!(
-            closed_mode(&["--provider-login=claude".into()]),
-            Ok(Some(Mode::Login(ProviderId::Claude)))
+            closed_login(&["--provider-login=claude".into()]),
+            Ok(Some(ProviderId::Claude))
         );
         assert_eq!(
-            closed_mode(&["--provider-login=codex".into()]),
-            Ok(Some(Mode::Login(ProviderId::Codex)))
+            closed_login(&["--provider-login=codex".into()]),
+            Ok(Some(ProviderId::Codex))
         );
-        assert_eq!(
-            closed_mode(&["--provider-session=claude".into()]),
-            Ok(Some(Mode::Session(ProviderId::Claude)))
-        );
-        assert_eq!(
-            closed_mode(&["--provider-session=codex".into()]),
-            Ok(Some(Mode::Session(ProviderId::Codex)))
-        );
-        assert_eq!(closed_mode(&[]), Ok(None));
+        assert_eq!(closed_login(&[]), Ok(None));
         for args in [
             vec!["--provider-login=gemini"],
             vec!["--provider-session=gemini"],
+            vec!["--provider-session=claude"],
+            vec!["--provider-session=codex"],
             vec!["--provider-login=claude", "--tools"],
             vec!["--provider-session=claude", "--print"],
             vec!["--provider-login=claude; command"],
             vec!["--provider-session=claude; command"],
         ] {
             let args: Vec<_> = args.into_iter().map(String::from).collect();
-            assert!(closed_mode(&args).is_err());
+            assert!(closed_login(&args).is_err());
         }
     }
 }

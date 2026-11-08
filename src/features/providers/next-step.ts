@@ -1,7 +1,7 @@
 // The one next step per provider, decided from the status the backend reported. `usable` and `blockers` are the
 // backend's answer (rule 4: no CLI files are read here); this module never recomputes them.
 import type { Blocker, ProviderStatus } from "@/lib/ipc";
-import { PROVIDER_IDS, type ProviderId } from "@/strings/providers";
+import { API_KEY_ONLY_PROVIDER_IDS } from "@/strings/providers";
 
 export type StepKind = "check_again" | "confirm" | "sign_in" | "go_to_lead";
 
@@ -18,10 +18,9 @@ const STEPS: Record<StepKind, NextStep> = {
 };
 
 /**
- * Rule 7, defense in depth: providers that never get a sign-in or confirm step, whatever `auth_modes` says. Names live
- * only in src/strings/providers.ts (rule 8), so the entry is picked by position; next-step.test.ts pins it.
+ * Rule 7, defense in depth: these providers never get a sign-in or confirm step, regardless of `auth_modes`.
  */
-export const NEVER_SIGN_IN: readonly ProviderId[] = [PROVIDER_IDS[4]];
+export const NEVER_SIGN_IN = API_KEY_ONLY_PROVIDER_IDS;
 
 /** True when this provider can only run on an API key (rule 7), by its auth modes or the never-sign-in list. */
 export function keyOnly(status: ProviderStatus): boolean {
@@ -43,7 +42,8 @@ export function nextStep(status: ProviderStatus): NextStep | null {
   if (!subscriptionAllowed(status)) return null; // rule 7: no login path for key-only tools
   // A confirmation cannot make this build runnable. Keep refresh available and
   // ask for personal-use confirmation only when execution can actually proceed.
-  if (executionUnavailable(status)) return STEPS.check_again;
+  if (executionUnavailable(status) || status.binary.release_reviewed === false)
+    return STEPS.check_again;
   if (!status.personal_use_confirmed) return STEPS.confirm; // rule 5
   if (status.sign_in.login_command !== undefined) return STEPS.check_again;
   if (status.sign_in.state !== "signed_in") return STEPS.sign_in;
@@ -77,8 +77,7 @@ const BLOCKER_SENTENCES: Record<Blocker, string> = {
   runtime_controls_unavailable:
     "Usage, presence and restart controls are not connected to execution.",
   provider_policy_unverified: "The provider policy has not been verified for this build.",
-  release_unreviewed:
-    "This vendor-signed release has not been reviewed for tasks. A human terminal can still open.",
+  release_unreviewed: "This vendor-signed release has not been reviewed for tasks.",
 };
 
 /** One plain sentence per blocker. A value this build does not know falls back to a generic sentence. */

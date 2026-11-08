@@ -42,6 +42,7 @@ const CHECK_TONE: Record<BinaryCheck["result"], { tone: StatusTone; label: strin
   pass: { tone: "success", label: "Passed" },
   fail: { tone: "danger", label: "Failed" },
   not_applicable: { tone: "neutral", label: "Not applicable" },
+  not_checked: { tone: "neutral", label: "Not checked" },
 };
 
 const CHECK_NAME: Record<BinaryCheck["kind"], string> = {
@@ -60,14 +61,16 @@ function usableLabel(status: ProviderStatus): { tone: StatusTone; label: string 
 
 function InstallRows({ status }: { status: ProviderStatus }) {
   const { install } = status;
-  const installed = install.state === "installed";
+  const chip: { tone: StatusTone; label: string } =
+    install.state === "installed"
+      ? { tone: "success", label: "Installed" }
+      : install.state === "not_installed"
+        ? { tone: "danger", label: "Not installed" }
+        : { tone: "neutral", label: "Installation unconfirmed" };
   return (
     <Row label="Install">
-      <StatusChip
-        tone={installed ? "success" : "danger"}
-        label={installed ? "Installed" : "Not installed"}
-      />
-      {installed && install.version !== undefined && (
+      <StatusChip {...chip} />
+      {install.version !== undefined && (
         <UntrustedText text={install.version} mono className="text-muted-foreground" />
       )}
     </Row>
@@ -154,22 +157,32 @@ function SignInRows({ status }: { status: ProviderStatus }) {
           <StatusChip tone="warning" label="Not confirmed yet" />
         )}
       </Row>
-      {status.sign_in.login_command !== undefined && status.binary.state === "verified" && (
+      {state !== "signed_in" && status.binary.release_reviewed === false && (
         <Row label="CLI sign-in">
-          <div className="flex flex-col gap-2 rounded-md border p-3 text-sm">
-            <p>
-              Run this command in Terminal, finish any browser prompts, then choose Check again.
-            </p>
-            <UntrustedText
-              text={status.sign_in.login_command}
-              mono
-              block
-              className="max-w-full text-left break-all"
-            />
-            <CopyButton value={status.sign_in.login_command} label="Copy login command" />
-          </div>
+          <p className="text-sm text-muted-foreground">
+            Harness sign-in requires the reviewed release. Sign in with your installed CLI in macOS
+            Terminal, then choose Check again.
+          </p>
         </Row>
       )}
+      {status.sign_in.login_command !== undefined &&
+        status.binary.state === "verified" &&
+        status.binary.release_reviewed !== false && (
+          <Row label="CLI sign-in">
+            <div className="flex flex-col gap-2 rounded-md border p-3 text-sm">
+              <p>
+                Run this command in Terminal, finish any browser prompts, then choose Check again.
+              </p>
+              <UntrustedText
+                text={status.sign_in.login_command}
+                mono
+                block
+                className="max-w-full text-left break-all"
+              />
+              <CopyButton value={status.sign_in.login_command} label="Copy login command" />
+            </div>
+          </Row>
+        )}
     </>
   );
 }
@@ -195,15 +208,12 @@ function TechnicalDetails({ status }: { status: ProviderStatus }) {
         )}
         {status.binary.verification_scope === "kernel_identity" && (
           <p>
-            macOS checked the CLI identity. Full-file integrity is still unverified, so this is not
-            clearance to run tasks.
+            macOS checked the CLI identity. Installer provenance and full-file integrity remain
+            unverified.
           </p>
         )}
         {status.binary.release_reviewed === false && (
-          <p>
-            This vendor-signed release is newer than the one reviewed for this build. Terminals
-            work, and tasks stay off for it.
-          </p>
+          <p>This vendor-signed release does not match the release reviewed for this build.</p>
         )}
         {status.sign_in.detail !== undefined && status.sign_in.state !== "unknown" && (
           <UntrustedText text={status.sign_in.detail} block />
@@ -270,7 +280,7 @@ export function ProviderCard({ status, primary }: { status: ProviderStatus; prim
   const step = nextStep(status);
   const mutation = useProviderStep(status);
   const available = status.adapter_available && status.killswitch !== "disabled";
-  const installed = status.install.state === "installed";
+  const installationMissing = status.install.state === "not_installed";
   const usable = usableLabel(status);
   const run = (kind: IpcStepKind) => () => {
     mutation.mutate(kind);
@@ -312,8 +322,10 @@ export function ProviderCard({ status, primary }: { status: ProviderStatus; prim
         {available && (
           <dl className="flex flex-col gap-3">
             <InstallRows status={status} />
-            {installed && <BinaryRow status={status} />}
-            {(installed || !subscriptionAllowed(status)) && <SignInRows status={status} />}
+            {!installationMissing && <BinaryRow status={status} />}
+            {(!installationMissing || !subscriptionAllowed(status)) && (
+              <SignInRows status={status} />
+            )}
             {showKeyRow && (
               <Row label="API key">
                 {status.api_key?.present === true ? (
@@ -328,7 +340,7 @@ export function ProviderCard({ status, primary }: { status: ProviderStatus; prim
         {!status.adapter_available && (
           <StatusChip tone="neutral" label="Not available yet" className="w-fit" />
         )}
-        {available && !installed && <InstallText status={status} />}
+        {available && installationMissing && <InstallText status={status} />}
         {blockers.length > 0 && (
           <ul aria-label="What blocks it" className="flex flex-col gap-1 text-sm">
             {blockers.map((blocker) => (
@@ -338,7 +350,7 @@ export function ProviderCard({ status, primary }: { status: ProviderStatus; prim
             ))}
           </ul>
         )}
-        {available && installed && <TechnicalDetails status={status} />}
+        {available && !installationMissing && <TechnicalDetails status={status} />}
         {mutation.isError && <ErrorAlert error={mutation.error} />}
       </CardContent>
       <CardFooter className="flex flex-wrap items-center gap-2">

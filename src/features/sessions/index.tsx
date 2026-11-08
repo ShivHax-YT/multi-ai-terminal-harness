@@ -29,7 +29,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { useIpc, useIpcEvent, type SessionState, type SessionView } from "@/lib/ipc";
+import { useIpc, useIpcEvent, useIpcMode, type SessionState, type SessionView } from "@/lib/ipc";
 import { MVP_PROVIDER_IDS, providerLabel, type ProviderId } from "@/strings/providers";
 
 import { applySessionSnapshot, isLiveSession } from "./session-state";
@@ -408,6 +408,21 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
 
 export default function SessionsScreen() {
   const { sessionId } = useParams();
+  const mode = useIpcMode();
+  if (mode === "native") {
+    return (
+      <EmptyState
+        icon={SquareTerminal}
+        title="Embedded terminals are unavailable"
+        description="Use the installed CLI in macOS Terminal. You can check its installation and sign-in status from Providers."
+        action={
+          <Button asChild variant="outline">
+            <Link to={paths.providers()}>Open Providers</Link>
+          </Button>
+        }
+      />
+    );
+  }
   return sessionId === undefined ? (
     <SessionList />
   ) : (

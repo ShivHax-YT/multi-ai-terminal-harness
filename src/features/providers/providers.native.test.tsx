@@ -84,4 +84,34 @@ describe("native onboarding observations", () => {
     ).not.toBeInTheDocument();
     expect(mock.control.calls.some((c) => c.command === "open_provider_login")).toBe(false);
   });
+
+  it("shows an unreviewed release's Terminal guidance without an unusable login command", async () => {
+    const mock = createMockIpc({ scenario: "ready" });
+    seedProvider(mock, "codex", {
+      binary: {
+        state: "verified",
+        verification_scope: "kernel_identity",
+        release_reviewed: false,
+        checks: [],
+      },
+      sign_in: { state: "signed_out", login_command: "stale command" },
+      usable: {
+        lead: false,
+        worker: false,
+        blockers: ["signed_out", "release_unreviewed", "execution_boundary_unavailable"],
+      },
+    });
+    const { user } = renderRoute("/providers", { mock });
+    const card = await screen.findByRole("group", { name: providerLabel("codex") });
+    await waitFor(() =>
+      expect(
+        within(card).getByText(/Sign in with your installed CLI in macOS Terminal/),
+      ).toBeVisible(),
+    );
+    expect(within(card).queryByRole("button", { name: "Copy login command" })).toBeNull();
+    await user.click(within(card).getByText("Technical details"));
+    await waitFor(() =>
+      expect(within(card).getByText(/does not match the release reviewed/)).toBeVisible(),
+    );
+  });
 });
